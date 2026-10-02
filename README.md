@@ -50,30 +50,45 @@ python3 scripts/wiki-status.py
 #    → 在 Claude Code / Codex 的 .mcp.json 里接上(见 context/.mcp.json.example)
 ```
 
-## 自研 harness:任意 LLM 可跑
+## 自研 agent:全 Go,任意 LLM 可跑
 
-方法论不绑定模型。除了用 Claude Code 作为执行引擎,项目自带**自研 harness**(`harness/`):同一套 SCHEMA + agent 指令,在 OpenAI 兼容(DeepSeek/Ollama/OpenRouter/…)、Anthropic 等任意模型下跑。
+**不再依赖 Claude Code 执行**——整个项目用 Go 实现自己的 agent 运行时(`cmd/kcp` + `internal/`),同一套方法论(SCHEMA)在 OpenAI 兼容(DeepSeek/Ollama/OpenRouter/…)、Anthropic 等任意模型下跑。方法论与执行引擎彻底解耦。
 
 ```bash
+go build -o kcp ./cmd/kcp
 export KCP_PROVIDER=openai-compatible  # 或 anthropic
 export KCP_MODEL=deepseek-chat
 export KCP_API_KEY=sk-xxx
-python -m harness compile raw/foo.md    # 等价"Claude 编译",但走自己的运行时
-python -m harness status
+./kcp status                 # 知识库状态(零 LLM 依赖)
+./kcp compile examples/raw-demo.md   # 单源编译(compiler agent)
+./kcp query "知识库里对 X 有哪些结论?"
+./kcp lint                   # 健康检查
+./kcp observe -s strategy -T "发现" -c "描述"
 ```
 
-设计见 `docs/harness设计.md`(M04 五组件映射 + M02 Provider 能力位 + M09 上下文纪律)。
+Go 包结构对应 M04 五组件:
+
+```
+cmd/kcp                CLI 入口
+internal/provider     M02 Provider 抽象 + 能力位(OpenAI 兼容/Anthropic)
+internal/agent        M04 循环:Think-Act-Observe + 停止条件 + 错误自愈
+internal/agents       内置角色 system prompt(compiler/query/qa)
+internal/tools        M06 工具注册(状态/检索/读写文件/lint),全 Go 实现
+internal/wiki         知识库操作(扫描/检索/lint),替代原 Python scripts
+internal/cli          命令分发
+```
+
+`.claude/`(Claude Code 版 agent)已降级为参考;`scripts/*.py` 为待移植旧工具链;Python 原型在 `legacy/python-harness/`。设计见 `docs/harness设计.md`。
 
 ## 项目结构
 
 ```
 knowledge-compounder/
 ├── SCHEMA.md            ← 编译纪律:页面格式约定(本项目的心智)
-├── harness/             ← 自研运行时:任意 LLM 可跑(providers/loop/tools/cli)
-├── .claude/
-│   ├── agents/          ← coordinator/compiler/qa/batch-compiler/converter(同一指令,双引擎复用)
-│   └── skills/          ← observe 捕获技能
-├── scripts/             ← 状态/lint/更新/PDF转换/隐私导出/观察
+├── cmd/kcp + internal/  ← 自研 Go agent:provider/agent/agents/tools/wiki/cli
+├── .claude/             ← 已降级为参考(Claude Code 版 agent 指令)
+├── scripts/             ← 旧 Python 工具链(待移植到 Go)
+├── legacy/              ← 被 Go 取代的 Python harness 原型
 ├── templates/           ← source/concept/entity/synthesis 页面模板
 ├── examples/            ← 合成演示:raw + 编译产物,展示纪律
 ├── context/             ← 支柱B:wiki 暴露为 MCP server,喂给 coding/trading agents

@@ -7,6 +7,9 @@ wiki/*
 wiki/health/*
 !wiki/health/.gitkeep
 
+# 编译产物
+/kcp
+
 # 本地环境
 .DS_Store
 *.swp
