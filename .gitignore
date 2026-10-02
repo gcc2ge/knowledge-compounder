@@ -1,0 +1,20 @@
+# 私有内容:你的知识库不进开源仓库
+# raw 与 wiki 是用户私有知识资产,默认不提交。需要时手动 git add -f
+raw/*
+!raw/.gitkeep
+wiki/*
+!wiki/.gitkeep
+wiki/health/*
+!wiki/health/.gitkeep
+
+# 本地环境
+.DS_Store
+*.swp
+__pycache__/
+*.pyc
+
+# 观察与临时文件
+raw/observations/*
+
+# 本地配置
+.claude/settings.local.json

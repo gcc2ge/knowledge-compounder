@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "wiki-context": {
+      "command": "python3",
+      "args": ["/绝对/路径/knowledge-compounder/context/wiki-mcp-server/server.py"],
+      "env": {}
+    }
+  }
+}
