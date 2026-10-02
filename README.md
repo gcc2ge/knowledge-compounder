@@ -50,19 +50,34 @@ python3 scripts/wiki-status.py
 #    → 在 Claude Code / Codex 的 .mcp.json 里接上(见 context/.mcp.json.example)
 ```
 
+## 自研 harness:任意 LLM 可跑
+
+方法论不绑定模型。除了用 Claude Code 作为执行引擎,项目自带**自研 harness**(`harness/`):同一套 SCHEMA + agent 指令,在 OpenAI 兼容(DeepSeek/Ollama/OpenRouter/…)、Anthropic 等任意模型下跑。
+
+```bash
+export KCP_PROVIDER=openai-compatible  # 或 anthropic
+export KCP_MODEL=deepseek-chat
+export KCP_API_KEY=sk-xxx
+python -m harness compile raw/foo.md    # 等价"Claude 编译",但走自己的运行时
+python -m harness status
+```
+
+设计见 `docs/harness设计.md`(M04 五组件映射 + M02 Provider 能力位 + M09 上下文纪律)。
+
 ## 项目结构
 
 ```
 knowledge-compounder/
 ├── SCHEMA.md            ← 编译纪律:页面格式约定(本项目的心智)
+├── harness/             ← 自研运行时:任意 LLM 可跑(providers/loop/tools/cli)
 ├── .claude/
-│   ├── agents/          ← coordinator/compiler/qa/batch-compiler/converter
+│   ├── agents/          ← coordinator/compiler/qa/batch-compiler/converter(同一指令,双引擎复用)
 │   └── skills/          ← observe 捕获技能
 ├── scripts/             ← 状态/lint/更新/PDF转换/隐私导出/观察
 ├── templates/           ← source/concept/entity/synthesis 页面模板
 ├── examples/            ← 合成演示:raw + 编译产物,展示纪律
 ├── context/             ← 支柱B:wiki 暴露为 MCP server,喂给 coding/trading agents
-└── docs/ 上手.md  循环设计.md  隐私模型.md
+└── docs/ 上手.md  循环设计.md  隐私模型.md  harness设计.md
 ```
 
 ## 两个支柱 + 一条闭环
