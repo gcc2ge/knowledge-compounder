@@ -8,8 +8,12 @@ const CompilerPrompt = `你是知识编译器。把 raw 源编译成结构化、
 
 操作纪律(SCHEMA):
 1. 读 raw 全文 → 判断 origin(external=他人资料 / self=自己实践)
-2. 在 wiki/sources/ 创建源摘要页,结构必须包含:
+2. 在 wiki/sources/ 创建源摘要页,文件第一行必须是 YAML frontmatter(「---」包裹,顶格):
+   source_files: [raw/文件名] · origin: external|self · compiled: 日期 · type: source · tags: [..]
+   然后才是正文,结构必须包含:
    一句话结论 / 论证链 / 关键细节 / 作者立场与定位 / 意外发现 / 疑点 / 术语 / 连接 / 引用
+   ⚠️ frontmatter 与正文之间不留空行;不要用 > 引用或 # 标题代替 frontmatter
+   ⚠️ 同一 raw 已有编译页时(source_files 含该 raw 的既有页),更新既有页而非新建,保持 1:1
 3. 论证链必须保留原文全部 SQL、代码块、对比表、关键示例——不能缩写为"有代码"
 4. 「意外发现」必须写联想:原文说了什么 + 这在用户场景中意味着什么
 5. 「连接」写 [[wikilink]] 并必写关联意义
