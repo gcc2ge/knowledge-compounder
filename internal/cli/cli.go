@@ -28,6 +28,9 @@ const usage = `kcp — 知识编译复利引擎(自研 agent,任意 LLM)
   kcp update add-source <slug> <源>   确定性页面编辑(无 LLM)
   kcp update touch <slug>             更新 updated 日期
   kcp update add-link <slug> <目标>   往「相关」节加 wikilink
+  kcp index                           重建 wiki/index.md(从页面 frontmatter)
+  kcp skeleton <raw文件> [--tags a,b] [--origin external|self] [--write]
+                                      生成 source 页骨架
   kcp check-sources                   检查概念/实体页 sources 是否被错误替换(git)
   kcp <role> "<输入>"           直接跑一个角色(compiler/qa/query)
   kcp list                      列出角色
@@ -68,6 +71,16 @@ func Main(args []string) int {
 		return 0
 	case "update":
 		return runUpdate(root, args[1:])
+	case "index":
+		fp, err := wiki.WriteIndex(root)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		fmt.Println("已重建 " + fp)
+		return 0
+	case "skeleton":
+		return runSkeleton(root, args[1:])
 	case "check-sources":
 		problems, err := wiki.CheckSourcesShrink(root)
 		if err != nil {
@@ -186,6 +199,51 @@ func runUpdate(root string, args []string) int {
 		return 1
 	}
 	fmt.Println(msg)
+	return 0
+}
+
+// runSkeleton 生成 source 页骨架;--write 直接写入 wiki/sources/。
+func runSkeleton(root string, args []string) int {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "用法: kcp skeleton <raw文件> [--tags a,b] [--origin external|self] [--write]")
+		return 1
+	}
+	rawPath := args[0]
+	var tags, origin string
+	write := false
+	for i := 1; i < len(args); i++ {
+		switch args[i] {
+		case "--tags":
+			if i+1 < len(args) {
+				tags = args[i+1]
+				i++
+			}
+		case "--origin":
+			if i+1 < len(args) {
+				origin = args[i+1]
+				i++
+			}
+		case "--write":
+			write = true
+		}
+	}
+	body, err := wiki.Skeleton(root, rawPath, tags, origin)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	if !write {
+		fmt.Println(body)
+		return 0
+	}
+	slug := strings.TrimSuffix(filepath.Base(rawPath), filepath.Ext(rawPath))
+	fp := filepath.Join(root, "wiki", "sources", slug+".md")
+	if err := os.WriteFile(fp, []byte(body), 0o644); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	rel, _ := filepath.Rel(root, fp)
+	fmt.Println("已写入 " + rel)
 	return 0
 }
 

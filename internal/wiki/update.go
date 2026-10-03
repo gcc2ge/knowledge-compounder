@@ -29,9 +29,9 @@ func ResolveSlug(root, slug string) (string, bool) {
 }
 
 // AddSource 给页面 frontmatter sources 追加一个源,并更新 updated 日期。
-// 幂等:已存在则不重复追加。
+// 幂等:已存在则不重复追加。保留原正文。
 func AddSource(root, slug, source string) (string, error) {
-	vals, fp, err := readPageForEdit(root, slug)
+	vals, body, fp, err := readPageBodyForEdit(root, slug)
 	if err != nil {
 		return "", err
 	}
@@ -41,20 +41,20 @@ func AddSource(root, slug, source string) (string, error) {
 	}
 	vals["sources"] = sources
 	vals["updated"] = today()
-	if err := writePage(fp, vals, ""); err != nil {
+	if err := writePage(fp, vals, body); err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("已更新 %s: 追加 source '%s'", slug, source), nil
 }
 
-// Touch 更新页面 updated 日期为今天。
+// Touch 更新页面 updated 日期为今天。保留原正文。
 func Touch(root, slug string) (string, error) {
-	vals, fp, err := readPageForEdit(root, slug)
+	vals, body, fp, err := readPageBodyForEdit(root, slug)
 	if err != nil {
 		return "", err
 	}
 	vals["updated"] = today()
-	if err := writePage(fp, vals, ""); err != nil {
+	if err := writePage(fp, vals, body); err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("已 touch %s → %s", slug, today()), nil
@@ -90,21 +90,8 @@ func AddLink(root, slug, target string) (string, error) {
 	return fmt.Sprintf("已加链接 %s → %s", slug, link), nil
 }
 
-// readPageForEdit 解析页面 frontmatter,保留原正文(空 body = 原样保留)。
-func readPageForEdit(root, slug string) (map[string]any, string, error) {
-	fp, ok := ResolveSlug(root, slug)
-	if !ok {
-		return nil, "", fmt.Errorf("页面不存在: %s", slug)
-	}
-	b, err := os.ReadFile(fp)
-	if err != nil {
-		return nil, "", err
-	}
-	vals, _ := ParseFrontmatter(string(b))
-	return vals, fp, nil
-}
-
-// readPageBodyForEdit 同上,额外返回正文(供 AddLink 修改)。
+// readPageBodyForEdit 解析页面 frontmatter + 正文,返回 (vals, body, fp, err)。
+// update 类操作必须保留原正文,否则会清空页面。
 func readPageBodyForEdit(root, slug string) (map[string]any, string, string, error) {
 	fp, ok := ResolveSlug(root, slug)
 	if !ok {
