@@ -37,6 +37,7 @@ const usage = `kcp — 知识编译复利引擎(自研 agent,任意 LLM)
 
 环境变量: KCP_PROVIDER(openai-compatible|anthropic) KCP_MODEL KCP_API_KEY KCP_BASE_URL
           KCP_MAX_STEPS KCP_MAX_SAME_ACTION KCP_MAX_TOKENS KCP_MAX_HEAL KCP_DEADLINE(秒) KCP_STATE_FILE
+          KCP_STREAM(默认1=SSE流式,0=关闭)
 `
 
 // Main 命令分发。返回退出码。
@@ -162,12 +163,20 @@ func runRole(root string, cfg config.Config, role, input string) int {
 		MaxHeal:       cfg.MaxHeal,
 		StateFile:     cfg.StateFile,
 	}
+	streamed := false
+	if cfg.Stream {
+		rt.OnStream = func(t string) { fmt.Print(t); streamed = true }
+	}
 	out, err := rt.Run(ctx, input, "")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	fmt.Println(out)
+	if streamed {
+		fmt.Println() // 内容已实时输出,补换行
+	} else {
+		fmt.Println(out)
+	}
 	return 0
 }
 

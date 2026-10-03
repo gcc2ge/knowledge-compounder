@@ -17,6 +17,7 @@ type Config struct {
 	MaxHeal       int // LLM 调用连续失败重试次数
 	Deadline      int // 秒;0 = 默认 600
 	StateFile     string // checkpoint 持久化路径(可断点续跑)
+	Stream        bool // SSE 流式输出(默认开,KCP_STREAM=0 关闭)
 }
 
 func Load() Config {
@@ -31,6 +32,7 @@ func Load() Config {
 		MaxHeal:       getenvInt("KCP_MAX_HEAL", 3),
 		Deadline:      getenvInt("KCP_DEADLINE", 600),
 		StateFile:     os.Getenv("KCP_STATE_FILE"),
+		Stream:        getenvInt("KCP_STREAM", 1) == 1,
 	}
 }
 

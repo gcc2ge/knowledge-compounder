@@ -2,11 +2,14 @@
 package provider
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
+	"strings"
 	"time"
 )
 
@@ -26,7 +29,24 @@ func NewOpenAICompatible(model, apiKey, baseURL string) *OpenAICompatible {
 	}
 }
 
-func (p *OpenAICompatible) Capabilities() Capabilities { return Capabilities{Tools: true} }
+func (p *OpenAICompatible) Capabilities() Capabilities { return Capabilities{Tools: true, Stream: true} }
+
+// buildOpenAITools 序列化工具定义(OpenAI function calling 格式)。
+func buildOpenAITools(tools []ToolDef) []map[string]any {
+	if len(tools) == 0 {
+		return nil
+	}
+	defs := make([]map[string]any, 0, len(tools))
+	for _, t := range tools {
+		defs = append(defs, map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name": t.Name, "description": t.Description, "parameters": t.Parameters,
+			},
+		})
+	}
+	return defs
+}
 
 // messagesToAPI 把统一 Message 转成 OpenAI chat 格式(tool_calls / tool 角色)。
 func messagesToAPI(msgs []Message) []map[string]any {
@@ -57,16 +77,7 @@ func messagesToAPI(msgs []Message) []map[string]any {
 
 func (p *OpenAICompatible) Chat(ctx context.Context, msgs []Message, tools []ToolDef, stop []string) (Message, error) {
 	payload := map[string]any{"model": p.Model, "messages": messagesToAPI(msgs)}
-	if len(tools) > 0 {
-		var defs []map[string]any
-		for _, t := range tools {
-			defs = append(defs, map[string]any{
-				"type": "function",
-				"function": map[string]any{
-					"name": t.Name, "description": t.Description, "parameters": t.Parameters,
-				},
-			})
-		}
+	if defs := buildOpenAITools(tools); len(defs) > 0 {
 		payload["tools"] = defs
 	}
 	if len(stop) > 0 {
@@ -120,6 +131,106 @@ func (p *OpenAICompatible) Chat(ctx context.Context, msgs []Message, tools []Too
 	out := Message{Role: "assistant", Content: apiMsg.Content}
 	for _, tc := range apiMsg.ToolCalls {
 		out.ToolCalls = append(out.ToolCalls, ToolCall{ID: tc.ID, Name: tc.Function.Name, Arguments: tc.Function.Arguments})
+	}
+	return out, nil
+}
+
+// Stream SSE 流式版 Chat:delta.content → onDelta;tool_calls 增量按 index 归并。
+func (p *OpenAICompatible) Stream(ctx context.Context, msgs []Message, tools []ToolDef, stop []string, onDelta func(string)) (Message, error) {
+	payload := map[string]any{"model": p.Model, "messages": messagesToAPI(msgs), "stream": true}
+	if defs := buildOpenAITools(tools); len(defs) > 0 {
+		payload["tools"] = defs
+	}
+	if len(stop) > 0 {
+		payload["stop"] = stop
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return Message{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.BaseURL+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return Message{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if p.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+p.APIKey)
+	}
+	resp, err := p.Client.Do(req)
+	if err != nil {
+		return Message{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		var e struct{ Error map[string]any }
+		_ = json.NewDecoder(resp.Body).Decode(&e)
+		return Message{}, fmt.Errorf("LLM API %d: %v", resp.StatusCode, e.Error)
+	}
+
+	out := Message{Role: "assistant"}
+	toolByIndex := map[int]*ToolCall{}
+	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	for sc.Scan() {
+		line := sc.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimPrefix(line, "data: ")
+		if data == "[DONE]" {
+			break
+		}
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content   string `json:"content"`
+					ToolCalls []struct {
+						Index    int    `json:"index"`
+						ID       string `json:"id"`
+						Function struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						} `json:"function"`
+					} `json:"tool_calls"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			continue
+		}
+		for _, c := range chunk.Choices {
+			if c.Delta.Content != "" {
+				out.Content += c.Delta.Content
+				if onDelta != nil {
+					onDelta(c.Delta.Content)
+				}
+			}
+			for _, tc := range c.Delta.ToolCalls {
+				t := toolByIndex[tc.Index]
+				if t == nil {
+					t = &ToolCall{}
+					toolByIndex[tc.Index] = t
+				}
+				if tc.ID != "" {
+					t.ID = tc.ID
+				}
+				if tc.Function.Name != "" {
+					t.Name = tc.Function.Name
+				}
+				t.Arguments += tc.Function.Arguments
+			}
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return Message{}, err
+	}
+	indices := make([]int, 0, len(toolByIndex))
+	for i := range toolByIndex {
+		indices = append(indices, i)
+	}
+	sort.Ints(indices)
+	for _, i := range indices {
+		out.ToolCalls = append(out.ToolCalls, *toolByIndex[i])
 	}
 	return out, nil
 }

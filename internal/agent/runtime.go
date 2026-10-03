@@ -24,6 +24,7 @@ type Runtime struct {
 	MaxTokens     int // 0 = 不限
 	MaxHeal       int // 0 = 默认 1 次机会
 	StateFile     string
+	OnStream      func(string) // SSE 增量输出回调;Provider 实现 Streamer 时走流式
 }
 
 // Run 执行一次 agent 任务:LLM 决策 → 执行工具 → 观察回填 → 再决策,直到无工具调用或达到停止条件。
@@ -46,7 +47,7 @@ func (r *Runtime) Run(ctx context.Context, input, state string) (string, error) 
 		if r.MaxTokens > 0 && tokensUsed(msgs) >= r.MaxTokens {
 			return "", fmt.Errorf("达到 token 预算 %d,停止", r.MaxTokens)
 		}
-		reply, err := r.chatWithHeal(ctx, msgs)
+		reply, err := r.callProvider(ctx, msgs)
 		if err != nil {
 			return "", err
 		}
@@ -72,8 +73,14 @@ func (r *Runtime) Run(ctx context.Context, input, state string) (string, error) 
 	return "", fmt.Errorf("达到最大步数 %d,停止", r.MaxSteps)
 }
 
-// chatWithHeal LLM 调用失败时退避重试(至多 MaxHeal 次),吞瞬态错误。
-func (r *Runtime) chatWithHeal(ctx context.Context, msgs []provider.Message) (provider.Message, error) {
+// callProvider 调用 LLM:Provider 实现 Streamer 且 OnStream 非 nil 时走 SSE 流式;
+// 失败时退避重试(至多 MaxHeal 次),吞瞬态错误。
+func (r *Runtime) callProvider(ctx context.Context, msgs []provider.Message) (provider.Message, error) {
+	if r.OnStream != nil {
+		if st, ok := r.Provider.(provider.Streamer); ok {
+			return st.Stream(ctx, msgs, r.Tools, nil, r.OnStream)
+		}
+	}
 	heal := r.MaxHeal
 	if heal <= 0 {
 		heal = 1

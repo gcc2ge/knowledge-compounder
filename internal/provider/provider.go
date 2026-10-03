@@ -27,13 +27,19 @@ type ToolDef struct {
 	Func        func(map[string]any) string
 }
 
-// Capabilities 提供商能力位:Tools=false 时循环降级 ReAct。
+// Capabilities 提供商能力位:Tools=false 时循环降级 ReAct;Stream=true 支持 SSE 增量。
 type Capabilities struct {
-	Tools bool
+	Tools  bool
+	Stream bool
 }
 
 // Provider 任意 LLM 的统一接口。
 type Provider interface {
 	Chat(ctx context.Context, msgs []Message, tools []ToolDef, stop []string) (Message, error)
 	Capabilities() Capabilities
+}
+
+// Streamer 流式决策(SSE 增量输出)。Provider 实现它且 runtime.OnStream 非 nil 时走流式。
+type Streamer interface {
+	Stream(ctx context.Context, msgs []Message, tools []ToolDef, stop []string, onDelta func(string)) (Message, error)
 }
