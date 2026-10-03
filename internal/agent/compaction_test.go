@@ -79,3 +79,41 @@ func TestMaybeCompactDisabled(t *testing.T) {
 		t.Fatalf("关闭治理不应压缩: ok=%v len=%d", ok, len(next))
 	}
 }
+
+// 带 write_file 轮的消息:写入动作「已发生」,不可重查,压缩时必须保留。
+func msgsWithWrite() []provider.Message {
+	m := []provider.Message{
+		{Role: "system", Content: "你是编译器"},
+		{Role: "user", Content: "编译任务"},
+	}
+	m = append(m, provider.Message{Role: "assistant", Content: "写入",
+		ToolCalls: []provider.ToolCall{{ID: "w", Name: "write_file", Arguments: "{}"}}})
+	m = append(m, provider.Message{Role: "tool", Content: "已写入 wiki/sources/X.md", ToolCallID: "w"})
+	m = append(m, round("搜索", 1, "结果A")...)
+	m = append(m, provider.Message{Role: "assistant", Content: "最终答案"})
+	return m
+}
+
+func TestKeepWrites(t *testing.T) {
+	m := msgsWithWrite()
+	compacted := compactMessages(m, 1) // 只留最近 1 轮
+	// system + 任务输入 + 占位 + write轮(2条) + 最近1轮(最终答案) = 6 条
+	if len(compacted) != 6 {
+		t.Fatalf("应保留 write 轮: 得 %d 条 = %#v", len(compacted), compacted)
+	}
+	if compacted[0].Role != "system" || compacted[1].Role != "user" {
+		t.Fatalf("system/任务输入必须保留: %#v", compacted[:2])
+	}
+	// write 轮(免裁剪)紧随占位,且 assistant+tool 结果完整
+	if compacted[3].Role != "assistant" || len(compacted[3].ToolCalls) == 0 || compacted[3].ToolCalls[0].Name != "write_file" {
+		t.Fatalf("write_file 轮被裁剪: %#v", compacted[3])
+	}
+	if compacted[4].Role != "tool" || compacted[4].Content != "已写入 wiki/sources/X.md" {
+		t.Fatalf("write 轮的 tool 结果被拆散: %#v", compacted[4])
+	}
+	// 最近 1 轮(最终答案)保留
+	last := compacted[len(compacted)-1]
+	if last.Role != "assistant" || last.Content != "最终答案" {
+		t.Fatalf("最近一轮被裁剪: %#v", last)
+	}
+}

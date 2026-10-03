@@ -57,12 +57,18 @@ func (r *Runtime) Run(ctx context.Context, input, state string) (string, error) 
 			r.emit(Event{Kind: EvStop, Step: step, Err: err})
 			return "", err
 		}
-		if r.MaxTokens > 0 && r.budgetTokens(msgs) >= r.MaxTokens {
-			err := fmt.Errorf("达到 token 预算 %d(已用 %d),停止", r.MaxTokens, r.budgetTokens(msgs))
-			r.emit(Event{Kind: EvStop, Step: step, Tokens: r.budgetTokens(msgs), Err: err})
+		// M09 上下文治理:callProvider 前先压缩,避免超预算请求真的发出(压缩后必写 checkpoint)
+		if next, ok := r.maybeCompact(msgs); ok {
+			r.emit(Event{Kind: EvCompact, Step: step, Dropped: len(msgs) - len(next)})
+			msgs = next
+			_ = r.saveCheckpoint(msgs)
+		}
+		if r.MaxTokens > 0 && r.consumedTokens(msgs) >= r.MaxTokens {
+			err := fmt.Errorf("达到 token 预算 %d(累计已用 %d),停止", r.MaxTokens, r.consumedTokens(msgs))
+			r.emit(Event{Kind: EvStop, Step: step, Tokens: r.consumedTokens(msgs), Err: err})
 			return "", err
 		}
-		r.emit(Event{Kind: EvStep, Step: step, Tokens: r.budgetTokens(msgs)})
+		r.emit(Event{Kind: EvStep, Step: step, Tokens: r.consumedTokens(msgs)})
 		reply, err := r.callProvider(ctx, msgs)
 		if err != nil {
 			r.emit(Event{Kind: EvError, Step: step, Err: err})
@@ -71,7 +77,7 @@ func (r *Runtime) Run(ctx context.Context, input, state string) (string, error) 
 		r.accumulateUsage(reply)
 		if len(reply.ToolCalls) == 0 {
 			_ = r.saveCheckpoint(msgs) // 保留最终对话供审计
-			r.emit(Event{Kind: EvDone, Step: step, Text: reply.Content, Tokens: r.budgetTokens(msgs)})
+			r.emit(Event{Kind: EvDone, Step: step, Text: reply.Content, Tokens: r.consumedTokens(msgs)})
 			return reply.Content, nil
 		}
 		for _, tc := range reply.ToolCalls {
@@ -89,13 +95,9 @@ func (r *Runtime) Run(ctx context.Context, input, state string) (string, error) 
 				return "", err
 			}
 		}
-		// M09 上下文治理:超预算折叠早期历史;压缩后必写 checkpoint 保审计。
-		if next, ok := r.maybeCompact(msgs); ok {
-			r.emit(Event{Kind: EvCompact, Step: step, Dropped: len(msgs) - len(next)})
-			msgs = next
+		// checkpoint 降频写,避免每步全量序列化(O(n²) 写放大);压缩已在循环顶部闭环时写
+		if step%every == every-1 {
 			_ = r.saveCheckpoint(msgs)
-		} else if step%every == every-1 {
-			_ = r.saveCheckpoint(msgs) // 降频写,避免每步全量序列化(O(n²) 写放大)
 		}
 	}
 	err := fmt.Errorf("达到最大步数 %d,停止", r.MaxSteps)
@@ -142,12 +144,16 @@ func (r *Runtime) accumulateUsage(reply provider.Message) {
 	r.usage.TotalTokens += reply.Usage.TotalTokens
 }
 
-// budgetTokens 返回当前累计 token 消耗:真实 usage 优先,缺省退回估算。
-func (r *Runtime) budgetTokens(msgs []provider.Message) int {
+// consumedTokens 预算闸门口径:当前请求体估算 + 累计真实消耗。
+//   - 累计 usage:真实输出/输入总消耗(provider 已解析)
+//   - estimateTokens:当前 msgs 即将发送的输入估算——补上「第一轮超长输入」,
+//     让 MaxTokens 在累计 usage 为 0 时也能拦住超预算的首次请求
+func (r *Runtime) consumedTokens(msgs []provider.Message) int {
+	total := 0
 	if r.usage != nil && r.usage.TotalTokens > 0 {
-		return r.usage.TotalTokens
+		total = r.usage.TotalTokens
 	}
-	return estimateTokens(msgs)
+	return total + estimateTokens(msgs)
 }
 
 // saveCheckpoint 持久化当前消息序列(可审计/可恢复)。
