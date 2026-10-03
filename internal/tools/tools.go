@@ -14,8 +14,8 @@ import (
 	"github.com/knowledge-compounder/kcp/internal/wiki"
 )
 
-// Build 构造工具列表。root 为项目根。
-func Build(root string) []provider.ToolDef {
+// Build 构造工具列表。root 为项目根;ask 为策展决策回调(向用户提问等裁决),nil 则 ask_user 返回非交互提示。
+func Build(root string, ask func(string) string) []provider.ToolDef {
 	return []provider.ToolDef{
 		{
 			Name: "wiki_status", Description: "查看知识库状态:页面计数 + 未编译 raw",
@@ -80,6 +80,17 @@ func Build(root string) []provider.ToolDef {
 			Name: "run_lint", Description: "运行 lint 健康检查(断链/孤儿)",
 			Parameters: obj(map[string]any{}),
 			Func:       func(map[string]any) string { return wiki.ReportLint(root) },
+		},
+		{
+			Name: "ask_user", Description: "策展决策点向用户提问并等待裁决(如:是否值得建概念页/是否 filed back)。人策展>自动,拿不准就调用。",
+			Parameters: obj(map[string]any{"question": strProp}),
+			Func: func(args map[string]any) string {
+				q := str(args, "question")
+				if ask == nil {
+					return "[非交互] 无用户可问。按 SCHEMA 纪律自行决策:单次提及不建页、2+ 源才建概念/实体页。"
+				}
+				return ask(q)
+			},
 		},
 	}
 }

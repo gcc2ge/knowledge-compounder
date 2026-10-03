@@ -2,6 +2,7 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"os"
@@ -156,7 +157,7 @@ func runRole(root string, cfg config.Config, role, input string) int {
 	rt := &agent.Runtime{
 		Provider:      p,
 		SystemPrompt:  system,
-		Tools:         tools.Build(root),
+		Tools:         tools.Build(root, terminalAsk),
 		MaxSteps:      cfg.MaxSteps,
 		MaxSameAction: cfg.MaxSameAction,
 		MaxTokens:     cfg.MaxTokens,
@@ -261,6 +262,22 @@ func runSkeleton(root string, args []string) int {
 	rel, _ := filepath.Rel(root, fp)
 	fmt.Println("已写入 " + rel)
 	return 0
+}
+
+// terminalAsk 策展决策交互:终端时读用户裁决;非终端(管道/CI)返回非交互提示。
+func terminalAsk(question string) string {
+	fi, err := os.Stdin.Stat()
+	if err != nil || fi.Mode()&os.ModeCharDevice == 0 {
+		return "[非交互] 无终端用户;按 SCHEMA 纪律自行决策(单次提及不建页、2+ 源才建概念/实体页)。"
+	}
+	fmt.Fprintln(os.Stderr, "\n[策展决策] "+question)
+	fmt.Fprint(os.Stderr, "裁决(回车=采纳模型建议;输入内容=覆盖建议): ")
+	line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	line = strings.TrimSpace(line)
+	if line == "" || line == "y" || line == "yes" {
+		return "用户裁决:采纳你的建议,继续。"
+	}
+	return "用户裁决: " + line
 }
 
 func newProvider(cfg config.Config) provider.Provider {

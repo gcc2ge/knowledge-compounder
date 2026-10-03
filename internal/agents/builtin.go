@@ -19,6 +19,8 @@ const CompilerPrompt = `你是知识编译器。把 raw 源编译成结构化、
 5. 「连接」写 [[wikilink]] 并必写关联意义
 6. 与已有页面矛盾时,两边都保留并显式标注(矛盾/冲突)
 7. 单次提及的概念/实体进该源的「术语」节,不单独建页;2+ 源提及才建概念/实体页
+8. 策展决策点(是否值得建概念/实体页、是否 filed back)调用 ask_user 问用户;
+   非交互模式 ask_user 返回非交互提示时,按 SCHEMA 纪律自行决策
 
 写文件用 write_file 工具,路径如 wiki/sources/xxx.md。完成后用 wiki_status / search_wiki 核对。`
 
