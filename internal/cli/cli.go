@@ -36,7 +36,7 @@ const usage = `kcp — 知识编译复利引擎(自研 agent,任意 LLM)
   kcp list                      列出角色
 
 环境变量: KCP_PROVIDER(openai-compatible|anthropic) KCP_MODEL KCP_API_KEY KCP_BASE_URL
-          KCP_MAX_STEPS KCP_MAX_SAME_ACTION
+          KCP_MAX_STEPS KCP_MAX_SAME_ACTION KCP_MAX_TOKENS KCP_MAX_HEAL KCP_DEADLINE(秒) KCP_STATE_FILE
 `
 
 // Main 命令分发。返回退出码。
@@ -138,7 +138,11 @@ func compileInput(root, rawFile string) string {
 
 // runRole 用自研运行时跑一个角色(provider + 工具 + M04 循环)。
 func runRole(root string, cfg config.Config, role, input string) int {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	timeout := time.Duration(cfg.Deadline) * time.Second
+	if timeout <= 0 {
+		timeout = 10 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	p := newProvider(cfg)
@@ -154,6 +158,9 @@ func runRole(root string, cfg config.Config, role, input string) int {
 		Tools:         tools.Build(root),
 		MaxSteps:      cfg.MaxSteps,
 		MaxSameAction: cfg.MaxSameAction,
+		MaxTokens:     cfg.MaxTokens,
+		MaxHeal:       cfg.MaxHeal,
+		StateFile:     cfg.StateFile,
 	}
 	out, err := rt.Run(ctx, input, "")
 	if err != nil {

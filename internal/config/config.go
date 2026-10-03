@@ -1,4 +1,4 @@
-// Package config 环境配置:provider/model/key/base_url + 停止参数。
+// Package config 环境配置:provider/model/key/base_url + 停止/恢复参数。
 package config
 
 import (
@@ -13,6 +13,10 @@ type Config struct {
 	BaseURL       string
 	MaxSteps      int
 	MaxSameAction int
+	MaxTokens     int // 0 = 不限(整体对话 token 预算,估算)
+	MaxHeal       int // LLM 调用连续失败重试次数
+	Deadline      int // 秒;0 = 默认 600
+	StateFile     string // checkpoint 持久化路径(可断点续跑)
 }
 
 func Load() Config {
@@ -23,6 +27,10 @@ func Load() Config {
 		BaseURL:       getenv("KCP_BASE_URL", "https://api.openai.com/v1"),
 		MaxSteps:      getenvInt("KCP_MAX_STEPS", 10),
 		MaxSameAction: getenvInt("KCP_MAX_SAME_ACTION", 3),
+		MaxTokens:     getenvInt("KCP_MAX_TOKENS", 0),
+		MaxHeal:       getenvInt("KCP_MAX_HEAL", 3),
+		Deadline:      getenvInt("KCP_DEADLINE", 600),
+		StateFile:     os.Getenv("KCP_STATE_FILE"),
 	}
 }
 
