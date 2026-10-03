@@ -91,6 +91,7 @@ kcp lint                     健康检查
 kcp observe -s <策略> -T <标题> -c <内容>   捕获观察
 kcp search "<查询>"          混合检索诊断(词法+向量,零 LLM,带 [A]/[B]/[C] 私有度徽标)
 kcp eval [--seeds <文件>]     RAG-vs-编译复利对照实验(Agent-as-a-Judge 打分,报告落 eval/reports/)
+kcp mcp                       MCP stdio server(支柱 B:wiki 暴露为 5 个工具,喂 coding/trading agents)
 kcp <role> "<输入>"          直接跑角色
 ```
 
@@ -98,7 +99,7 @@ kcp <role> "<输入>"          直接跑角色
 
 - `.claude/` 与 `legacy/python-harness/` → 已删除(指令已提炼进 `internal/agents` + SCHEMA.md;ReAct 要点见上)
 - `scripts/` → Python 工具链已全部移植到 Go;仅保留 pdf2md.sh / export-public.sh(依赖外部工具的 shell)
-- `context/wiki-mcp-server/`(Python MCP)→ Phase 5 移植 Go
+- `context/wiki-mcp-server/(Python MCP)` → 已移植为 `kcp mcp`(internal/mcp,纯 stdlib,Phase 5)
 
 ## 开发路线(Phase)
 
@@ -111,7 +112,7 @@ kcp <role> "<输入>"          直接跑角色
 | 2 | scripts/*.py 移植 Go:完整 lint(矛盾/格式/覆盖)、update(add-source/touch/add-link)、check-sources-shrink、index 重建、source-skeleton。pdf2md/export-public 保留 shell(依赖外部工具) | ✅ 分批完成(2026-10-03) |
 | 3 | 生产化 harness:SSE 流式(M02 两层流式栈)、MaxTokens/Deadline/MaxHeal、checkpoint 持久化(M04 Store)、策展决策点暂停要人 | ✅ 完成(2026-10-03) |
 | 4 | 检索与质量:grep → embedding + rerank(Agentic RAG)、证据 A/B/C 分层、评估集(Agent-as-a-Judge)、RAG-vs-编译对照实验 | ✅ 完成(2026-10-03)`kcp search`/`kcp eval`;GLM 实测 B 优 3/3(+1.1 均分) |
-| 5 | context/wiki-mcp-server Python → Go(支柱 B 完整 MCP server,喂 coding/trading agents) | ⬜ |
+| 5 | context/wiki-mcp-server Python → Go(支柱 B 完整 MCP server,喂 coding/trading agents) | ✅ 完成(2026-10-03)`kcp mcp`;纯 stdlib MCP stdio + synthesize_for Agentic RAG |
 | 6 | A2A 暴露(M12 ADK launcher)给 agent cloud + License 策略定稿(AGPL/BSL vs MIT) | ⬜ |
 
 ## 边界与 TODO

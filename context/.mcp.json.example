@@ -1,9 +1,17 @@
 {
   "mcpServers": {
     "wiki-context": {
-      "command": "python3",
-      "args": ["/绝对/路径/knowledge-compounder/context/wiki-mcp-server/server.py"],
-      "env": {}
+      "command": "/绝对/路径/knowledge-compounder/kcp",
+      "args": ["mcp"],
+      "env": {
+        "KCP_PROVIDER": "anthropic",
+        "KCP_MODEL": "claude-3-5-sonnet-20241022",
+        "KCP_API_KEY": "sk-xxx",
+        "KCP_BASE_URL": "https://api.anthropic.com/v1",
+        "KCP_EMBED_MODEL": "text-embedding-3-small",
+        "KCP_EMBED_BASE_URL": "https://api.openai.com/v1",
+        "KCP_EMBED_API_KEY": "sk-xxx"
+      }
     }
   }
 }

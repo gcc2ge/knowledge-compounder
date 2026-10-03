@@ -14,6 +14,7 @@ import (
 	"github.com/knowledge-compounder/kcp/internal/agents"
 	"github.com/knowledge-compounder/kcp/internal/config"
 	"github.com/knowledge-compounder/kcp/internal/eval"
+	"github.com/knowledge-compounder/kcp/internal/mcp"
 	"github.com/knowledge-compounder/kcp/internal/provider"
 	"github.com/knowledge-compounder/kcp/internal/retrieval"
 	"github.com/knowledge-compounder/kcp/internal/tools"
@@ -39,6 +40,7 @@ const usage = `kcp — 知识编译复利引擎(自研 agent,任意 LLM)
   kcp check-sources                   检查概念/实体页 sources 是否被错误替换(git)
   kcp search "<查询>"                混合检索诊断(词法+向量,零 LLM,带私有度徽标)
   kcp eval [--seeds <文件>] [--k <n>] RAG-vs-编译复利对照实验(Agent-as-a-Judge 打分)
+  kcp mcp                      MCP stdio server(支柱 B:wiki 暴露为 5 个工具,喂 coding/trading agents)
   kcp <role> "<输入>"           直接跑一个角色(compiler/qa/query)
   kcp list                      列出角色
 
@@ -164,6 +166,13 @@ func Main(args []string) int {
 		}
 		if _, err := eval.RunCompare(root, cfg, seedList); err != nil {
 			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		return 0
+	case "mcp":
+		srv := mcp.New(root, eval.RetrievalOpts(root, cfg))
+		if err := srv.Serve(os.Stdin, os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, "mcp: ", err)
 			return 1
 		}
 		return 0

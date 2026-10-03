@@ -52,7 +52,7 @@ export KCP_API_KEY=sk-xxx              # 本地 ollama 可留空
 ./kcp eval                    # 评估种子见 eval/seeds/(按你的知识库改写),报告落 eval/reports/
 
 # 6. 把知识库喂给其他 agent 当外脑
-#    → context/ 目录的 MCP server 把 wiki 暴露成 MCP 工具
+#    → ./kcp mcp 把 wiki 暴露成 MCP server(支柱 B,纯 Go 零依赖)
 #    → 在 Claude Code / Codex 的 .mcp.json 里接上(见 context/.mcp.json.example)
 ```
 
@@ -95,7 +95,7 @@ knowledge-compounder/
 ├── scripts/             ← 保留 shell:pdf2md.sh / export-public.sh(Python 已移植到 Go)
 ├── templates/           ← source/concept/entity/synthesis 页面模板
 ├── examples/            ← 合成演示:raw + 编译产物,展示纪律
-├── context/             ← 支柱B:wiki 暴露为 MCP server,喂给 coding/trading agents
+├── context/             ← 支柱B:kcp mcp 把 wiki 暴露成 MCP server,喂给 coding/trading agents
 └── docs/ 上手.md  循环设计.md  隐私模型.md  harness设计.md
 ```
 

@@ -6,31 +6,39 @@
 
 ## 快速开始
 
+全 Go、零依赖(纯 stdlib 实现 MCP JSON-RPC 协议,不引 mcp-go SDK)。
+
 ```bash
-cd context/wiki-mcp-server
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-python3 server.py                 # 默认 stdio,在项目根目录运行(读 ../wiki)
+cd knowledge-compounder
+go build -o kcp ./cmd/kcp
+./kcp mcp        # MCP stdio server,在项目根目录运行(自动定位 SCHEMA.md 所在根)
 ```
 
-然后在 Claude Code / Codex 的 `.mcp.json` 里接上(见 `../.mcp.json.example`)。
+然后在 Claude Code / Codex 的 `.mcp.json` 里接上(见 `../.mcp.json.example`):
+
+```json
+{ "mcpServers": { "wiki-context": {
+  "command": "/绝对/路径/knowledge-compounder/kcp",
+  "args": ["mcp"], "env": { "KCP_EMBED_MODEL": "...", "KCP_API_KEY": "..." } } } }
+```
 
 ## 工具
 
-| 工具 | 作用 | 实现状态 |
+| 工具 | 作用 | 状态 |
 |---|---|---|
-| `search_wiki(query, k)` | 关键词检索 wiki(标题+正文加权) | ✅ 骨架(grep 级) |
+| `search_wiki(query, k)` | 混合检索(词法+语义向量,Phase 4),返回标题+**私有度徽标** `[A]/[B]/[C]`+命中分+摘要 | ✅ |
 | `get_page(page)` | 读取一个 wiki 页面 | ✅ |
-| `get_related(page)` | 解析页面的 `[[wikilinks]]`,返回关联页 | ✅ |
-| `list_recent(n)` | 最近编译的源页 | ✅ |
-| `synthesize_for(question)` | 带 A/B/C 证据分层的综合回答 | 🔜 TODO:Agentic RAG |
+| `get_related(page)` | 解析页面的 `[[wikilinks]]`,返回可解析/断链去向 | ✅ |
+| `list_recent(n)` | 最近修改的 wiki 页 | ✅ |
+| `synthesize_for(question)` | Agentic RAG 综合回答(检索+LLM 综合,带来源与徽标引用);需配 `KCP_API_KEY` | ✅ |
 
-## TODO(从骨架到可用)
+## 环境变量
 
-1. **检索升级**:grep 级 → embedding 检索 + rerank(见 `docs/循环设计.md` 的"编译 vs RAG 对照实验")
-2. **synthesize_for 落地**:用 compile 循环 + SCHEMA 的 synthesis 模板做"查询即投资"——综合结果 filed back 到 `wiki/synthesis/`
-3. **证据分层**:返回片段带 A/B/C 私有度标注
-4. **A2A 暴露**:如需给远程 agent 调用,用 ADK launcher 包一层(见战略层的 A2A 讨论)
+检索工具零 LLM 可跑;`synthesize_for` 需要 LLM:
+
+- `KCP_PROVIDER` / `KCP_MODEL` / `KCP_API_KEY` / `KCP_BASE_URL` —— synthesize_for 的 LLM
+- `KCP_EMBED_MODEL` / `KCP_EMBED_BASE_URL` / `KCP_EMBED_API_KEY` —— 语义检索;留空用离线字符哈希嵌入
+- `KCP_RETRIEVE_K` —— 默认检索条数(默认 5)
 
 ## 为什么不"全塞进窗口"
 
