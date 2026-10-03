@@ -95,7 +95,7 @@ kcp <role> "<输入>"          直接跑角色
 ## 与旧版的关系
 
 - `.claude/` 与 `legacy/python-harness/` → 已删除(指令已提炼进 `internal/agents` + SCHEMA.md;ReAct 要点见上)
-- `scripts/*.py` → 待移植到 Go(Phase 2:完整 lint/export-public/pdf2md/update/registry/relink)
+- `scripts/` → Python 工具链已全部移植到 Go;仅保留 pdf2md.sh / export-public.sh(依赖外部工具的 shell)
 - `context/wiki-mcp-server/`(Python MCP)→ Phase 5 移植 Go
 
 ## 开发路线(Phase)

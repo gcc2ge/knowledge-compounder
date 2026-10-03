@@ -32,6 +32,8 @@ const usage = `kcp — 知识编译复利引擎(自研 agent,任意 LLM)
   kcp index                           重建 wiki/index.md(从页面 frontmatter)
   kcp skeleton <raw文件> [--tags a,b] [--origin external|self] [--write]
                                       生成 source 页骨架
+  kcp preflight <raw> [--source-page <页>]
+                                      硬资产完整性核验(代码块/表/示例不丢)
   kcp check-sources                   检查概念/实体页 sources 是否被错误替换(git)
   kcp <role> "<输入>"           直接跑一个角色(compiler/qa/query)
   kcp list                      列出角色
@@ -83,6 +85,31 @@ func Main(args []string) int {
 		return 0
 	case "skeleton":
 		return runSkeleton(root, args[1:])
+	case "preflight":
+		if len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "用法: kcp preflight <raw> [--source-page <页>]")
+			return 1
+		}
+		sourcePage := ""
+		for i := 2; i < len(args); i++ {
+			if args[i] == "--source-page" && i+1 < len(args) {
+				sourcePage = filepath.Join(root, args[i+1])
+				i++
+			}
+		}
+		report, issues, err := wiki.Preflight(filepath.Join(root, args[1]), sourcePage)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		fmt.Print(report)
+		for _, it := range issues {
+			fmt.Println("  " + it)
+		}
+		if len(issues) > 0 {
+			return 1
+		}
+		return 0
 	case "check-sources":
 		problems, err := wiki.CheckSourcesShrink(root)
 		if err != nil {

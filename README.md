@@ -78,7 +78,7 @@ internal/wiki         知识库操作(扫描/检索/lint),替代原 Python scrip
 internal/cli          命令分发
 ```
 
-`scripts/*.py` 为待移植旧工具链。设计见 `docs/harness设计.md`。
+`scripts/` 仅保留 pdf2md.sh(T1/T2 PDF 管道)与 export-public.sh(隐私导出)——两者依赖外部工具,保留 shell;Python 工具链已全部移植到 Go。设计见 `docs/harness设计.md`。
 
 ## 项目结构
 
@@ -86,7 +86,7 @@ internal/cli          命令分发
 knowledge-compounder/
 ├── SCHEMA.md            ← 编译纪律:页面格式约定(本项目的心智)
 ├── cmd/kcp + internal/  ← 自研 Go agent:provider/agent/agents/tools/wiki/cli
-├── scripts/             ← 旧 Python 工具链(待移植到 Go)
+├── scripts/             ← 保留 shell:pdf2md.sh / export-public.sh(Python 已移植到 Go)
 ├── templates/           ← source/concept/entity/synthesis 页面模板
 ├── examples/            ← 合成演示:raw + 编译产物,展示纪律
 ├── context/             ← 支柱B:wiki 暴露为 MCP server,喂给 coding/trading agents
