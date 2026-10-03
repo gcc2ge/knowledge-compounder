@@ -106,7 +106,7 @@ kcp <role> "<输入>"          直接跑角色
 |---|---|---|
 | 0 | 全 Go 骨架:provider 抽象 + agent 循环 + 6 工具 + status/lint/observe CLI | ✅ `a7cc774` |
 | 1 | 真实 LLM 端到端实测:compile/query 跑通,验证工具调用回填与停止条件,修循环 bug(DeepSeek/Ollama) | ✅ 智谱 GLM 实测通过(2026-10-03) |
-| 2 | scripts/*.py 移植 Go:完整 lint(矛盾/格式/覆盖)、export-public、pdf2md、update/registry/relink、check-sources-shrink、source-skeleton | ⬜ |
+| 2 | scripts/*.py 移植 Go:完整 lint(矛盾/格式/覆盖)、update(add-source/touch/add-link)、check-sources-shrink、index 重建、source-skeleton。pdf2md/export-public 保留 shell(依赖外部工具) | ✅ 分批完成(2026-10-03) |
 | 3 | 生产化 harness:SSE 流式(M02 两层流式栈)、MaxTokens/Deadline/MaxHeal、checkpoint 持久化(M04 Store)、策展决策点暂停要人 | ⬜ |
 | 4 | 检索与质量:grep → embedding + rerank(Agentic RAG)、证据 A/B/C 分层、评估集(Agent-as-a-Judge)、RAG-vs-编译对照实验 | ⬜ |
 | 5 | context/wiki-mcp-server Python → Go(支柱 B 完整 MCP server,喂 coding/trading agents) | ⬜ |
