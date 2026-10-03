@@ -11,12 +11,20 @@ type ToolCall struct {
 	Arguments string // JSON 字符串
 }
 
+// Usage LLM 响应的 token 用量(provider 解析 API 返回;缺失时 Runtime 用估算兜底)。
+type Usage struct {
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
+	TotalTokens  int `json:"total_tokens"`
+}
+
 // Message 统一消息模型:system | user | assistant | tool。
 type Message struct {
 	Role       string
 	Content    string
 	ToolCalls  []ToolCall
 	ToolCallID string
+	Usage      *Usage // 仅 assistant 响应携带;累计消费供 MaxTokens 闸门
 }
 
 // ToolDef 工具定义(JSON Schema 参数 + Go 实现)。

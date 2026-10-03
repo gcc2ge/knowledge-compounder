@@ -2,6 +2,8 @@
 // - 工具结果作为 Observation 回填(messages 追加式,记忆 = Messages)
 // - 错误自愈:工具 panic → 观察文本喂回;LLM 调用失败 → MaxHeal 退避重试
 // - 停止条件:MaxSteps + MaxSameAction + MaxTokens + Deadline(ctx)
+// - 上下文治理(M09):Compaction 超预算折叠早期历史(见 compaction.go)
+// - 可观测(M10):OnEvent 结构化事件流(见 event.go);OnStream 是文本子集
 // - checkpoint:StateFile 持久化 Messages,可中断/可恢复/可审计(M04 Store)
 package agent
 
@@ -16,15 +18,21 @@ import (
 )
 
 type Runtime struct {
-	Provider      provider.Provider
-	SystemPrompt  string
-	Tools         []provider.ToolDef
-	MaxSteps      int
-	MaxSameAction int
-	MaxTokens     int // 0 = 不限
-	MaxHeal       int // 0 = 默认 1 次机会
-	StateFile     string
-	OnStream      func(string) // SSE 增量输出回调;Provider 实现 Streamer 时走流式
+	Provider        provider.Provider
+	SystemPrompt    string
+	Tools           []provider.ToolDef
+	MaxSteps        int
+	MaxSameAction   int
+	MaxTokens       int // 0 = 不限(预算:真实 usage 优先,缺省估算)
+	MaxHeal         int // 0 = 默认 1 次机会
+	StateFile       string
+	OnStream        func(string)     // SSE 增量文本回调(兼容;OnEvent 非 nil 时忽略)
+	OnEvent         EventHandler     // 结构化事件流(可观测,M10);非 nil 优先于 OnStream
+	Compaction      CompactionPolicy // 上下文治理(M09);零值 = 关闭
+	CheckpointEvery int              // 写 checkpoint 的步频;0 = 默认每 3 步
+
+	// 运行时内部状态(非并发,单循环)
+	usage *provider.Usage // 累计真实 token 消耗
 }
 
 // Run 执行一次 agent 任务:LLM 决策 → 执行工具 → 观察回填 → 再决策,直到无工具调用或达到停止条件。
@@ -39,46 +47,69 @@ func (r *Runtime) Run(ctx context.Context, input, state string) (string, error) 
 		msgs = append(msgs, provider.Message{Role: "user", Content: input})
 	}
 
+	every := r.CheckpointEvery
+	if every <= 0 {
+		every = 3
+	}
 	same := map[string]int{}
 	for step := 0; step < r.MaxSteps; step++ {
 		if err := ctx.Err(); err != nil {
+			r.emit(Event{Kind: EvStop, Step: step, Err: err})
 			return "", err
 		}
-		if r.MaxTokens > 0 && tokensUsed(msgs) >= r.MaxTokens {
-			return "", fmt.Errorf("达到 token 预算 %d,停止", r.MaxTokens)
+		if r.MaxTokens > 0 && r.budgetTokens(msgs) >= r.MaxTokens {
+			err := fmt.Errorf("达到 token 预算 %d(已用 %d),停止", r.MaxTokens, r.budgetTokens(msgs))
+			r.emit(Event{Kind: EvStop, Step: step, Tokens: r.budgetTokens(msgs), Err: err})
+			return "", err
 		}
+		r.emit(Event{Kind: EvStep, Step: step, Tokens: r.budgetTokens(msgs)})
 		reply, err := r.callProvider(ctx, msgs)
 		if err != nil {
+			r.emit(Event{Kind: EvError, Step: step, Err: err})
 			return "", err
 		}
+		r.accumulateUsage(reply)
 		if len(reply.ToolCalls) == 0 {
 			_ = r.saveCheckpoint(msgs) // 保留最终对话供审计
+			r.emit(Event{Kind: EvDone, Step: step, Text: reply.Content, Tokens: r.budgetTokens(msgs)})
 			return reply.Content, nil
 		}
 		for _, tc := range reply.ToolCalls {
+			r.emit(Event{Kind: EvToolCall, Step: step, Tool: tc.Name, Args: tc.Arguments})
 			obs := r.execTool(tc)
+			r.emit(Event{Kind: EvToolResult, Step: step, Tool: tc.Name, Result: trunc(obs, 300)})
 			msgs = append(msgs, provider.Message{Role: "assistant", Content: reply.Content, ToolCalls: []provider.ToolCall{tc}})
 			msgs = append(msgs, provider.Message{Role: "tool", Content: obs, ToolCallID: tc.ID})
 
 			sig := tc.Name + ":" + tc.Arguments
 			same[sig]++
 			if same[sig] > r.MaxSameAction {
-				return "", fmt.Errorf("同一动作重复 %d 次(%s),判定原地打转,停止", r.MaxSameAction, sig)
+				err := fmt.Errorf("同一动作重复 %d 次(%s),判定原地打转,停止", r.MaxSameAction, sig)
+				r.emit(Event{Kind: EvStop, Step: step, Err: err})
+				return "", err
 			}
 		}
-		if err := r.saveCheckpoint(msgs); err != nil {
-			return "", err
+		// M09 上下文治理:超预算折叠早期历史;压缩后必写 checkpoint 保审计。
+		if next, ok := r.maybeCompact(msgs); ok {
+			r.emit(Event{Kind: EvCompact, Step: step, Dropped: len(msgs) - len(next)})
+			msgs = next
+			_ = r.saveCheckpoint(msgs)
+		} else if step%every == every-1 {
+			_ = r.saveCheckpoint(msgs) // 降频写,避免每步全量序列化(O(n²) 写放大)
 		}
 	}
-	return "", fmt.Errorf("达到最大步数 %d,停止", r.MaxSteps)
+	err := fmt.Errorf("达到最大步数 %d,停止", r.MaxSteps)
+	r.emit(Event{Kind: EvStop, Step: r.MaxSteps, Err: err})
+	return "", err
 }
 
-// callProvider 调用 LLM:Provider 实现 Streamer 且 OnStream 非 nil 时走 SSE 流式;
+// callProvider 调用 LLM:Provider 实现 Streamer 且订阅了流式时走 SSE;
 // 失败时退避重试(至多 MaxHeal 次),吞瞬态错误。
 func (r *Runtime) callProvider(ctx context.Context, msgs []provider.Message) (provider.Message, error) {
-	if r.OnStream != nil {
+	if r.OnEvent != nil || r.OnStream != nil {
 		if st, ok := r.Provider.(provider.Streamer); ok {
-			return st.Stream(ctx, msgs, r.Tools, nil, r.OnStream)
+			onDelta := func(t string) { r.emit(Event{Kind: EvText, Text: t}) }
+			return st.Stream(ctx, msgs, r.Tools, nil, onDelta)
 		}
 	}
 	heal := r.MaxHeal
@@ -95,6 +126,28 @@ func (r *Runtime) callProvider(ctx context.Context, msgs []provider.Message) (pr
 		reply, err = r.Provider.Chat(ctx, msgs, r.Tools, nil)
 	}
 	return reply, err
+}
+
+// accumulateUsage 累计真实 token 消耗(provider 未返回 usage 时为 nil,走估算)。
+func (r *Runtime) accumulateUsage(reply provider.Message) {
+	if reply.Usage == nil {
+		return
+	}
+	if r.usage == nil {
+		r.usage = reply.Usage
+		return
+	}
+	r.usage.InputTokens += reply.Usage.InputTokens
+	r.usage.OutputTokens += reply.Usage.OutputTokens
+	r.usage.TotalTokens += reply.Usage.TotalTokens
+}
+
+// budgetTokens 返回当前累计 token 消耗:真实 usage 优先,缺省退回估算。
+func (r *Runtime) budgetTokens(msgs []provider.Message) int {
+	if r.usage != nil && r.usage.TotalTokens > 0 {
+		return r.usage.TotalTokens
+	}
+	return estimateTokens(msgs)
 }
 
 // saveCheckpoint 持久化当前消息序列(可审计/可恢复)。
@@ -125,8 +178,8 @@ func (r *Runtime) loadCheckpoint() []provider.Message {
 	return msgs
 }
 
-// tokensUsed 粗略估算已用 token(≈字符数/4)。
-func tokensUsed(msgs []provider.Message) int {
+// estimateTokens 粗略估算消息序列 token 量(≈字符数/4)。
+func estimateTokens(msgs []provider.Message) int {
 	n := 0
 	for _, m := range msgs {
 		n += len([]rune(m.Content))
@@ -135,6 +188,15 @@ func tokensUsed(msgs []provider.Message) int {
 		}
 	}
 	return n / 4
+}
+
+// trunc 截断长文本(工具结果/参数渲染),避免事件刷屏。
+func trunc(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
 }
 
 // execTool 执行工具并返回 Observation;失败/panic 喂回模型而非崩溃(错误自愈)。

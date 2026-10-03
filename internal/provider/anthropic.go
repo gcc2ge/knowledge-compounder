@@ -126,11 +126,19 @@ func (p *Anthropic) Chat(ctx context.Context, msgs []Message, tools []ToolDef, s
 			Name  string         `json:"name"`
 			Input map[string]any `json:"input"`
 		} `json:"content"`
+		Usage *struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+		} `json:"usage"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
 		return Message{}, err
 	}
 	out := Message{Role: "assistant"}
+	if data.Usage != nil {
+		out.Usage = &Usage{InputTokens: data.Usage.InputTokens, OutputTokens: data.Usage.OutputTokens,
+			TotalTokens: data.Usage.InputTokens + data.Usage.OutputTokens}
+	}
 	for _, b := range data.Content {
 		switch b.Type {
 		case "text":
@@ -201,9 +209,17 @@ func (p *Anthropic) Stream(ctx context.Context, msgs []Message, tools []ToolDef,
 				Text        string `json:"text"`
 				PartialJSON string `json:"partial_json"`
 			} `json:"delta"`
+			Usage *struct {
+				InputTokens  int `json:"input_tokens"`
+				OutputTokens int `json:"output_tokens"`
+			} `json:"usage"`
 		}
 		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &ev); err != nil {
 			continue
+		}
+		if ev.Usage != nil { // message_delta 末帧
+			out.Usage = &Usage{InputTokens: ev.Usage.InputTokens, OutputTokens: ev.Usage.OutputTokens,
+				TotalTokens: ev.Usage.InputTokens + ev.Usage.OutputTokens}
 		}
 		switch ev.Type {
 		case "content_block_start":

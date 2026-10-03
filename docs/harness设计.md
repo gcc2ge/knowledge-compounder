@@ -114,15 +114,14 @@ kcp <role> "<输入>"          直接跑角色
 | 4 | 检索与质量:grep → embedding + rerank(Agentic RAG)、证据 A/B/C 分层、评估集(Agent-as-a-Judge)、RAG-vs-编译对照实验 | ✅ 完成(2026-10-03)`kcp search`/`kcp eval`;GLM 实测 B 优 3/3(+1.1 均分) |
 | 5 | context/wiki-mcp-server Python → Go(支柱 B 完整 MCP server,喂 coding/trading agents) | ✅ 完成(2026-10-03)`kcp mcp`;纯 stdlib MCP stdio + synthesize_for Agentic RAG |
 | 6 | A2A 暴露(M12 ADK launcher)给 agent cloud + License 策略定稿(AGPL/BSL vs MIT) | ⬜ |
+| 7 | **上下文治理 + 可观测评估(M09/M10 P1 补齐)**:Compaction 折叠早期历史(`KCP_COMPACT_TOKENS`,保留最近 N 轮,防 O(n²) 请求体)、真实 token usage 闸门(`Message.Usage` + OpenAI `include_usage`/Anthropic `message_delta`)、checkpoint 降频(每 N 步写,压缩后必写)、**结构化 AgentEvent 流**(EvText/Step/ToolCall/ToolResult/Compact/Done/Stop/Error,供 CLI 逐步渲染与 Supervisor 内省)、**eval 轨迹判官**(检索轨迹 + 3 维过程质量打分,捕「对的答案、错的过程」)、种子按真实知识库重写(6 问跨 5 知识域) | ✅ 完成(2026-10-03)`kcp compile`/`query` 事件渲染;`kcp eval` 报告含轨迹节 |
 
 ## 边界与 TODO
 
-> 各项已在「开发路线」中按 Phase 归位,此处保留细节。
+> 各项已按 Phase 归位;P1 两项(上下文治理/可观测评估)已闭环(Phase 7),此处保留仍在开放的缺口。
 
-- **SSE 流式**(Phase 3):骨架非流式;生产补 SSE(M02 两层流式栈)
-- **停止条件**(Phase 1+3):MaxSteps/MaxSameAction 已就位;补 MaxTokens/Deadline/MaxHeal
-- **检索升级**(Phase 4):grep → BM25-lite 词法 + 可选向量余弦(Agentic RAG),0.55/0.45 融合 rerank;证据 A/B/C 分层徽标自动标注
-- **人工把关点**(Phase 3):compiler 在"建概念页?"策展决策处暂停要用户裁决("人策展>自动"进协议)
-- **状态 checkpoint**(Phase 3):可中断/可恢复/可审计(M04 Store 持久化)
-- **评估集**(Phase 4):`kcp eval`——评估种子 `eval/seeds/`(需按自己知识库改写),Agent-as-a-Judge 按 5 维打分(论证完整性/连接价值/矛盾标注/综合密度/可迁移性),报告落 `eval/reports/`
-- **A2A 暴露**(Phase 6):M12 ADK launcher 包一层,开放给远程 agent
+- **OS 沙箱 + 权限流(产品化最大短板)**:write_file 只有路径白名单;无 OS 级隔离、无 ask/allow/deny 权限流。对齐 Codex Seatbelt/Landlock 需容器或进程级权限降级,方案待定。
+- **A2A 暴露(Phase 6)**:M12 ADK launcher 包一层,开放给远程 agent;License 策略定稿(AGPL/BSL vs MIT)。
+- **mcp synthesize_for**:单页截 2000 字符、无 SSE 流式;get_page 无页长上限保护。
+- **Provider 实测面**:仅智谱 GLM 端到端验证过;Ollama/DeepSeek/vLLM 需按 Phase 1 主张补跑。
+- **compaction 策略保守**:折叠占位只提示不总结(零依赖自洽);若需求摘要式压缩需额外 LLM 调用(放弃零依赖或按 `Capabilities` 分流)。

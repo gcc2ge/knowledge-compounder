@@ -47,6 +47,8 @@ const usage = `kcp — 知识编译复利引擎(自研 agent,任意 LLM)
 环境变量: KCP_PROVIDER(openai-compatible|anthropic) KCP_MODEL KCP_API_KEY KCP_BASE_URL
           KCP_MAX_STEPS KCP_MAX_SAME_ACTION KCP_MAX_TOKENS KCP_MAX_HEAL KCP_DEADLINE(秒) KCP_STATE_FILE
           KCP_STREAM(默认1=SSE流式,0=关闭)
+          KCP_COMPACT_TOKENS(上下文治理:估算token超此值压缩早期历史;0=关闭)
+          KCP_COMPACT_KEEP_ROUNDS(压缩保留最近几轮;默认8) KCP_CHECKPOINT_EVERY(checkpoint步频;默认3)
           KCP_EMBED_MODEL(留空=离线字符哈希嵌入;设置后用 OpenAI 兼容 /embeddings 语义检索)
           KCP_EMBED_BASE_URL KCP_EMBED_API_KEY(默认跟随 KCP_BASE_URL/KCP_API_KEY)
           KCP_RETRIEVE_K(默认5)
@@ -257,18 +259,37 @@ func runRole(root string, cfg config.Config, role, input string) int {
 	}[role]
 
 	rt := &agent.Runtime{
-		Provider:      p,
-		SystemPrompt:  system,
-		Tools:         tools.Build(root, terminalAsk, eval.RetrievalOpts(root, cfg)),
-		MaxSteps:      cfg.MaxSteps,
-		MaxSameAction: cfg.MaxSameAction,
-		MaxTokens:     cfg.MaxTokens,
-		MaxHeal:       cfg.MaxHeal,
-		StateFile:     cfg.StateFile,
+		Provider:        p,
+		SystemPrompt:    system,
+		Tools:           tools.Build(root, terminalAsk, eval.RetrievalOpts(root, cfg)),
+		MaxSteps:        cfg.MaxSteps,
+		MaxSameAction:   cfg.MaxSameAction,
+		MaxTokens:       cfg.MaxTokens,
+		MaxHeal:         cfg.MaxHeal,
+		StateFile:       cfg.StateFile,
+		CheckpointEvery: cfg.CheckpointEvery,
+		Compaction: agent.CompactionPolicy{
+			Enabled:    cfg.CompactTokens > 0,
+			MaxTokens:  cfg.CompactTokens,
+			KeepRounds: cfg.KeepRounds,
+		},
 	}
 	streamed := false
 	if cfg.Stream {
-		rt.OnStream = func(t string) { fmt.Print(t); streamed = true }
+		// 结构化事件流渲染:文本打 stdout(流式),工具调用/返回打 stderr(逐步可见)。
+		rt.OnEvent = func(ev agent.Event) {
+			switch ev.Kind {
+			case agent.EvText:
+				fmt.Print(ev.Text)
+				streamed = true
+			case agent.EvToolCall:
+				fmt.Fprintf(os.Stderr, "\n[step %d] → %s(%s)\n", ev.Step, ev.Tool, truncStr(ev.Args, 100))
+			case agent.EvToolResult:
+				fmt.Fprintf(os.Stderr, "[step %d] ← %s: %s\n", ev.Step, ev.Tool, truncStr(ev.Result, 180))
+			case agent.EvCompact:
+				fmt.Fprintf(os.Stderr, "[step %d] ⇥ 上下文压缩:折叠 %d 条早期消息\n", ev.Step, ev.Dropped)
+			}
+		}
 	}
 	out, err := rt.Run(ctx, input, "")
 	if err != nil {
@@ -364,6 +385,15 @@ func runSkeleton(root string, args []string) int {
 	rel, _ := filepath.Rel(root, fp)
 	fmt.Println("已写入 " + rel)
 	return 0
+}
+
+// truncStr 截断长文本供 stderr 逐步渲染(工具参数/结果)。
+func truncStr(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
 }
 
 // terminalAsk 策展决策交互:终端时读用户裁决;非终端(管道/CI)返回非交互提示。

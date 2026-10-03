@@ -31,6 +31,22 @@ type Seed struct {
 // DefaultRubric SCHEMA 质量维度(来源性质 A/B/C 之外的评估面)。
 var DefaultRubric = []string{"论证完整性", "连接价值", "矛盾标注", "综合密度", "可迁移性"}
 
+// TrajRubric 轨迹质量维度(过程评估,M10 Agent-as-a-Judge 轨迹判官)。
+var TrajRubric = []string{"检索相关度", "证据覆盖", "证据忠实"}
+
+// TraceHit 一次检索命中的证据(M10 轨迹:检索到了什么)。
+type TraceHit struct {
+	Label string  `json:"label"` // 页面/文档标签(含路径)
+	Score float64 `json:"score"` // 融合检索分
+}
+
+// Trace 单方案的检索轨迹:TopK 命中的证据列表。用于「对的答案、错的过程」检测——
+// 答案文本可以漂亮,但若检索根本没命中关键页,过程就是坏的。
+type Trace struct {
+	Mode string     `json:"mode"` // "rag" | "wiki"
+	Hits []TraceHit `json:"hits"`
+}
+
 // LoadSeeds 加载评估种子:path 指定单个文件;空则扫 root/eval/seeds/*.json。
 func LoadSeeds(root, path string) ([]Seed, error) {
 	if path == "" {
@@ -124,12 +140,16 @@ func buildContext(docsByPath map[string]string, res []retrieval.Result) string {
 	return b.String()
 }
 
-// Answer 用给定语料检索并让 LLM 答题。返回答案文本。
-func Answer(ctx context.Context, p provider.Provider, docs []retrieval.Doc, q string, opts retrieval.Options, top int) (string, error) {
+// Answer 用给定语料检索并让 LLM 答题。返回答案文本 + 检索轨迹(供轨迹判官)。
+func Answer(ctx context.Context, p provider.Provider, docs []retrieval.Doc, q string, opts retrieval.Options, top int) (string, Trace, error) {
 	opts.Top = top
 	res := retrieval.Search(docs, q, opts)
+	trace := Trace{Hits: make([]TraceHit, 0, len(res))}
+	for _, r := range res {
+		trace.Hits = append(trace.Hits, TraceHit{Label: r.Label, Score: r.Score})
+	}
 	if len(res) == 0 {
-		return "(检索无命中)", nil
+		return "(检索无命中)", trace, nil
 	}
 	byPath := make(map[string]string, len(docs))
 	for _, d := range docs {
@@ -141,17 +161,17 @@ func Answer(ctx context.Context, p provider.Provider, docs []retrieval.Doc, q st
 		{Role: "user", Content: prompt},
 	}, nil, nil)
 	if err != nil {
-		return "", err
+		return "", trace, err
 	}
-	return strings.TrimSpace(msg.Content), nil
+	return strings.TrimSpace(msg.Content), trace, nil
 }
 
 // ---- 评审(Agent-as-a-Judge) ----
 
 type judgeScores struct {
-	Scores   map[string]map[string]int `json:"scores"`
-	Verdict  string                    `json:"verdict"`
-	Rationale string                   `json:"rationale"`
+	Scores    map[string]map[string]int `json:"scores"`
+	Verdict   string                    `json:"verdict"`
+	Rationale string                    `json:"rationale"`
 }
 
 const judgePrompt = `你是知识库方案评审(Agent-as-a-Judge)。同一问题给了两套检索方案的答案:
@@ -199,14 +219,92 @@ func Judge(ctx context.Context, p provider.Provider, seed Seed, ragAns, wikiAns 
 	return out, nil
 }
 
+// ---- 轨迹评审(过程质量,M10) ----
+
+type trajScores struct {
+	Scores    map[string]map[string]int `json:"scores"`
+	Rationale string                    `json:"trajRationale"`
+}
+
+const trajectoryJudgePrompt = `你是知识库检索轨迹评审(Agent-as-a-Judge)。同一问题,两套方案各自做了「检索 → 作答」:
+- 方案A = RAG外挂:直接检索未编译原文碎片
+- 方案B = 知识编译复利:检索编译后的知识资产(源摘要/概念/综合页)
+下面分别给出两方案的检索轨迹(命中的资料,按相关度降序带分)与最终答案。
+按 3 个维度对两方案各打 1-5 分(整数):
+- 检索相关度:检索到的资料与问题的相关程度
+- 证据覆盖:关键信息是否都在检索结果里,有无明显遗漏关键页/关键原文
+- 证据忠实:最终答案是否严格依据检索到的证据,而非引入外部知识或编造
+
+问题: %s
+
+方案A 检索轨迹:
+%s
+
+方案B 检索轨迹:
+%s
+
+方案A 答案:
+%s
+
+方案B 答案:
+%s
+
+只输出 JSON(不要 markdown 围栏,不要其他文字):
+{"scores":{"rag":{"检索相关度":1,"证据覆盖":1,"证据忠实":1},"wiki":{...}},"trajRationale":"一句话评语(哪方检索过程更好、差在哪)"}`
+
+// JudgeTrajectory 评审两方案的检索轨迹(过程质量) + 答案。判「对的答案、错的过程」。
+func JudgeTrajectory(ctx context.Context, p provider.Provider, seed Seed, ragTrace, wikiTrace Trace, ragAns, wikiAns string) (trajScores, error) {
+	prompt := fmt.Sprintf(trajectoryJudgePrompt, seed.Question,
+		traceText("A", ragTrace), traceText("B", wikiTrace), ragAns, wikiAns)
+	msg, err := p.Chat(ctx, []provider.Message{
+		{Role: "system", Content: "你是严格的评估评审,只输出 JSON。"},
+		{Role: "user", Content: prompt},
+	}, nil, nil)
+	if err != nil {
+		return trajScores{}, err
+	}
+	return parseTrajJSON(msg.Content)
+}
+
+// traceText 把检索轨迹渲染成给 judge 的文本:命中列表(label + score)。
+func traceText(prefix string, t Trace) string {
+	if len(t.Hits) == 0 {
+		return fmt.Sprintf("%s: (检索无命中)", prefix)
+	}
+	var b strings.Builder
+	for i, h := range t.Hits {
+		fmt.Fprintf(&b, "  %d. %s (分 %.2f)\n", i+1, h.Label, h.Score)
+	}
+	return prefix + ":\n" + b.String()
+}
+
+// parseTrajJSON 清洗并解析轨迹评审 JSON(容忍 markdown 围栏/前后缀)。
+func parseTrajJSON(text string) (trajScores, error) {
+	var out trajScores
+	text = strings.TrimSpace(text)
+	text = strings.TrimPrefix(text, "```json")
+	text = strings.TrimPrefix(text, "```")
+	text = strings.TrimSuffix(text, "```")
+	text = strings.TrimSpace(text)
+	text = regexp.MustCompile(`^[^{]*`).ReplaceAllString(text, "")
+	text = regexp.MustCompile(`}[^}]*$`).ReplaceAllString(text, "}")
+	if err := json.Unmarshal([]byte(text), &out); err != nil {
+		return trajScores{}, fmt.Errorf("轨迹评审 JSON 解析失败: %v\n原文: %.200s", err, text)
+	}
+	return out, nil
+}
+
 // ---- 报告 ----
 
 // CaseResult 单条种子的完整结果。
 type CaseResult struct {
-	Seed    Seed
-	RAGAns  string
-	WikiAns string
-	Judge   judgeScores
+	Seed      Seed
+	RAGAns    string
+	WikiAns   string
+	Judge     judgeScores
+	RAGTrace  Trace // M10 轨迹:过程质量评审的输入
+	WikiTrace Trace
+	Traj      trajScores
 }
 
 // RunCompare 跑完整对照实验:两方案各答题 → 评审 → 报告。
@@ -221,23 +319,31 @@ func RunCompare(root string, cfg config.Config, seeds []Seed) (string, error) {
 	var cases []CaseResult
 	for _, s := range seeds {
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-		ragAns, err := Answer(ctx, p, rawDocs, s.Question, opts, cfg.RetrieveK)
+		ragAns, ragTrace, err := Answer(ctx, p, rawDocs, s.Question, opts, cfg.RetrieveK)
 		if err != nil {
 			cancel()
 			return "", fmt.Errorf("RAG 答题失败 [%s]: %w", s.ID, err)
 		}
-		wikiAns, err := Answer(ctx, p, wikiDocs, s.Question, opts, cfg.RetrieveK)
+		wikiAns, wikiTrace, err := Answer(ctx, p, wikiDocs, s.Question, opts, cfg.RetrieveK)
 		if err != nil {
 			cancel()
 			return "", fmt.Errorf("WIKI 答题失败 [%s]: %w", s.ID, err)
 		}
 		j, err := Judge(ctx, p, s, ragAns, wikiAns)
-		cancel()
 		if err != nil {
+			cancel()
 			return "", fmt.Errorf("评审失败 [%s]: %w", s.ID, err)
 		}
-		cases = append(cases, CaseResult{Seed: s, RAGAns: ragAns, WikiAns: wikiAns, Judge: j})
-		fmt.Printf("✓ %s: verdict=%s\n", s.ID, j.Verdict)
+		// M10 轨迹判官:评价检索过程质量,捕捉「对的答案、错的过程」。
+		tj, err := JudgeTrajectory(ctx, p, s, ragTrace, wikiTrace, ragAns, wikiAns)
+		cancel()
+		if err != nil {
+			return "", fmt.Errorf("轨迹评审失败 [%s]: %w", s.ID, err)
+		}
+		ragTrace.Mode, wikiTrace.Mode = "rag", "wiki"
+		cases = append(cases, CaseResult{Seed: s, RAGAns: ragAns, WikiAns: wikiAns, Judge: j,
+			RAGTrace: ragTrace, WikiTrace: wikiTrace, Traj: tj})
+		fmt.Printf("✓ %s: verdict=%s · 轨迹优=%s\n", s.ID, j.Verdict, trajWinner(tj))
 	}
 	report := render(cases, cfg.Model)
 	fp := writeReport(root, report)
@@ -283,6 +389,28 @@ func render(cases []CaseResult, model string) string {
 	}
 	b.WriteString(fmt.Sprintf("\n评审倾向: %s\n", verdictStr(verdictCount)))
 
+	// M10 轨迹质量汇总:检索过程维度(过程好 ≠ 答案好)。
+	tavg := func(dim string) (float64, float64) {
+		totalA, totalB, n := 0, 0, 0
+		for _, c := range cases {
+			if c.Traj.Scores == nil {
+				continue
+			}
+			totalA += c.Traj.Scores["rag"][dim]
+			totalB += c.Traj.Scores["wiki"][dim]
+			n++
+		}
+		if n == 0 {
+			return 0, 0
+		}
+		return float64(totalA) / float64(n), float64(totalB) / float64(n)
+	}
+	b.WriteString("\n| 轨迹维度 | RAG | 编译 | Δ |\n|---|---|---|---|\n")
+	for _, dim := range TrajRubric {
+		a, w := tavg(dim)
+		b.WriteString(fmt.Sprintf("| %s | %.1f | %.1f | %+.1f |\n", dim, a, w, w-a))
+	}
+
 	for _, c := range cases {
 		note := c.Seed.Note
 		note = strings.TrimPrefix(note, "期望:")
@@ -299,8 +427,60 @@ func render(cases []CaseResult, model string) string {
 			}
 			b.WriteString("\n")
 		}
+		// M10 检索轨迹 + 过程质量评审
+		b.WriteString("\n**检索轨迹**:\n\n")
+		for _, t := range []struct {
+			name string
+			tr   Trace
+		}{{"RAG", c.RAGTrace}, {"编译复利", c.WikiTrace}} {
+			b.WriteString(fmt.Sprintf("- %s 命中 %d 条:", t.name, len(t.tr.Hits)))
+			for i, h := range t.tr.Hits {
+				if i >= 8 {
+					b.WriteString(" …")
+					break
+				}
+				b.WriteString(fmt.Sprintf(" [%s %.2f]", h.Label, h.Score))
+			}
+			b.WriteString("\n")
+		}
+		if c.Traj.Scores != nil {
+			b.WriteString("轨迹评审: ")
+			for _, m := range []string{"RAG", "WIKI"} {
+				b.WriteString(fmt.Sprintf("%s: ", m))
+				for _, dim := range TrajRubric {
+					if v, ok := c.Traj.Scores[strings.ToLower(m)][dim]; ok {
+						b.WriteString(fmt.Sprintf("%s=%d ", dim, v))
+					}
+				}
+				b.WriteString(" ")
+			}
+			b.WriteString("\n")
+			if c.Traj.Rationale != "" {
+				b.WriteString(fmt.Sprintf("轨迹评语: %s\n", c.Traj.Rationale))
+			}
+		}
 	}
 	return b.String()
+}
+
+// trajWinner 按轨迹维度总分判过程优胜方(用于命令行 ✓ 输出)。
+func trajWinner(t trajScores) string {
+	sumA, sumB := 0, 0
+	if t.Scores == nil {
+		return "无轨迹分"
+	}
+	for _, d := range TrajRubric {
+		sumA += t.Scores["rag"][d]
+		sumB += t.Scores["wiki"][d]
+	}
+	switch {
+	case sumB > sumA:
+		return "B"
+	case sumA > sumB:
+		return "A"
+	default:
+		return "持平"
+	}
 }
 
 func verdictStr(m map[string]int) string {

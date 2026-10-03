@@ -29,7 +29,9 @@ func NewOpenAICompatible(model, apiKey, baseURL string) *OpenAICompatible {
 	}
 }
 
-func (p *OpenAICompatible) Capabilities() Capabilities { return Capabilities{Tools: true, Stream: true} }
+func (p *OpenAICompatible) Capabilities() Capabilities {
+	return Capabilities{Tools: true, Stream: true}
+}
 
 // buildOpenAITools 序列化工具定义(OpenAI function calling 格式)。
 func buildOpenAITools(tools []ToolDef) []map[string]any {
@@ -120,6 +122,7 @@ func (p *OpenAICompatible) Chat(ctx context.Context, msgs []Message, tools []Too
 				} `json:"tool_calls"`
 			} `json:"message"`
 		} `json:"choices"`
+		Usage *Usage `json:"usage"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
 		return Message{}, err
@@ -128,7 +131,7 @@ func (p *OpenAICompatible) Chat(ctx context.Context, msgs []Message, tools []Too
 		return Message{}, fmt.Errorf("LLM 无输出")
 	}
 	apiMsg := data.Choices[0].Message
-	out := Message{Role: "assistant", Content: apiMsg.Content}
+	out := Message{Role: "assistant", Content: apiMsg.Content, Usage: data.Usage}
 	for _, tc := range apiMsg.ToolCalls {
 		out.ToolCalls = append(out.ToolCalls, ToolCall{ID: tc.ID, Name: tc.Function.Name, Arguments: tc.Function.Arguments})
 	}
@@ -141,6 +144,8 @@ func (p *OpenAICompatible) Stream(ctx context.Context, msgs []Message, tools []T
 	if defs := buildOpenAITools(tools); len(defs) > 0 {
 		payload["tools"] = defs
 	}
+	// stream_options.include_usage 让流式末帧携带 usage(真实 token 消耗,供 MaxTokens 闸门)
+	payload["stream_options"] = map[string]any{"include_usage": true}
 	if len(stop) > 0 {
 		payload["stop"] = stop
 	}
@@ -194,9 +199,13 @@ func (p *OpenAICompatible) Stream(ctx context.Context, msgs []Message, tools []T
 					} `json:"tool_calls"`
 				} `json:"delta"`
 			} `json:"choices"`
+			Usage *Usage `json:"usage"`
 		}
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			continue
+		}
+		if chunk.Usage != nil {
+			out.Usage = chunk.Usage
 		}
 		for _, c := range chunk.Choices {
 			if c.Delta.Content != "" {

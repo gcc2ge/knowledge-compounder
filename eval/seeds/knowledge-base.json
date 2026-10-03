@@ -1,0 +1,38 @@
+[
+  {
+    "id": "kb1",
+    "question": "Agent 的 harness 由哪五个组件构成?Claude Code / Codex / kcp 三家 harness 的本质差异在哪?",
+    "note": "期望:M04 五组件(LLM+Tools+State+Loop+Stop);三家 Loop 内核同构(TAO+FC),差异在护栏选型——Claude Code 权限系统+生态、Codex OS 沙箱、kcp 窄工具+路径白名单。",
+    "rubric": ["论证完整性", "连接价值"]
+  },
+  {
+    "id": "kb2",
+    "question": "原生 Function Calling 和文本 ReAct 的区别是什么?为什么 kcp 需要文本 ReAct 降级而 Claude Code / Codex 不需要?",
+    "note": "期望:FC=结构化 tool_calls 协议,ReAct=文本约定(Thought/Action/Observation)脆弱需解析;kcp 为模型自由付出兼容成本,商用锁自家模型所以无降级路径。",
+    "rubric": ["论证完整性", "矛盾标注"]
+  },
+  {
+    "id": "kb3",
+    "question": "MySQL 索引失效的典型场景有哪些?哪个最容易被忽视?",
+    "note": "期望:最左前缀、函数包裹/隐式类型转换、OR 断索引、LIKE 前缀模糊;最易忽视=对索引列做函数/运算导致无法走索引。",
+    "rubric": ["论证完整性", "可迁移性"]
+  },
+  {
+    "id": "kb4",
+    "question": "钱包账户体系里的「六形态」指什么?统一模型如何把六形态归一?",
+    "note": "期望:六形态机制(主/子/影子/冻结/在途/锁定等形态);统一模型=单账户抽象 + 形态字段 + 冻结/在途资金字段,记账与余额口径收敛。",
+    "rubric": ["综合密度", "连接价值"]
+  },
+  {
+    "id": "kb5",
+    "question": "知识编译复利与 RAG 外挂知识库的本质区别是什么?为什么说知识像复利一样增长?",
+    "note": "期望:RAG=读取机制(取完不增值);编译复利=编译+查询投资 filed back+失败 observe 回灌,每轮循环 wiki 更密。",
+    "rubric": ["综合密度", "可迁移性"]
+  },
+  {
+    "id": "kb6",
+    "question": "Go 并发里如何用 context 取消避免 goroutine 泄漏?给出核心写法。",
+    "note": "期望:ctx.Done() + select 双分支;生产消费双方都监听取消;任务 ctx 从父派生,超时/取消统一传播。",
+    "rubric": ["论证完整性", "可迁移性"]
+  }
+]
