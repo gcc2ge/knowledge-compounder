@@ -21,6 +21,7 @@ type Config struct {
 	CompactTokens   int    // M09 上下文治理:估算 token 超此值压缩早期历史;0 = 关闭治理
 	KeepRounds      int    // M09:压缩时保留最近几轮(0 = 默认 8)
 	CheckpointEvery int    // checkpoint 写盘步频(0 = 默认每 3 步)
+	MaxOutputTokens int    // 单次 LLM 输出上限透传(0 = 模型默认)
 	EmbedModel      string // 语义检索:留空 = 离线字符哈希嵌入;设置后用 OpenAI 兼容 /embeddings
 	EmbedBaseURL    string
 	EmbedAPIKey     string
@@ -43,6 +44,7 @@ func Load() Config {
 		CompactTokens:   getenvInt("KCP_COMPACT_TOKENS", 0),
 		KeepRounds:      getenvInt("KCP_COMPACT_KEEP_ROUNDS", 0),
 		CheckpointEvery: getenvInt("KCP_CHECKPOINT_EVERY", 0),
+		MaxOutputTokens: getenvInt("KCP_MAX_OUTPUT_TOKENS", 0),
 		EmbedModel:      os.Getenv("KCP_EMBED_MODEL"),
 		EmbedBaseURL:    getenv("KCP_EMBED_BASE_URL", os.Getenv("KCP_BASE_URL")),
 		EmbedAPIKey:     getenv("KCP_EMBED_API_KEY", os.Getenv("KCP_API_KEY")),

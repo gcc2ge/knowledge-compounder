@@ -23,12 +23,12 @@ type Doc struct {
 
 // Result 单条检索结果。
 type Result struct {
-	Path    string
-	Label   string
-	Score   float64 // 0-1 融合分
-	Lexical float64 // 词法子分
+	Path     string
+	Label    string
+	Score    float64 // 0-1 融合分
+	Lexical  float64 // 词法子分
 	Semantic float64 // 向量子分(-1 表示未启用)
-	Summary string
+	Summary  string
 }
 
 // Options 检索选项。
@@ -150,7 +150,7 @@ func corpusVectors(docs []Doc, emb embed.Embedder, cache *embed.Cache) [][]float
 	var pending []int
 	for i, d := range docs {
 		if fi, err := os.Stat(d.Path); err == nil && cache != nil {
-			if v, ok := cache.Get(embed.Key(d.Path, fi)); ok {
+			if v, ok := cache.Get(embed.Key(d.Path, fi), emb.Dim()); ok { // 维度校验:切换嵌入器时旧缓存视为 miss
 				vecs[i] = v
 				continue
 			}

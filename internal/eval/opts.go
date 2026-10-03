@@ -23,7 +23,11 @@ func RetrievalOpts(root string, cfg config.Config) retrieval.Options {
 
 func newProvider(cfg config.Config) provider.Provider {
 	if cfg.Provider == "anthropic" {
-		return provider.NewAnthropic(cfg.Model, cfg.APIKey, cfg.BaseURL)
+		p := provider.NewAnthropic(cfg.Model, cfg.APIKey, cfg.BaseURL)
+		p.MaxTokens = cfg.MaxOutputTokens
+		return p
 	}
-	return provider.NewOpenAICompatible(cfg.Model, cfg.APIKey, cfg.BaseURL)
+	p := provider.NewOpenAICompatible(cfg.Model, cfg.APIKey, cfg.BaseURL)
+	p.MaxTokens = cfg.MaxOutputTokens
+	return p
 }

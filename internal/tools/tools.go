@@ -65,13 +65,13 @@ func Build(root string, ask func(string) string, opts retrieval.Options) []provi
 			},
 		},
 		{
-			Name: "write_file", Description: "写入 wiki/raw/examples 内的文件(编译写页面用)",
+			Name: "write_file", Description: "写入 wiki/ examples 内的文件(编译写页面用);raw/ 不可变,禁止写入",
 			Parameters: obj(map[string]any{"path": strProp, "content": strProp}),
 			Func: func(args map[string]any) string {
 				path, content := str(args, "path"), str(args, "content")
-				fp, ok := safeJoin(root, path, "wiki", "raw", "examples")
+				fp, ok := safeJoin(root, path, "wiki", "examples")
 				if !ok {
-					return fmt.Sprintf("拒绝:只允许写 wiki/ raw/ examples/,收到 %s", path)
+					return fmt.Sprintf("拒绝:只允许写 wiki/ examples/(raw/ 不可变,禁止写入),收到 %s", path)
 				}
 				if err := os.MkdirAll(filepath.Dir(fp), 0o755); err != nil {
 					return fmt.Sprintf("写入失败: %v", err)

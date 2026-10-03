@@ -14,10 +14,11 @@ import (
 )
 
 type OpenAICompatible struct {
-	Model   string
-	APIKey  string
-	BaseURL string
-	Client  *http.Client
+	Model     string
+	APIKey    string
+	BaseURL   string
+	MaxTokens int // 0 = 模型默认上限;>0 透传 max_tokens 限制单次输出长度
+	Client    *http.Client
 }
 
 func NewOpenAICompatible(model, apiKey, baseURL string) *OpenAICompatible {
@@ -79,6 +80,9 @@ func messagesToAPI(msgs []Message) []map[string]any {
 
 func (p *OpenAICompatible) Chat(ctx context.Context, msgs []Message, tools []ToolDef, stop []string) (Message, error) {
 	payload := map[string]any{"model": p.Model, "messages": messagesToAPI(msgs)}
+	if p.MaxTokens > 0 {
+		payload["max_tokens"] = p.MaxTokens
+	}
 	if defs := buildOpenAITools(tools); len(defs) > 0 {
 		payload["tools"] = defs
 	}
@@ -141,6 +145,9 @@ func (p *OpenAICompatible) Chat(ctx context.Context, msgs []Message, tools []Too
 // Stream SSE 流式版 Chat:delta.content → onDelta;tool_calls 增量按 index 归并。
 func (p *OpenAICompatible) Stream(ctx context.Context, msgs []Message, tools []ToolDef, stop []string, onDelta func(string)) (Message, error) {
 	payload := map[string]any{"model": p.Model, "messages": messagesToAPI(msgs), "stream": true}
+	if p.MaxTokens > 0 {
+		payload["max_tokens"] = p.MaxTokens
+	}
 	if defs := buildOpenAITools(tools); len(defs) > 0 {
 		payload["tools"] = defs
 	}

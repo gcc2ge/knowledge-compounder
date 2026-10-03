@@ -49,6 +49,7 @@ const usage = `kcp — 知识编译复利引擎(自研 agent,任意 LLM)
           KCP_STREAM(默认1=SSE流式,0=关闭)
           KCP_COMPACT_TOKENS(上下文治理:估算token超此值压缩早期历史;0=关闭)
           KCP_COMPACT_KEEP_ROUNDS(压缩保留最近几轮;默认8) KCP_CHECKPOINT_EVERY(checkpoint步频;默认3)
+          KCP_MAX_OUTPUT_TOKENS(单次LLM输出上限透传;0=模型默认)
           KCP_EMBED_MODEL(留空=离线字符哈希嵌入;设置后用 OpenAI 兼容 /embeddings 语义检索)
           KCP_EMBED_BASE_URL KCP_EMBED_API_KEY(默认跟随 KCP_BASE_URL/KCP_API_KEY)
           KCP_RETRIEVE_K(默认5)
@@ -414,9 +415,13 @@ func terminalAsk(question string) string {
 
 func newProvider(cfg config.Config) provider.Provider {
 	if cfg.Provider == "anthropic" {
-		return provider.NewAnthropic(cfg.Model, cfg.APIKey, cfg.BaseURL)
+		p := provider.NewAnthropic(cfg.Model, cfg.APIKey, cfg.BaseURL)
+		p.MaxTokens = cfg.MaxOutputTokens
+		return p
 	}
-	return provider.NewOpenAICompatible(cfg.Model, cfg.APIKey, cfg.BaseURL)
+	p := provider.NewOpenAICompatible(cfg.Model, cfg.APIKey, cfg.BaseURL)
+	p.MaxTokens = cfg.MaxOutputTokens
+	return p
 }
 
 // observe 捕获观察:写 raw/observations/<ts>-<strategy>.md(frontmatter + 内容)。

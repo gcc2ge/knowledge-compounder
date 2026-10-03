@@ -14,10 +14,11 @@ import (
 )
 
 type Anthropic struct {
-	Model   string
-	APIKey  string
-	BaseURL string
-	Client  *http.Client
+	Model     string
+	APIKey    string
+	BaseURL   string
+	MaxTokens int // 0 = 默认 8192;>0 覆盖单次输出上限
+	Client    *http.Client
 }
 
 func NewAnthropic(model, apiKey, baseURL string) *Anthropic {
@@ -83,9 +84,16 @@ func messagesToAnthropic(msgs []Message) (string, []map[string]any) {
 	return system, blocks
 }
 
+func (p *Anthropic) maxTokens() int {
+	if p.MaxTokens > 0 {
+		return p.MaxTokens
+	}
+	return 8192
+}
+
 func (p *Anthropic) Chat(ctx context.Context, msgs []Message, tools []ToolDef, stop []string) (Message, error) {
 	system, blocks := messagesToAnthropic(msgs)
-	payload := map[string]any{"model": p.Model, "messages": blocks, "max_tokens": 8192}
+	payload := map[string]any{"model": p.Model, "messages": blocks, "max_tokens": p.maxTokens()}
 	if system != "" {
 		payload["system"] = system
 	}
@@ -154,7 +162,7 @@ func (p *Anthropic) Chat(ctx context.Context, msgs []Message, tools []ToolDef, s
 // Stream SSE 流式版 Chat:content_block_delta(text_delta/input_json_delta)按 index 归并。
 func (p *Anthropic) Stream(ctx context.Context, msgs []Message, tools []ToolDef, stop []string, onDelta func(string)) (Message, error) {
 	system, blocks := messagesToAnthropic(msgs)
-	payload := map[string]any{"model": p.Model, "messages": blocks, "max_tokens": 8192, "stream": true}
+	payload := map[string]any{"model": p.Model, "messages": blocks, "max_tokens": p.maxTokens(), "stream": true}
 	if system != "" {
 		payload["system"] = system
 	}

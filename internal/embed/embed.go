@@ -4,7 +4,6 @@ package embed
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
@@ -14,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Embedder 向量化接口。实现:LocalEmbedder(离线哈希)、OpenAIEmbedder(/embeddings)。
@@ -68,11 +68,15 @@ func (l *LocalEmbedder) embedOne(text string) []float32 {
 type OpenAIEmbedder struct {
 	baseURL, apiKey, model string
 	dim                    int
+	client                 *http.Client // 带超时,防端点挂起(对齐 provider 的网络纪律)
 }
 
 // NewOpenAI 构造 OpenAI 兼容嵌入器。
 func NewOpenAI(baseURL, apiKey, model string) *OpenAIEmbedder {
-	return &OpenAIEmbedder{baseURL: strings.TrimSuffix(baseURL, "/"), apiKey: apiKey, model: model}
+	return &OpenAIEmbedder{
+		baseURL: strings.TrimSuffix(baseURL, "/"), apiKey: apiKey, model: model,
+		client: &http.Client{Timeout: 60 * time.Second},
+	}
 }
 
 func (o *OpenAIEmbedder) Dim() int { return o.dim }
@@ -100,7 +104,7 @@ func (o *OpenAIEmbedder) Embed(texts []string) ([][]float32, error) {
 	if o.apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+o.apiKey)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := o.client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -158,20 +162,32 @@ func norm(v []float32) {
 }
 
 // Cache 磁盘向量缓存:key = 文档路径|mtime|size,避免每轮查询重复 embed 全库。
+// dim 记录缓存向量维度:切换嵌入器(本地 512 ↔ OpenAI 1536)时维度不符的键视为
+// 未命中并重新 embed,Set 时维度冲突则整库重建——防 Cosine 取 min 兜底产生错乱检索。
 type Cache struct {
 	path string
 	mu   sync.Mutex
 	m    map[string][]float32
+	dim  int
 }
 
 // NewCache 加载(或初始化)缓存文件。path 为空则只做内存缓存。
+// 兼容旧版无 dim 的纯 map 缓存文件(读入后 dim=0,首次 Set 时定维)。
 func NewCache(path string) *Cache {
 	c := &Cache{path: path, m: map[string][]float32{}}
 	if path == "" {
 		return c
 	}
 	if b, err := os.ReadFile(path); err == nil {
-		_ = json.Unmarshal(b, &c.m)
+		var disk struct {
+			Dim  int                  `json:"dim"`
+			Vecs map[string][]float32 `json:"vecs"`
+		}
+		if json.Unmarshal(b, &disk) == nil && disk.Vecs != nil {
+			c.m, c.dim = disk.Vecs, disk.Dim
+			return c
+		}
+		_ = json.Unmarshal(b, &c.m) // 旧版结构
 	}
 	return c
 }
@@ -181,20 +197,29 @@ func Key(path string, fi os.FileInfo) string {
 	return path + "|" + strconv.FormatInt(fi.ModTime().UnixNano(), 10) + "|" + strconv.FormatInt(fi.Size(), 10)
 }
 
-func (c *Cache) Get(key string) ([]float32, bool) {
+// Get 读取缓存向量。wantDim>0 且缓存维度不符 → 未命中(调用方重新 embed 覆盖)。
+func (c *Cache) Get(key string, wantDim int) ([]float32, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	v, ok := c.m[key]
+	if ok && wantDim > 0 && len(v) != wantDim {
+		return nil, false
+	}
 	return v, ok
 }
 
+// Set 写入向量;与既有缓存维度冲突时整库重建(嵌入器切换)。
 func (c *Cache) Set(key string, v []float32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.dim > 0 && len(v) != c.dim {
+		c.m = map[string][]float32{}
+	}
+	c.dim = len(v)
 	c.m[key] = v
 }
 
-// Save 持久化到磁盘(幂等,失败静默)。
+// Save 持久化到磁盘(幂等,失败静默)。带 dim 字段供下次加载校验。
 func (c *Cache) Save() {
 	if c.path == "" {
 		return
@@ -204,19 +229,7 @@ func (c *Cache) Save() {
 	if len(c.m) == 0 {
 		return
 	}
-	if b, err := json.Marshal(c.m); err == nil {
+	if b, err := json.Marshal(map[string]any{"dim": c.dim, "vecs": c.m}); err == nil {
 		_ = os.WriteFile(c.path, b, 0o644)
 	}
-}
-
-// Checksum 对一批向量做内容摘要,用于持久化校验(避免缓存与维度不一致)。
-func Checksum(vecs [][]float32) string {
-	h := sha256.New()
-	for _, v := range vecs {
-		for _, x := range v {
-			h.Write([]byte(strconv.FormatFloat(float64(x), 'g', 6, 32)))
-			h.Write([]byte{0})
-		}
-	}
-	return fmt.Sprintf("%x", h.Sum(nil))[:16]
 }

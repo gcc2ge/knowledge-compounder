@@ -82,10 +82,12 @@ func loadSeedFile(path string) ([]Seed, error) {
 
 // ---- 语料 ----
 
-// RawDocs 未编译原文语料(raw/、raw/books/、raw/observations/)——RAG 外挂的检索对象。
+// RawDocs 未编译原文语料(raw/、raw/books/)——RAG 外挂的检索对象。
+// 刻意排除 raw/observations/:失败回灌是编译复利独有的私有 edge,掺进 RAG 语料
+// 会掩盖对照实验的真实差异(见 M10 评估设计)。
 func RawDocs(root string) []retrieval.Doc {
 	var docs []retrieval.Doc
-	for _, dir := range []string{"raw", filepath.Join("raw", "books"), filepath.Join("raw", "observations")} {
+	for _, dir := range []string{"raw", filepath.Join("raw", "books")} {
 		matches, _ := filepath.Glob(filepath.Join(root, dir, "*.md"))
 		for _, m := range matches {
 			text := wiki.Read(m)
@@ -174,30 +176,50 @@ type judgeScores struct {
 	Rationale string                    `json:"rationale"`
 }
 
-const judgePrompt = `你是知识库方案评审(Agent-as-a-Judge)。同一问题给了两套检索方案的答案:
+// rubricDesc 维度 → 打分说明(seed 自定义维度无说明时用通用描述)。
+var rubricDesc = map[string]string{
+	"论证完整性": "证据链是否完整、每步有依据",
+	"连接价值":  "是否建立跨知识连接并解释其意义",
+	"矛盾标注":  "是否识别并显式呈现资料矛盾",
+	"综合密度":  "是否经综合而非罗列碎片",
+	"可迁移性":  "结论能否直接用于新场景/决策",
+}
+
+// buildJudgePrompt 按维度列表动态构造评审提示词(seed.Rubric 为空时用 DefaultRubric)。
+func buildJudgePrompt(rubric []string) string {
+	var dims strings.Builder
+	for _, d := range rubric {
+		desc := rubricDesc[d]
+		if desc == "" {
+			desc = "该维度上的表现"
+		}
+		fmt.Fprintf(&dims, "- %s: %s\n", d, desc)
+	}
+	return fmt.Sprintf(`你是知识库方案评审(Agent-as-a-Judge)。同一问题给了两套检索方案的答案:
 - 方案A = RAG外挂(直接检索原文碎片,原文=未编译的原始资料)
 - 方案B = 知识编译复利(检索编译后的知识资产:源摘要/概念/综合页,含意外发现、连接与意义、矛盾标注、置信度)
-按以下 5 个维度对两方案各打 1-5 分(整数):
-- 论证完整性:证据链是否完整、每步有依据
-- 连接价值:是否建立跨知识连接并解释其意义
-- 矛盾标注:是否识别并显式呈现资料矛盾
-- 综合密度:是否经综合而非罗列碎片
-- 可迁移性:结论能否直接用于新场景/决策
-
-问题: %s
+按以下 %d 个维度对两方案各打 1-5 分(整数):
+%s
+问题: %%s
 
 方案A(RAG)答案:
-%s
+%%s
 
 方案B(编译复利)答案:
-%s
+%%s
 
 只输出 JSON(不要 markdown 围栏,不要其他文字):
-{"scores":{"rag":{"论证完整性":1,"连接价值":1,"矛盾标注":1,"综合密度":1,"可迁移性":1},"wiki":{...}},"verdict":"B更优|A更优|持平","rationale":"一句话理由"}`
+{"scores":{"rag":{...},"wiki":{...}},"verdict":"B更优|A更优|持平","rationale":"一句话理由"}`,
+		len(rubric), dims.String())
+}
 
-// Judge 让 LLM 评审两套答案,返回各维度分数。
+// Judge 让 LLM 评审两套答案,返回各维度分数。维度取 seed.Rubric(空则 5 维默认)。
 func Judge(ctx context.Context, p provider.Provider, seed Seed, ragAns, wikiAns string) (judgeScores, error) {
-	prompt := fmt.Sprintf(judgePrompt, seed.Question, ragAns, wikiAns)
+	rubric := seed.Rubric
+	if len(rubric) == 0 {
+		rubric = DefaultRubric
+	}
+	prompt := fmt.Sprintf(buildJudgePrompt(rubric), seed.Question, ragAns, wikiAns)
 	msg, err := p.Chat(ctx, []provider.Message{
 		{Role: "system", Content: "你是严格的评估评审,只输出 JSON。"},
 		{Role: "user", Content: prompt},
@@ -418,9 +440,13 @@ func render(cases []CaseResult, model string) string {
 		b.WriteString(fmt.Sprintf("\n---\n\n## %s %s\n\n> 期望: %s\n\n**RAG 答案**:\n\n%s\n\n**编译复利答案**:\n\n%s\n\n**评审**: verdict=%s · %s\n",
 			c.Seed.ID, c.Seed.Question, note, c.RAGAns, c.WikiAns, c.Judge.Verdict, c.Judge.Rationale))
 		scores := map[string]map[string]int{"RAG": c.Judge.Scores["rag"], "WIKI": c.Judge.Scores["wiki"]}
+		dimList := DefaultRubric
+		if len(c.Seed.Rubric) > 0 {
+			dimList = c.Seed.Rubric
+		}
 		for _, m := range []string{"RAG", "WIKI"} {
 			b.WriteString(fmt.Sprintf("%s: ", m))
-			for _, dim := range DefaultRubric {
+			for _, dim := range dimList {
 				if v, ok := scores[m][dim]; ok {
 					b.WriteString(fmt.Sprintf("%s=%d ", dim, v))
 				}

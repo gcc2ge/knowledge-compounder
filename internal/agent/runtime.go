@@ -38,8 +38,11 @@ type Runtime struct {
 // Run 执行一次 agent 任务:LLM 决策 → 执行工具 → 观察回填 → 再决策,直到无工具调用或达到停止条件。
 // StateFile 存在时从中恢复消息(断点续跑);否则从 system+input 初始化。
 func (r *Runtime) Run(ctx context.Context, input, state string) (string, error) {
-	msgs := r.loadCheckpoint()
+	// 断点续跑:恢复消息与累计 usage(MaxTokens 预算不归零)
+	msgs, savedUsage := r.loadCheckpoint()
+	r.usage = savedUsage
 	if len(msgs) == 0 {
+		r.usage = nil
 		msgs = []provider.Message{{Role: "system", Content: r.SystemPrompt}}
 		if state != "" {
 			msgs = append(msgs, provider.Message{Role: "user", Content: "[任务状态]\n" + state})
@@ -106,26 +109,29 @@ func (r *Runtime) Run(ctx context.Context, input, state string) (string, error) 
 }
 
 // callProvider 调用 LLM:Provider 实现 Streamer 且订阅了流式时走 SSE;
-// 失败时退避重试(至多 MaxHeal 次),吞瞬态错误。
+// 失败时退避重试(至多 MaxHeal 次)——流式与非流式统一重试,吞瞬态错误(M04 错误三分类)。
 func (r *Runtime) callProvider(ctx context.Context, msgs []provider.Message) (provider.Message, error) {
-	if r.OnEvent != nil || r.OnStream != nil {
-		if st, ok := r.Provider.(provider.Streamer); ok {
-			onDelta := func(t string) { r.emit(Event{Kind: EvText, Text: t}) }
-			return st.Stream(ctx, msgs, r.Tools, nil, onDelta)
-		}
-	}
 	heal := r.MaxHeal
 	if heal <= 0 {
 		heal = 1
 	}
-	reply, err := r.Provider.Chat(ctx, msgs, r.Tools, nil)
+	call := func() (provider.Message, error) {
+		if r.OnEvent != nil || r.OnStream != nil {
+			if st, ok := r.Provider.(provider.Streamer); ok {
+				onDelta := func(t string) { r.emit(Event{Kind: EvText, Text: t}) }
+				return st.Stream(ctx, msgs, r.Tools, nil, onDelta)
+			}
+		}
+		return r.Provider.Chat(ctx, msgs, r.Tools, nil)
+	}
+	reply, err := call()
 	for tries := 1; err != nil && tries <= heal; tries++ {
 		select {
 		case <-ctx.Done():
 			return provider.Message{}, ctx.Err()
 		case <-time.After(time.Duration(tries) * time.Second): // 线性退避
 		}
-		reply, err = r.Provider.Chat(ctx, msgs, r.Tools, nil)
+		reply, err = call()
 	}
 	return reply, err
 }
@@ -156,32 +162,43 @@ func (r *Runtime) consumedTokens(msgs []provider.Message) int {
 	return total + estimateTokens(msgs)
 }
 
-// saveCheckpoint 持久化当前消息序列(可审计/可恢复)。
+// checkpoint 持久化结构:Messages + 累计 usage(M04 Store,断点续跑预算不归零)。
+// 兼容旧版纯 Messages 数组(loadCheckpoint 回退解析)。
+type checkpoint struct {
+	Messages []provider.Message `json:"messages"`
+	Usage    *provider.Usage    `json:"usage,omitempty"`
+}
+
+// saveCheckpoint 持久化当前消息序列与累计消耗(可审计/可恢复)。
 func (r *Runtime) saveCheckpoint(msgs []provider.Message) error {
 	if r.StateFile == "" {
 		return nil
 	}
-	b, err := json.Marshal(msgs)
+	b, err := json.Marshal(checkpoint{Messages: msgs, Usage: r.usage})
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(r.StateFile, b, 0o644)
 }
 
-// loadCheckpoint 从 StateFile 恢复消息序列;无文件或损坏返回空。
-func (r *Runtime) loadCheckpoint() []provider.Message {
+// loadCheckpoint 恢复消息序列与累计 usage;无文件/损坏/空返回 nil。
+func (r *Runtime) loadCheckpoint() ([]provider.Message, *provider.Usage) {
 	if r.StateFile == "" {
-		return nil
+		return nil, nil
 	}
 	b, err := os.ReadFile(r.StateFile)
 	if err != nil {
-		return nil
+		return nil, nil
 	}
-	var msgs []provider.Message
-	if err := json.Unmarshal(b, &msgs); err != nil || len(msgs) == 0 {
-		return nil
+	var cp checkpoint
+	if err := json.Unmarshal(b, &cp); err == nil && len(cp.Messages) > 0 {
+		return cp.Messages, cp.Usage
 	}
-	return msgs
+	var msgs []provider.Message // 旧版纯数组
+	if err := json.Unmarshal(b, &msgs); err == nil && len(msgs) > 0 {
+		return msgs, nil
+	}
+	return nil, nil
 }
 
 // estimateTokens 粗略估算消息序列 token 量(≈字符数/4)。

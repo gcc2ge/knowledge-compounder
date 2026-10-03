@@ -6,20 +6,22 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 // LintResult 一次 lint 报告。
 type LintResult struct {
-	Broken        map[string][]string // 页面 → 指向不存在页面的链接
-	Orphans       []string            // 零入站链接的页面
-	NoFrontmatter []string            // 缺 YAML frontmatter 的页面(格式检查)
-	Format        []string            // source 页格式问题(缺 origin/意外发现/疑点)
-	Contradictions []string           // 含矛盾标注的页(人工审核项,非错误)
-	Uncompiled    []string            // 未编译的 raw 源
-	Counts        struct{ Pages, BrokenLinks int }
+	Broken         map[string][]string // 页面 → 指向不存在页面的链接
+	Orphans        []string            // 零入站链接的页面
+	NoFrontmatter  []string            // 缺 YAML frontmatter 的页面(格式检查)
+	Format         []string            // source 页格式问题(缺 origin/意外发现/疑点)
+	Contradictions []string            // 含矛盾标注的页(人工审核项,非错误)
+	ReviewAfter    []string            // review_after 已过的页面(过时检查)
+	Uncompiled     []string            // 未编译的 raw 源
+	Counts         struct{ Pages, BrokenLinks int }
 }
 
-// Lint 健康检查(骨架):断链 + 孤儿。TODO 对齐 scripts/wiki-lint.py 全量(矛盾/格式/覆盖)。
+// Lint 健康检查:断链 + 孤儿 + 缺 frontmatter + source 格式 + 矛盾标注 + 过时 + 未编译覆盖。
 func Lint(root string) LintResult {
 	res := LintResult{Broken: map[string][]string{}}
 	pages := Pages(root)
@@ -44,6 +46,7 @@ func Lint(root string) LintResult {
 		if first := strings.TrimSpace(strings.SplitN(content, "\n", 2)[0]); first != "---" {
 			res.NoFrontmatter = append(res.NoFrontmatter, slug)
 		}
+		vals, body := ParseFrontmatter(content)
 		// 矛盾标注 → 人工审核项(SCHEMA:只把 CONTRADICTION/矛盾声明列为审核)
 		for _, kw := range []string{"CONTRADICTION", "⚠️ 矛盾", "⚠️ 冲突", "矛盾声明"} {
 			if strings.Contains(content, kw) {
@@ -51,9 +54,14 @@ func Lint(root string) LintResult {
 				break
 			}
 		}
+		// 过时检查:review_after 早于今天的页面列为人审项
+		if v, ok := vals["review_after"].(string); ok && v != "" {
+			if t, err := time.Parse("2006-01-02", v); err == nil && t.Before(time.Now()) {
+				res.ReviewAfter = append(res.ReviewAfter, slug)
+			}
+		}
 		// source 页格式:origin 必填、意外发现必填、疑点节非空
 		if filepath.Base(filepath.Dir(p)) == "sources" {
-			vals, body := ParseFrontmatter(content)
 			if len(FrontmatterList(vals, "origin")) == 0 {
 				res.Format = append(res.Format, slug+": 缺 origin(external|self)")
 			}
@@ -76,6 +84,7 @@ func Lint(root string) LintResult {
 	sort.Strings(res.NoFrontmatter)
 	sort.Strings(res.Format)
 	sort.Strings(res.Contradictions)
+	sort.Strings(res.ReviewAfter)
 	for _, v := range res.Broken {
 		res.Counts.BrokenLinks += len(v)
 	}
@@ -83,13 +92,13 @@ func Lint(root string) LintResult {
 	return res
 }
 
-// ReportLint 打印 lint 报告。
+// ReportLint 打印 lint 报告并落盘 wiki/health/<日期>.md(健康报告留档,供下次比较)。
 func ReportLint(root string) string {
 	res := Lint(root)
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("lint: %d 页,断链 %d,孤儿 %d,缺 frontmatter %d,格式 %d,矛盾标注 %d,未编译 %d\n",
+	b.WriteString(fmt.Sprintf("lint: %d 页,断链 %d,孤儿 %d,缺 frontmatter %d,格式 %d,矛盾标注 %d,过时 %d,未编译 %d\n",
 		res.Counts.Pages, res.Counts.BrokenLinks, len(res.Orphans), len(res.NoFrontmatter),
-		len(res.Format), len(res.Contradictions), len(res.Uncompiled)))
+		len(res.Format), len(res.Contradictions), len(res.ReviewAfter), len(res.Uncompiled)))
 	if res.Counts.BrokenLinks > 0 {
 		b.WriteString("断链:\n")
 		for slug, links := range res.Broken {
@@ -108,12 +117,18 @@ func ReportLint(root string) string {
 	if len(res.Contradictions) > 0 {
 		b.WriteString("矛盾标注(人工审核):\n  " + strings.Join(res.Contradictions, ", ") + "\n")
 	}
+	if len(res.ReviewAfter) > 0 {
+		b.WriteString("过时页(review_after 已过,人工复核):\n  " + strings.Join(res.ReviewAfter, ", ") + "\n")
+	}
 	if len(res.Uncompiled) > 0 {
 		b.WriteString("未编译 raw:\n  " + strings.Join(res.Uncompiled, ", ") + "\n")
 	}
-	if res.Counts.BrokenLinks == 0 && len(res.Orphans) == 0 && len(res.NoFrontmatter) == 0 && len(res.Format) == 0 {
-		b.WriteString("健康:无断链、无孤儿、无格式问题。\n")
+	if res.Counts.BrokenLinks == 0 && len(res.Orphans) == 0 && len(res.NoFrontmatter) == 0 && len(res.Format) == 0 && len(res.ReviewAfter) == 0 {
+		b.WriteString("健康:无断链、无孤儿、无格式问题、无过时。\n")
 	}
-	_ = os.MkdirAll(filepath.Join(root, "wiki", "health"), 0o755)
+	// 落盘健康报告(供历史比较;失败静默)
+	dir := filepath.Join(root, "wiki", "health")
+	_ = os.MkdirAll(dir, 0o755)
+	_ = os.WriteFile(filepath.Join(dir, time.Now().Format("2006-01-02")+".md"), []byte(b.String()), 0o644)
 	return b.String()
 }
