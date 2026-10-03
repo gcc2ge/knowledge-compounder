@@ -31,19 +31,21 @@
 ## 快速上手
 
 ```bash
-# 1. 克隆模板,进入项目
+# 1. 克隆模板,进入项目,编译自研 agent
 git clone https://github.com/<you>/knowledge-compounder.git && cd knowledge-compounder
+go build -o kcp ./cmd/kcp
 
-# 2. 装一个笔记源(raw/ 支持 .md/.txt/.pdf/.epub/.docx)
-#    或者用 observe 捕获一条观察
-python3 scripts/observe.py -s strategy -T "发现:费率异常" -c "描述"
+# 2. 配置模型(任意 LLM:DeepSeek/Ollama/智谱 GLM/OpenRouter…)
+export KCP_PROVIDER=openai-compatible   # 或 anthropic
+export KCP_MODEL=deepseek-chat          # 或本地 ollama 模型
+export KCP_API_KEY=sk-xxx              # 本地 ollama 可留空
 
-# 3. 用 Claude Code 打开项目(它自带 coordinator + compiler + qa agents)
-#    告诉 coordinator:编译 raw/ 里的新文件
-#    → compiler 编译进 wiki/,qa lint,index/log 自动维护
+# 3. 装一个笔记源(raw/ 支持 .md/.txt/.pdf/.epub/.docx),然后编译
+./kcp status                 # 看状态 + 未编译 raw
+./kcp compile raw/你的文件.md # compiler agent 按 SCHEMA 编译(SSE 流式,策展点暂停问人)
 
-# 4. 看状态
-python3 scripts/wiki-status.py
+# 4. 查询并 filed back(查询即投资)
+./kcp query "知识库里对 X 有什么结论?"
 
 # 5. 把知识库喂给其他 agent 当外脑
 #    → context/ 目录的 MCP server 把 wiki 暴露成 MCP 工具
