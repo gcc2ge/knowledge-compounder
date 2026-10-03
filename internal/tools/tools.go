@@ -138,7 +138,7 @@ func safeJoin(root, path string, allowed ...string) (string, bool) {
 }
 
 func readSafe(root, path string) string {
-	fp, ok := safeJoin(root, path, "wiki", "raw", "examples", "SCHEMA.md", "templates", "docs", "harness", "legacy")
+	fp, ok := safeJoin(root, path, "wiki", "raw", "examples", "SCHEMA.md", "templates", "docs")
 	if !ok {
 		return "拒绝:路径超出项目根或不在白名单目录。"
 	}

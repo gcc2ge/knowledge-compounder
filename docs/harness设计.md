@@ -22,7 +22,7 @@ Agent = LLM(决策器) + Tools(感知行动) + State(状态) + Loop(循环) + St
 
 ## Agent 指令从哪来
 
-`internal/agents/builtin.go` 内置三个角色(compiler/query/qa),指令精炼自 SCHEMA 与旧 `.claude/agents/*.md`。**编译纪律原样进入 system prompt**;`.claude/` 已降级为参考。
+`internal/agents/builtin.go` 内置三个角色(compiler/query/qa),指令精炼自 SCHEMA.md。**编译纪律原样进入 system prompt**。
 
 ```
 internal/agents/builtin.go
@@ -40,7 +40,17 @@ internal/agents/builtin.go
 | `OpenAICompatible` | `/chat/completions` + tools | tools=True(覆盖 OpenAI/DeepSeek/Moonshot/OpenRouter/Ollama/vLLM/Gemini-OpenAI 端点,同一协议) |
 | `Anthropic` | `/v1/messages` + tool_use/tool_result | tools=True |
 
-`Capabilities.Tools=false` 时循环应降级 ReAct(TODO:loop_react 已在 Python 原型验证过,Go 待移植)。
+`Capabilities.Tools=false` 时循环降级为文本协议(ReAct,已从 Python 原型验证沉淀):
+
+```
+Thought: 对任务的推理
+Action: <tool> | <JSON入参>     # 无可用工具时 Action: none
+Observation: <工具返回 / 环境反馈>
+(循环,最多 MaxSteps 次)
+Final: <最终答案>
+```
+
+harness 解析 Thought/Action/Observation/Final 四段;`Action: none` 或出现 `Final:` 即停。
 
 ## 上下文组装(M09 纪律)
 
@@ -84,9 +94,8 @@ kcp <role> "<输入>"          直接跑角色
 
 ## 与旧版的关系
 
-- `.claude/agents/*.md` → 降级参考;指令已提炼进 `internal/agents`
+- `.claude/` 与 `legacy/python-harness/` → 已删除(指令已提炼进 `internal/agents` + SCHEMA.md;ReAct 要点见上)
 - `scripts/*.py` → 待移植到 Go(Phase 2:完整 lint/export-public/pdf2md/update/registry/relink)
-- `legacy/python-harness/` → Python 原型,保留作 ReAct 降级与检索算法参考
 - `context/wiki-mcp-server/`(Python MCP)→ Phase 5 移植 Go
 
 ## 边界与 TODO

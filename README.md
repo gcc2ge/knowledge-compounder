@@ -78,7 +78,7 @@ internal/wiki         知识库操作(扫描/检索/lint),替代原 Python scrip
 internal/cli          命令分发
 ```
 
-`.claude/`(Claude Code 版 agent)已降级为参考;`scripts/*.py` 为待移植旧工具链;Python 原型在 `legacy/python-harness/`。设计见 `docs/harness设计.md`。
+`scripts/*.py` 为待移植旧工具链。设计见 `docs/harness设计.md`。
 
 ## 项目结构
 
@@ -86,9 +86,7 @@ internal/cli          命令分发
 knowledge-compounder/
 ├── SCHEMA.md            ← 编译纪律:页面格式约定(本项目的心智)
 ├── cmd/kcp + internal/  ← 自研 Go agent:provider/agent/agents/tools/wiki/cli
-├── .claude/             ← 已降级为参考(Claude Code 版 agent 指令)
 ├── scripts/             ← 旧 Python 工具链(待移植到 Go)
-├── legacy/              ← 被 Go 取代的 Python harness 原型
 ├── templates/           ← source/concept/entity/synthesis 页面模板
 ├── examples/            ← 合成演示:raw + 编译产物,展示纪律
 ├── context/             ← 支柱B:wiki 暴露为 MCP server,喂给 coding/trading agents
