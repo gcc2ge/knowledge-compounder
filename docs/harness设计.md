@@ -75,7 +75,7 @@ internal/
 | 工具 | 实现 | 说明 |
 |---|---|---|
 | `wiki_status` | internal/wiki.Scan | 计数 + 未编译 raw |
-| `search_wiki` | internal/wiki.SearchPages | 标题命中×3 + 正文计数;TODO embedding+rerank |
+| `search_wiki` | internal/retrieval | 混合检索:BM25-lite 词法 + 可选向量余弦(0.55/0.45 融合 rerank);配 `KCP_EMBED_MODEL` 用 OpenAI 兼容 `/embeddings`,留空用本地字符 n-gram 哈希嵌入(离线可跑);向量磁盘缓存 `.kcp-embed-cache.json` |
 | `get_page` | internal/wiki.GetPage | 读页面 |
 | `read_file` | 白名单目录 | wiki/raw/examples/docs/... |
 | `write_file` | 限 wiki/raw/examples | 防路径穿越 |
@@ -89,6 +89,8 @@ kcp compile <raw文件>        单源编译(compiler agent 按 SCHEMA)
 kcp query "<问题>"           检索 + 综合 + 建议 filed back
 kcp lint                     健康检查
 kcp observe -s <策略> -T <标题> -c <内容>   捕获观察
+kcp search "<查询>"          混合检索诊断(词法+向量,零 LLM,带 [A]/[B]/[C] 私有度徽标)
+kcp eval [--seeds <文件>]     RAG-vs-编译复利对照实验(Agent-as-a-Judge 打分,报告落 eval/reports/)
 kcp <role> "<输入>"          直接跑角色
 ```
 
@@ -108,7 +110,7 @@ kcp <role> "<输入>"          直接跑角色
 | 1 | 真实 LLM 端到端实测:compile/query 跑通,验证工具调用回填与停止条件,修循环 bug(DeepSeek/Ollama) | ✅ 智谱 GLM 实测通过(2026-10-03) |
 | 2 | scripts/*.py 移植 Go:完整 lint(矛盾/格式/覆盖)、update(add-source/touch/add-link)、check-sources-shrink、index 重建、source-skeleton。pdf2md/export-public 保留 shell(依赖外部工具) | ✅ 分批完成(2026-10-03) |
 | 3 | 生产化 harness:SSE 流式(M02 两层流式栈)、MaxTokens/Deadline/MaxHeal、checkpoint 持久化(M04 Store)、策展决策点暂停要人 | ✅ 完成(2026-10-03) |
-| 4 | 检索与质量:grep → embedding + rerank(Agentic RAG)、证据 A/B/C 分层、评估集(Agent-as-a-Judge)、RAG-vs-编译对照实验 | ⬜ |
+| 4 | 检索与质量:grep → embedding + rerank(Agentic RAG)、证据 A/B/C 分层、评估集(Agent-as-a-Judge)、RAG-vs-编译对照实验 | ✅ 完成(2026-10-03)`kcp search`/`kcp eval`;GLM 实测 B 优 3/3(+1.1 均分) |
 | 5 | context/wiki-mcp-server Python → Go(支柱 B 完整 MCP server,喂 coding/trading agents) | ⬜ |
 | 6 | A2A 暴露(M12 ADK launcher)给 agent cloud + License 策略定稿(AGPL/BSL vs MIT) | ⬜ |
 
@@ -118,8 +120,8 @@ kcp <role> "<输入>"          直接跑角色
 
 - **SSE 流式**(Phase 3):骨架非流式;生产补 SSE(M02 两层流式栈)
 - **停止条件**(Phase 1+3):MaxSteps/MaxSameAction 已就位;补 MaxTokens/Deadline/MaxHeal
-- **检索升级**(Phase 4):grep → embedding + rerank(Agentic RAG);证据 A/B/C 分层
+- **检索升级**(Phase 4):grep → BM25-lite 词法 + 可选向量余弦(Agentic RAG),0.55/0.45 融合 rerank;证据 A/B/C 分层徽标自动标注
 - **人工把关点**(Phase 3):compiler 在"建概念页?"策展决策处暂停要用户裁决("人策展>自动"进协议)
 - **状态 checkpoint**(Phase 3):可中断/可恢复/可审计(M04 Store 持久化)
-- **评估集**(Phase 4):Agent-as-a-Judge 验证编译质量
+- **评估集**(Phase 4):`kcp eval`——评估种子 `eval/seeds/`(需按自己知识库改写),Agent-as-a-Judge 按 5 维打分(论证完整性/连接价值/矛盾标注/综合密度/可迁移性),报告落 `eval/reports/`
 - **A2A 暴露**(Phase 6):M12 ADK launcher 包一层,开放给远程 agent

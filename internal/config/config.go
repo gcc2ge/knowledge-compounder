@@ -18,6 +18,10 @@ type Config struct {
 	Deadline      int // 秒;0 = 默认 600
 	StateFile     string // checkpoint 持久化路径(可断点续跑)
 	Stream        bool // SSE 流式输出(默认开,KCP_STREAM=0 关闭)
+	EmbedModel    string // 语义检索:留空 = 离线字符哈希嵌入;设置后用 OpenAI 兼容 /embeddings
+	EmbedBaseURL  string
+	EmbedAPIKey   string
+	RetrieveK     int // search_wiki / kcp search 返回条数
 }
 
 func Load() Config {
@@ -33,6 +37,10 @@ func Load() Config {
 		Deadline:      getenvInt("KCP_DEADLINE", 600),
 		StateFile:     os.Getenv("KCP_STATE_FILE"),
 		Stream:        getenvInt("KCP_STREAM", 1) == 1,
+		EmbedModel:    os.Getenv("KCP_EMBED_MODEL"),
+		EmbedBaseURL:  getenv("KCP_EMBED_BASE_URL", os.Getenv("KCP_BASE_URL")),
+		EmbedAPIKey:   getenv("KCP_EMBED_API_KEY", os.Getenv("KCP_API_KEY")),
+		RetrieveK:     getenvInt("KCP_RETRIEVE_K", 5),
 	}
 }
 

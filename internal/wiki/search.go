@@ -4,55 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strings"
 )
-
-// Result 检索结果:页面路径 + 命中分 + 摘要首行。
-type Result struct {
-	Page    string
-	Score   int
-	Summary string
-}
-
-var summaryRe = regexp.MustCompile(`(?m)^## (?:一句话结论|定义|概述|问题)\s*\n([^\n]+)`)
-
-// SearchPages 关键词检索:标题命中权重 3,正文命中计数。
-// 骨架为 grep 级;TODO 升级 embedding + rerank(Agentic RAG)。
-func SearchPages(root, query string, k int) []Result {
-	terms := []string{}
-	for _, t := range strings.Fields(strings.ToLower(query)) {
-		terms = append(terms, t)
-	}
-	var results []Result
-	for _, p := range Pages(root) {
-		text := Read(p)
-		if text == "" {
-			continue
-		}
-		stem := strings.ToLower(filepath.Base(p))
-		score := 0
-		for _, t := range terms {
-			if strings.Contains(stem, t) {
-				score += 3
-			}
-			score += strings.Count(strings.ToLower(text), t)
-		}
-		if score == 0 {
-			continue
-		}
-		summary := ""
-		if m := summaryRe.FindStringSubmatch(text); m != nil {
-			summary = strings.TrimSpace(m[1])
-		}
-		results = append(results, Result{Page: filepath.Base(p), Score: score, Summary: summary})
-	}
-	sort.Slice(results, func(i, j int) bool { return results[i].Score > results[j].Score })
-	if k > 0 && len(results) > k {
-		results = results[:k]
-	}
-	return results
-}
 
 // GetPage 按 slug 或文件名读页面,返回 (内容, 子目录, 是否存在)。
 func GetPage(root, slug string) (string, string, bool) {

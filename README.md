@@ -46,8 +46,12 @@ export KCP_API_KEY=sk-xxx              # 本地 ollama 可留空
 
 # 4. 查询并 filed back(查询即投资)
 ./kcp query "知识库里对 X 有什么结论?"
+./kcp search "X 相关关键词"    # 混合检索诊断(词法+向量,带 [A]/[B]/[C] 私有度徽标,零 LLM)
 
-# 5. 把知识库喂给其他 agent 当外脑
+# 5. 对照实验:编译复利 vs RAG 外挂(Agent-as-a-Judge 打分)
+./kcp eval                    # 评估种子见 eval/seeds/(按你的知识库改写),报告落 eval/reports/
+
+# 6. 把知识库喂给其他 agent 当外脑
 #    → context/ 目录的 MCP server 把 wiki 暴露成 MCP 工具
 #    → 在 Claude Code / Codex 的 .mcp.json 里接上(见 context/.mcp.json.example)
 ```

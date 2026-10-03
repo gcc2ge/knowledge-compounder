@@ -13,7 +13,9 @@ import (
 	"github.com/knowledge-compounder/kcp/internal/agent"
 	"github.com/knowledge-compounder/kcp/internal/agents"
 	"github.com/knowledge-compounder/kcp/internal/config"
+	"github.com/knowledge-compounder/kcp/internal/eval"
 	"github.com/knowledge-compounder/kcp/internal/provider"
+	"github.com/knowledge-compounder/kcp/internal/retrieval"
 	"github.com/knowledge-compounder/kcp/internal/tools"
 	"github.com/knowledge-compounder/kcp/internal/wiki"
 )
@@ -35,12 +37,17 @@ const usage = `kcp — 知识编译复利引擎(自研 agent,任意 LLM)
   kcp preflight <raw> [--source-page <页>]
                                       硬资产完整性核验(代码块/表/示例不丢)
   kcp check-sources                   检查概念/实体页 sources 是否被错误替换(git)
+  kcp search "<查询>"                混合检索诊断(词法+向量,零 LLM,带私有度徽标)
+  kcp eval [--seeds <文件>] [--k <n>] RAG-vs-编译复利对照实验(Agent-as-a-Judge 打分)
   kcp <role> "<输入>"           直接跑一个角色(compiler/qa/query)
   kcp list                      列出角色
 
 环境变量: KCP_PROVIDER(openai-compatible|anthropic) KCP_MODEL KCP_API_KEY KCP_BASE_URL
           KCP_MAX_STEPS KCP_MAX_SAME_ACTION KCP_MAX_TOKENS KCP_MAX_HEAL KCP_DEADLINE(秒) KCP_STATE_FILE
           KCP_STREAM(默认1=SSE流式,0=关闭)
+          KCP_EMBED_MODEL(留空=离线字符哈希嵌入;设置后用 OpenAI 兼容 /embeddings 语义检索)
+          KCP_EMBED_BASE_URL KCP_EMBED_API_KEY(默认跟随 KCP_BASE_URL/KCP_API_KEY)
+          KCP_RETRIEVE_K(默认5)
 `
 
 // Main 命令分发。返回退出码。
@@ -125,6 +132,41 @@ func Main(args []string) int {
 			fmt.Println("  " + p)
 		}
 		return 1
+	case "search":
+		if len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "用法: kcp search \"<查询>\"")
+			return 1
+		}
+		return runSearch(root, cfg, strings.Join(args[1:], " "))
+	case "eval":
+		seeds, k := "", 0
+		for i := 1; i < len(args); i++ {
+			switch args[i] {
+			case "--seeds":
+				if i+1 < len(args) {
+					seeds = args[i+1]
+					i++
+				}
+			case "--k":
+				if i+1 < len(args) {
+					fmt.Sscanf(args[i+1], "%d", &k)
+					i++
+				}
+			}
+		}
+		if k > 0 {
+			cfg.RetrieveK = k
+		}
+		seedList, err := eval.LoadSeeds(root, seeds)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		if _, err := eval.RunCompare(root, cfg, seedList); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		return 0
 	case "compile":
 		if len(args) < 2 {
 			fmt.Fprintln(os.Stderr, "用法: kcp compile <raw文件>")
@@ -165,6 +207,30 @@ func compileInput(root, rawFile string) string {
 	return fmt.Sprintf("编译以下 raw 源,按 SCHEMA 生成 wiki/sources/ 源摘要页(论证链保留全部代码/表/示例),并检查交叉引用:\n\n%s", content)
 }
 
+// runSearch 混合检索诊断(零 LLM):词法+向量融合分、词法/语义子分、私有度徽标。
+func runSearch(root string, cfg config.Config, query string) int {
+	opts := eval.RetrievalOpts(root, cfg)
+	results := wiki.Retrieve(root, query, opts)
+	if len(results) == 0 {
+		fmt.Println("未找到相关页面。")
+		return 0
+	}
+	fmt.Printf("检索「%s」: %d 条(嵌入=%s, 缓存=%s)\n", query, len(results), embedDesc(opts), retrieval.CachePath(root))
+	for _, r := range results {
+		badge := wiki.EvidenceBadge(root, r.Path)
+		fmt.Printf("- [[%s]] %s 融合%.2f 词法%.2f 语义%.2f: %s\n",
+			r.Label, badge, r.Score, r.Lexical, r.Semantic, r.Summary)
+	}
+	return 0
+}
+
+func embedDesc(opts retrieval.Options) string {
+	if opts.Embedder == nil {
+		return "无向量层"
+	}
+	return "已启用"
+}
+
 // runRole 用自研运行时跑一个角色(provider + 工具 + M04 循环)。
 func runRole(root string, cfg config.Config, role, input string) int {
 	timeout := time.Duration(cfg.Deadline) * time.Second
@@ -184,7 +250,7 @@ func runRole(root string, cfg config.Config, role, input string) int {
 	rt := &agent.Runtime{
 		Provider:      p,
 		SystemPrompt:  system,
-		Tools:         tools.Build(root, terminalAsk),
+		Tools:         tools.Build(root, terminalAsk, eval.RetrievalOpts(root, cfg)),
 		MaxSteps:      cfg.MaxSteps,
 		MaxSameAction: cfg.MaxSameAction,
 		MaxTokens:     cfg.MaxTokens,

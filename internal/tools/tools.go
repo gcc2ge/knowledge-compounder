@@ -11,11 +11,13 @@ import (
 	"strings"
 
 	"github.com/knowledge-compounder/kcp/internal/provider"
+	"github.com/knowledge-compounder/kcp/internal/retrieval"
 	"github.com/knowledge-compounder/kcp/internal/wiki"
 )
 
-// Build 构造工具列表。root 为项目根;ask 为策展决策回调(向用户提问等裁决),nil 则 ask_user 返回非交互提示。
-func Build(root string, ask func(string) string) []provider.ToolDef {
+// Build 构造工具列表。root 为项目根;ask 为策展决策回调(向用户提问等裁决),nil 则 ask_user 返回非交互提示;
+// opts 为检索选项(embedder/缓存/条数),空则 search_wiki 退回词法检索。
+func Build(root string, ask func(string) string, opts retrieval.Options) []provider.ToolDef {
 	return []provider.ToolDef{
 		{
 			Name: "wiki_status", Description: "查看知识库状态:页面计数 + 未编译 raw",
@@ -23,18 +25,22 @@ func Build(root string, ask func(string) string) []provider.ToolDef {
 			Func:       func(map[string]any) string { return wiki.StatusText(root) },
 		},
 		{
-			Name: "search_wiki", Description: "在知识库中检索相关页面",
+			Name: "search_wiki", Description: "在知识库中检索相关页面(混合检索:词法 + 可选语义向量;结果带私有度徽标 [A]公开/[B]精选综合/[C]私有)",
 			Parameters: obj(map[string]any{"query": strProp, "k": intProp}),
 			Func: func(args map[string]any) string {
 				query := str(args, "query")
-				k := intArg(args, "k", 5)
-				results := wiki.SearchPages(root, query, k)
+				k := intArg(args, "k", 0)
+				if k > 0 {
+					opts.Top = k
+				}
+				results := wiki.Retrieve(root, query, opts)
 				if len(results) == 0 {
-					return "知识库中未找到匹配页面。"
+					return "知识库中未找到相关页面。"
 				}
 				var b strings.Builder
 				for _, r := range results {
-					fmt.Fprintf(&b, "- [[%s]] (命中 %d): %s\n", strings.TrimSuffix(r.Page, ".md"), r.Score, r.Summary)
+					badge := wiki.EvidenceBadge(root, r.Path)
+					fmt.Fprintf(&b, "- [[%s]] %s 命中%.2f: %s\n", r.Label, badge, r.Score, r.Summary)
 				}
 				return b.String()
 			},

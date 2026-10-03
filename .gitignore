@@ -10,6 +10,12 @@ wiki/health/*
 # 编译产物
 /kcp
 
+# 向量缓存(派生数据,可随时重建)
+.kcp-embed-cache.json
+
+# 评估运行报告(派生;评估种子 eval/seeds/ 保留)
+eval/reports/
+
 # 本地环境
 .DS_Store
 *.swp
