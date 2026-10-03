@@ -98,12 +98,28 @@ kcp <role> "<输入>"          直接跑角色
 - `scripts/*.py` → 待移植到 Go(Phase 2:完整 lint/export-public/pdf2md/update/registry/relink)
 - `context/wiki-mcp-server/`(Python MCP)→ Phase 5 移植 Go
 
+## 开发路线(Phase)
+
+> 骨架已成(Phase 0)。全部 TODO 按序推进,每阶段以可验收产物收尾。
+
+| Phase | 内容 | 状态 |
+|---|---|---|
+| 0 | 全 Go 骨架:provider 抽象 + agent 循环 + 6 工具 + status/lint/observe CLI | ✅ `a7cc774` |
+| 1 | 真实 LLM 端到端实测:compile/query 跑通,验证工具调用回填与停止条件,修循环 bug(DeepSeek/Ollama) | ⬜ 堵点:等 KCP_API_KEY |
+| 2 | scripts/*.py 移植 Go:完整 lint(矛盾/格式/覆盖)、export-public、pdf2md、update/registry/relink、check-sources-shrink、source-skeleton | ⬜ |
+| 3 | 生产化 harness:SSE 流式(M02 两层流式栈)、MaxTokens/Deadline/MaxHeal、checkpoint 持久化(M04 Store)、策展决策点暂停要人 | ⬜ |
+| 4 | 检索与质量:grep → embedding + rerank(Agentic RAG)、证据 A/B/C 分层、评估集(Agent-as-a-Judge)、RAG-vs-编译对照实验 | ⬜ |
+| 5 | context/wiki-mcp-server Python → Go(支柱 B 完整 MCP server,喂 coding/trading agents) | ⬜ |
+| 6 | A2A 暴露(M12 ADK launcher)给 agent cloud + License 策略定稿(AGPL/BSL vs MIT) | ⬜ |
+
 ## 边界与 TODO
 
-- **流式输出**:骨架非流式;生产补 SSE(M02 两层流式栈)
-- **停止条件**:补 MaxTokens/Deadline/MaxHeal
-- **检索升级**:grep → embedding + rerank(Agentic RAG);证据 A/B/C 分层
-- **人工把关点**:compiler 在"建概念页?"策展决策处暂停要用户裁决("人策展>自动"进协议)
-- **状态 checkpoint**:可中断/可恢复/可审计(M04 Store 持久化)
-- **评估集**:Agent-as-a-Judge 验证编译质量
-- **A2A 暴露**:M12 ADK launcher 包一层,开放给远程 agent
+> 各项已在「开发路线」中按 Phase 归位,此处保留细节。
+
+- **SSE 流式**(Phase 3):骨架非流式;生产补 SSE(M02 两层流式栈)
+- **停止条件**(Phase 1+3):MaxSteps/MaxSameAction 已就位;补 MaxTokens/Deadline/MaxHeal
+- **检索升级**(Phase 4):grep → embedding + rerank(Agentic RAG);证据 A/B/C 分层
+- **人工把关点**(Phase 3):compiler 在"建概念页?"策展决策处暂停要用户裁决("人策展>自动"进协议)
+- **状态 checkpoint**(Phase 3):可中断/可恢复/可审计(M04 Store 持久化)
+- **评估集**(Phase 4):Agent-as-a-Judge 验证编译质量
+- **A2A 暴露**(Phase 6):M12 ADK launcher 包一层,开放给远程 agent
