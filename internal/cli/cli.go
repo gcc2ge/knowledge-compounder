@@ -25,6 +25,10 @@ const usage = `kcp — 知识编译复利引擎(自研 agent,任意 LLM)
   kcp compile <raw文件>         单源编译(compiler agent 按 SCHEMA 生成 source 页)
   kcp query "<问题>"           检索知识库 + 综合回答
   kcp observe -s <策略> -T <标题> -c <内容>   捕获观察
+  kcp update add-source <slug> <源>   确定性页面编辑(无 LLM)
+  kcp update touch <slug>             更新 updated 日期
+  kcp update add-link <slug> <目标>   往「相关」节加 wikilink
+  kcp check-sources                   检查概念/实体页 sources 是否被错误替换(git)
   kcp <role> "<输入>"           直接跑一个角色(compiler/qa/query)
   kcp list                      列出角色
 
@@ -62,6 +66,23 @@ func Main(args []string) int {
 		}
 		fmt.Println("观察已捕获到 raw/observations/")
 		return 0
+	case "update":
+		return runUpdate(root, args[1:])
+	case "check-sources":
+		problems, err := wiki.CheckSourcesShrink(root)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		if len(problems) == 0 {
+			fmt.Println("check-sources: 无缩水,sources 完整。")
+			return 0
+		}
+		fmt.Println("⚠️ 概念/实体页 sources 缩水(compiler 重写 frontmatter 常见 bug):")
+		for _, p := range problems {
+			fmt.Println("  " + p)
+		}
+		return 1
 	case "compile":
 		if len(args) < 2 {
 			fmt.Fprintln(os.Stderr, "用法: kcp compile <raw文件>")
@@ -127,6 +148,44 @@ func runRole(root string, cfg config.Config, role, input string) int {
 		return 1
 	}
 	fmt.Println(out)
+	return 0
+}
+
+// runUpdate 确定性页面编辑:add-source / touch / add-link(无 LLM,对齐 wiki-update.py)。
+func runUpdate(root string, args []string) int {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "用法: kcp update <add-source|touch|add-link> <slug> [参数]")
+		return 1
+	}
+	var msg string
+	var err error
+	switch args[0] {
+	case "add-source":
+		if len(args) < 3 {
+			err = fmt.Errorf("用法: kcp update add-source <slug> <源>")
+		} else {
+			msg, err = wiki.AddSource(root, args[1], args[2])
+		}
+	case "touch":
+		if len(args) < 2 {
+			err = fmt.Errorf("用法: kcp update touch <slug>")
+		} else {
+			msg, err = wiki.Touch(root, args[1])
+		}
+	case "add-link":
+		if len(args) < 3 {
+			err = fmt.Errorf("用法: kcp update add-link <slug> <目标>")
+		} else {
+			msg, err = wiki.AddLink(root, args[1], args[2])
+		}
+	default:
+		err = fmt.Errorf("未知 update 操作: %s(支持 add-source/touch/add-link)", args[0])
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	fmt.Println(msg)
 	return 0
 }
 
