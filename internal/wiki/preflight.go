@@ -67,12 +67,12 @@ type inv struct{ fenced, tables, htmlTables, math, examples, lines int }
 
 func inventoryText(text string) inv {
 	return inv{
-		fenced:      len(preFencedBlock.FindAllString(text, -1)),
-		tables:      len(preTable.FindAllString(text, -1)),
-		htmlTables:  len(preHTMLTable.FindAllString(text, -1)),
-		math:        len(preMath.FindAllString(text, -1)),
-		examples:    len(preExample.FindAllString(text, -1)),
-		lines:       strings.Count(text, "\n") + 1,
+		fenced:     len(preFencedBlock.FindAllString(text, -1)),
+		tables:     len(preTable.FindAllString(text, -1)),
+		htmlTables: len(preHTMLTable.FindAllString(text, -1)),
+		math:       len(preMath.FindAllString(text, -1)),
+		examples:   len(preExample.FindAllString(text, -1)),
+		lines:      strings.Count(text, "\n") + 1,
 	}
 }
 

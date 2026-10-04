@@ -10,13 +10,13 @@ import (
 
 // Status wiki 状态:页面计数 + 未编译 raw。
 type Status struct {
-	Sources    int      `json:"sources"`
-	Concepts   int      `json:"concepts"`
-	Entities   int      `json:"entities"`
-	Synthesis  int      `json:"synthesis"`
-	Notes      int      `json:"notes"`
-	Total      int      `json:"total_pages"`
-	Uncompiled int      `json:"uncompiled"`
+	Sources         int      `json:"sources"`
+	Concepts        int      `json:"concepts"`
+	Entities        int      `json:"entities"`
+	Synthesis       int      `json:"synthesis"`
+	Notes           int      `json:"notes"`
+	Total           int      `json:"total_pages"`
+	Uncompiled      int      `json:"uncompiled"`
 	UncompiledFiles []string `json:"uncompiled_files"`
 }
 
