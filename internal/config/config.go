@@ -41,7 +41,7 @@ func Load() Config {
 		Deadline:        getenvInt("KCP_DEADLINE", 600),
 		StateFile:       os.Getenv("KCP_STATE_FILE"),
 		Stream:          getenvInt("KCP_STREAM", 1) == 1,
-		CompactTokens:   getenvInt("KCP_COMPACT_TOKENS", 0),
+		CompactTokens:   getenvInt("KCP_COMPACT_TOKENS", 80000), // 默认开:长源分页读入必须配压缩;显式 0 关闭
 		KeepRounds:      getenvInt("KCP_COMPACT_KEEP_ROUNDS", 0),
 		CheckpointEvery: getenvInt("KCP_CHECKPOINT_EVERY", 0),
 		MaxOutputTokens: getenvInt("KCP_MAX_OUTPUT_TOKENS", 0),

@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"time"
+	"unicode"
 
 	"github.com/gcc2ge/knowledge-compounder/internal/provider"
 )
@@ -201,16 +202,31 @@ func (r *Runtime) loadCheckpoint() ([]provider.Message, *provider.Usage) {
 	return nil, nil
 }
 
-// estimateTokens 粗略估算消息序列 token 量(≈字符数/4)。
+// estimateTokens 粗略估算消息序列 token 量,中文感知:
+// CJK ≈ 1 token/字(BPE 实测 1.0–1.5 字/token),其余 ≈ 4 字符/token。
+// 旧版统一 /4 对中文低估 2.5 倍+,长中文源读入后压缩永不触发——实测 438KB 源毒化上下文。
+// 宁可高估:压缩与预算闸门偏保守是安全方向。
 func estimateTokens(msgs []provider.Message) int {
 	n := 0
 	for _, m := range msgs {
-		n += len([]rune(m.Content))
+		n += textTokens(m.Content)
 		for _, tc := range m.ToolCalls {
-			n += len([]rune(tc.Arguments))
+			n += textTokens(tc.Arguments)
 		}
 	}
-	return n / 4
+	return n
+}
+
+func textTokens(s string) int {
+	cjk, other := 0, 0
+	for _, r := range s {
+		if unicode.Is(unicode.Han, r) || unicode.Is(unicode.Hiragana, r) || unicode.Is(unicode.Katakana, r) {
+			cjk++
+		} else {
+			other++
+		}
+	}
+	return cjk + other/4
 }
 
 // trunc 截断长文本(工具结果/参数渲染),避免事件刷屏。

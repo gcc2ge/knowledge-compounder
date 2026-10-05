@@ -137,6 +137,34 @@ func Test快照瘦身与水合(t *testing.T) {
 	}
 }
 
+// 回归场景:「泄漏」是概念页「goroutine泄漏」名称的子串,Contains 计数继承全部提及——
+// 实测产生过伪概念页。FormatMentions 必须给出护栏警示拦住建页决策。
+func TestMentions子串护栏(t *testing.T) {
+	idx := Build(tmpWiki(t))
+	out := idx.FormatMentions(idx.Mentions([]string{"泄漏"}))
+	if !strings.Contains(out, "子串") {
+		t.Fatalf("「泄漏」是页面名「goroutine泄漏」的子串,应带护栏警示,得:\n%s", out)
+	}
+	// 完整术语不应误伤
+	out = idx.FormatMentions(idx.Mentions([]string{"goroutine 泄漏"}))
+	if strings.Contains(out, "⚠️") {
+		t.Errorf("完整术语不应触发警示,得:\n%s", out)
+	}
+	// 短词护栏:单字术语
+	out = (&Index{}).FormatMentions([]MentionResult{{Term: "锁", Hits: []string{"a", "b"}}})
+	if !strings.Contains(out, "术语过短") {
+		t.Errorf("单字术语应触发短词警示,得:\n%s", out)
+	}
+	// 同批子串:批内「泄漏」⊂「goroutine 泄漏」
+	out = (&Index{}).FormatMentions([]MentionResult{
+		{Term: "泄漏", Hits: []string{"a", "b"}},
+		{Term: "goroutine 泄漏", Hits: []string{"a", "b"}},
+	})
+	if !strings.Contains(out, "同批术语") {
+		t.Errorf("批内子串应触发警示,得:\n%s", out)
+	}
+}
+
 func Test图查询(t *testing.T) {
 	idx := Build(tmpWiki(t))
 	// 入站:goroutine泄漏 被 a、b 链入

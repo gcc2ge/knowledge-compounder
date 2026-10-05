@@ -48,7 +48,7 @@ const usage = `kcp — 知识编译复利引擎(自研 agent,任意 LLM)
 环境变量: KCP_PROVIDER(openai-compatible|anthropic) KCP_MODEL KCP_API_KEY KCP_BASE_URL
           KCP_MAX_STEPS KCP_MAX_SAME_ACTION KCP_MAX_TOKENS KCP_MAX_HEAL KCP_DEADLINE(秒) KCP_STATE_FILE
           KCP_STREAM(默认1=SSE流式,0=关闭)
-          KCP_COMPACT_TOKENS(上下文治理:估算token超此值压缩早期历史;0=关闭)
+          KCP_COMPACT_TOKENS(上下文治理:估算token超此值压缩早期历史;默认80000,显式0=关闭)
           KCP_COMPACT_KEEP_ROUNDS(压缩保留最近几轮;默认8) KCP_CHECKPOINT_EVERY(checkpoint步频;默认3)
           KCP_MAX_OUTPUT_TOKENS(单次LLM输出上限透传;0=模型默认)
           KCP_EMBED_MODEL(留空=离线字符哈希嵌入;设置后用 OpenAI 兼容 /embeddings 语义检索)
@@ -185,13 +185,17 @@ func Main(args []string) int {
 			fmt.Fprintln(os.Stderr, "用法: kcp compile <raw文件>")
 			return 1
 		}
-		return runRole(root, cfg, "compiler", compileInput(root, args[1]))
+		code := runRole(root, cfg, "compiler", compileInput(root, args[1]), args[1])
+		if code == 0 {
+			postCompileQA(root, args[1]) // Stop hook 语义:编译完自动核对,问题就地暴露
+		}
+		return code
 	case "query":
 		if len(args) < 2 {
 			fmt.Fprintln(os.Stderr, "用法: kcp query <问题>")
 			return 1
 		}
-		return runRole(root, cfg, "query", strings.Join(args[1:], " "))
+		return runRole(root, cfg, "query", strings.Join(args[1:], " "), "")
 	default:
 		// 兜底:把第一个参数当角色
 		if args[0] == "compiler" || args[0] == "qa" || args[0] == "query" {
@@ -199,26 +203,72 @@ func Main(args []string) int {
 			if len(args) > 1 {
 				input = strings.Join(args[1:], " ")
 			}
-			return runRole(root, cfg, args[0], input)
+			return runRole(root, cfg, args[0], input, "")
 		}
 		fmt.Fprintf(os.Stderr, "未知命令: %s\n%s", args[0], usage)
 		return 1
 	}
 }
 
-// compileInput 组装 compiler 的任务输入:raw 内容 + SCHEMA 要求。
+// compileInput 组装 compiler 的任务输入:路径 + 短预览 + 分页读取指示。
+// 不再把全文塞进初始消息——旧做法 20KB 截断,长书必丢内容;全文经 read_file 工具结果
+// 进入上下文一次(可被压缩折叠),与 Claude Code 的 Read 语义对齐。
 func compileInput(root, rawFile string) string {
 	fp := filepath.Join(root, rawFile)
 	b, err := os.ReadFile(fp)
 	if err != nil {
 		return fmt.Sprintf("读取失败: %v", err)
 	}
-	content := string(b)
-	if len(content) > 20000 {
-		content = content[:20000] + "\n…(截断)"
+	lines := strings.Count(string(b), "\n") + 1
+	preview := string(b)
+	if len(preview) > 1500 {
+		preview = preview[:1500] + "…(预览截断)"
 	}
-	return fmt.Sprintf("只编译下面这一个 raw 源:%s(禁止读取或编译其他 raw)。源摘要页文件名必须是 wiki/sources/%s.md(与 raw 主干同名,禁止改名/加后缀)。按 SCHEMA 生成源摘要页(论证链保留全部代码/表/示例);再用 search_wiki 检查哪些概念/实体已被 2+ 个源提及,满足条件的直接创建/更新 wiki/concepts/、wiki/entities/ 页面;禁止创建 synthesis 页。\n\n%s",
-		rawFile, strings.TrimSuffix(filepath.Base(rawFile), ".md"), content)
+	return fmt.Sprintf(`只编译这一个 raw 源:%s(共 %d 行;禁止读取或编译其他 raw)。
+第一步:用 read_file(path="%s") 读全文;返回要求分页时按提示 offset/limit 逐页读完——**禁止只凭下面的预览编译**。
+源摘要页文件名必须是 wiki/sources/%s.md(与 raw 主干同名,禁止改名/加后缀)。按 SCHEMA 生成源摘要页(论证链保留全部代码/表/示例);再用 wiki_mentions 检查哪些概念/实体已被 2+ 个源提及(候选术语用完整词,勿用泛化短词;⚠️ 警示行出现时优先并入完整页面),满足条件的创建/更新 wiki/concepts/、wiki/entities/;禁止创建 synthesis 页。
+
+=== 文件预览(仅供判断题材,前 1500 字节) ===
+%s`, rawFile, lines, rawFile, strings.TrimSuffix(filepath.Base(rawFile), ".md"), preview)
+}
+
+// postCompileQA 编译后自动质检(对标 Claude Code 的 Stop hook):
+// preflight 硬资产完整性 + sources 缩水检查 + lint 摘要;打 stderr,不污染 stdout。
+func postCompileQA(root, rawFile string) {
+	fmt.Fprintln(os.Stderr, "\n[自动质检] 编译后检查…")
+	slug := strings.TrimSuffix(filepath.Base(rawFile), ".md")
+	sourcePage := filepath.Join(root, "wiki", "sources", slug+".md")
+	if _, issues, err := wiki.Preflight(filepath.Join(root, rawFile), sourcePage); err == nil {
+		if len(issues) == 0 {
+			fmt.Fprintln(os.Stderr, "  preflight: 硬资产完整(代码/表/示例无缺失)")
+		} else {
+			fmt.Fprintf(os.Stderr, "  ⚠️ preflight 缺失 %d 项(重编或人工补齐):\n", len(issues))
+			for i, it := range issues {
+				if i >= 8 {
+					fmt.Fprintf(os.Stderr, "    …共 %d 项\n", len(issues))
+					break
+				}
+				fmt.Fprintf(os.Stderr, "    - %s\n", it)
+			}
+		}
+	}
+	if problems, err := wiki.CheckSourcesShrink(root); err == nil && len(problems) > 0 {
+		fmt.Fprintf(os.Stderr, "  ⚠️ 概念/实体页 sources 缩水 %d 页:\n", len(problems))
+		for _, p := range problems {
+			fmt.Fprintf(os.Stderr, "    - %s\n", p)
+		}
+	}
+	fmt.Fprintln(os.Stderr, "  lint:", lintSummary(root))
+}
+
+// lintSummary 单行 lint 概要(取报告首行)。
+func lintSummary(root string) string {
+	for _, line := range strings.Split(wiki.ReportLint(root), "\n") {
+		if strings.HasPrefix(line, "lint:") {
+			return strings.TrimSpace(line)
+		}
+	}
+	return "见 kcp lint"
 }
 
 // runSearch 混合检索诊断(零 LLM):词法+向量融合分、词法/语义子分、私有度徽标。
@@ -260,8 +310,8 @@ func indexDesc(idx *index.Index) string {
 	return fmt.Sprintf("on(%d 页)", len(idx.Pages))
 }
 
-// runRole 用自研运行时跑一个角色(provider + 工具 + M04 循环)。
-func runRole(root string, cfg config.Config, role, input string) int {
+// runRole 用自研运行时跑一个角色(provider + 工具 + M04 循环)。rawFile 为 compile 场景的源路径(步数自适应用)。
+func runRole(root string, cfg config.Config, role, input, rawFile string) int {
 	timeout := time.Duration(cfg.Deadline) * time.Second
 	if timeout <= 0 {
 		timeout = 10 * time.Minute
@@ -280,10 +330,15 @@ func runRole(root string, cfg config.Config, role, input string) int {
 		time.Now().Format("2006-01-02"))
 
 	// 编译一个源要写 1 个 source 页 + 2-6 个概念/实体页,外加检索核对;默认 10 步不够(实测在调查阶段耗尽)。
-	// 用户显式设 KCP_MAX_STEPS 时不覆盖。
+	// 用户显式设 KCP_MAX_STEPS 时不覆盖;长源(>100KB)分页读 + 分批落盘需要更多步,按大小自适应。
 	steps := cfg.MaxSteps
 	if role == "compiler" && os.Getenv("KCP_MAX_STEPS") == "" {
 		steps = 25
+		if rawFile != "" {
+			if fi, err := os.Stat(filepath.Join(root, rawFile)); err == nil && fi.Size() > 100<<10 {
+				steps = 35
+			}
+		}
 	}
 
 	toolList, idx := tools.Build(root, terminalAsk, eval.RetrievalOpts(root, cfg))

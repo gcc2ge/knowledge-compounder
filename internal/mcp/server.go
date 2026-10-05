@@ -110,18 +110,7 @@ func (s *Server) register() {
 			}
 			s.sync()
 			if s.idx != nil {
-				var b strings.Builder
-				for _, r := range s.idx.Mentions(terms) {
-					switch n := len(r.Hits); n {
-					case 0:
-						fmt.Fprintf(&b, "「%s」未被任何源页提及。\n", r.Term)
-					case 1:
-						fmt.Fprintf(&b, "「%s」仅 1 个源提及(%s)——单次提及,不建页。\n", r.Term, r.Hits[0])
-					default:
-						fmt.Fprintf(&b, "「%s」被 %d 个源提及(%s)——≥2,满足建页纪律。\n", r.Term, n, strings.Join(r.Hits, "、"))
-					}
-				}
-				return strings.TrimSuffix(b.String(), "\n")
+				return s.idx.FormatMentions(s.idx.Mentions(terms)) // 三档话术 + 子串/短词护栏
 			}
 			// 降级:全扫
 			files, _ := filepath.Glob(filepath.Join(s.root, "wiki", "sources", "*.md"))

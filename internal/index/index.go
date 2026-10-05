@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gcc2ge/knowledge-compounder/internal/embed"
 	"github.com/gcc2ge/knowledge-compounder/internal/retrieval"
@@ -504,6 +505,50 @@ func (idx *Index) Mentions(terms []string) []MentionResult {
 		out = append(out, MentionResult{Term: term, Hits: hits})
 	}
 	return out
+}
+
+// FormatMentions 三档建页话术 + 确定性护栏警示。护栏防 Contains 语义伪影:
+// 实测「泄漏」作为「goroutine泄漏」的子串继承了全部提及数,工具说 ≥2、模型照建——
+// 计数没错,判据太粗;把警示写进返回文本,便宜模型就能被机械拦住。
+func (idx *Index) FormatMentions(rs []MentionResult) string {
+	var b strings.Builder
+	for _, r := range rs {
+		switch n := len(r.Hits); n {
+		case 0:
+			fmt.Fprintf(&b, "「%s」未被任何源页提及。\n", r.Term)
+		case 1:
+			fmt.Fprintf(&b, "「%s」仅 1 个源提及(%s)——单次提及,进该源「术语」节,不建页。\n", r.Term, r.Hits[0])
+		default:
+			fmt.Fprintf(&b, "「%s」被 %d 个源提及(%s)——≥2,满足建页纪律,可创建/更新对应页面。\n", r.Term, n, strings.Join(r.Hits, "、"))
+		}
+		for _, w := range idx.mentionGuards(r.Term, rs) {
+			fmt.Fprintf(&b, "  ⚠️ %s\n", w)
+		}
+	}
+	return strings.TrimSuffix(b.String(), "\n")
+}
+
+// mentionGuards 三层护栏:①术语过短(单汉字泛化词)②同批更长术语的子串 ③已有页面名的子串。
+// nil 接收者安全(降级路径仅少第③层)。
+func (idx *Index) mentionGuards(term string, rs []MentionResult) []string {
+	var warns []string
+	if utf8.RuneCountInString(term) < 2 {
+		warns = append(warns, "术语过短,子串匹配可能高估提及——泛化词慎建页。")
+	}
+	for _, o := range rs {
+		if o.Term != term && len(o.Term) > len(term) && strings.Contains(o.Term, term) {
+			warns = append(warns, fmt.Sprintf("「%s」是同批术语「%s」的子串,命中可能来自后者——优先并入完整术语的页面,勿单独建页。", term, o.Term))
+		}
+	}
+	if idx != nil {
+		for slug := range idx.slugIndex {
+			if slug != term && len(slug) > len(term) && strings.Contains(slug, term) {
+				warns = append(warns, fmt.Sprintf("「%s」是已有页面「%s」名称的子串,命中可能继承自该页主题——慎建独立页,优先并入。", term, slug))
+				break // 一个例证足够
+			}
+		}
+	}
+	return warns
 }
 
 // GetPage 按 slug 读页(命中索引定位,正文按需读盘)。
