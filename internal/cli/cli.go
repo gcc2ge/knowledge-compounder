@@ -14,6 +14,7 @@ import (
 	"github.com/gcc2ge/knowledge-compounder/internal/agents"
 	"github.com/gcc2ge/knowledge-compounder/internal/config"
 	"github.com/gcc2ge/knowledge-compounder/internal/eval"
+	"github.com/gcc2ge/knowledge-compounder/internal/index"
 	"github.com/gcc2ge/knowledge-compounder/internal/mcp"
 	"github.com/gcc2ge/knowledge-compounder/internal/provider"
 	"github.com/gcc2ge/knowledge-compounder/internal/retrieval"
@@ -223,12 +224,19 @@ func compileInput(root, rawFile string) string {
 // runSearch 混合检索诊断(零 LLM):词法+向量融合分、词法/语义子分、私有度徽标。
 func runSearch(root string, cfg config.Config, query string) int {
 	opts := eval.RetrievalOpts(root, cfg)
-	results := wiki.Retrieve(root, query, opts)
+	idx := index.Load(root)
+	var results []retrieval.Result
+	if idx != nil {
+		results = idx.Rank(query, opts)
+		_ = idx.Save(root) // 留快照给下次(首次运行建索引的开销只付一次)
+	} else {
+		results = wiki.Retrieve(root, query, opts)
+	}
 	if len(results) == 0 {
 		fmt.Println("未找到相关页面。")
 		return 0
 	}
-	fmt.Printf("检索「%s」: %d 条(嵌入=%s, 缓存=%s)\n", query, len(results), embedDesc(opts), retrieval.CachePath(root))
+	fmt.Printf("检索「%s」: %d 条(嵌入=%s, 缓存=%s, 索引=%s)\n", query, len(results), embedDesc(opts), retrieval.CachePath(root), indexDesc(idx))
 	for _, r := range results {
 		badge := wiki.EvidenceBadge(root, r.Path)
 		fmt.Printf("- [[%s]] %s 融合%.2f 词法%.2f 语义%.2f: %s\n",
@@ -242,6 +250,14 @@ func embedDesc(opts retrieval.Options) string {
 		return "无向量层"
 	}
 	return "已启用"
+}
+
+// indexDesc 索引状态描述(nil=降级全扫)。
+func indexDesc(idx *index.Index) string {
+	if idx == nil {
+		return "off(全扫)"
+	}
+	return fmt.Sprintf("on(%d 页)", len(idx.Pages))
 }
 
 // runRole 用自研运行时跑一个角色(provider + 工具 + M04 循环)。
@@ -270,10 +286,15 @@ func runRole(root string, cfg config.Config, role, input string) int {
 		steps = 25
 	}
 
+	toolList, idx := tools.Build(root, terminalAsk, eval.RetrievalOpts(root, cfg))
+	if idx != nil {
+		defer idx.Save(root) // 进程退出前把索引增量留给下次(原子写)
+	}
+
 	rt := &agent.Runtime{
 		Provider:        p,
 		SystemPrompt:    system,
-		Tools:           tools.Build(root, terminalAsk, eval.RetrievalOpts(root, cfg)),
+		Tools:           toolList,
 		MaxSteps:        steps,
 		MaxSameAction:   cfg.MaxSameAction,
 		MaxTokens:       cfg.MaxTokens,

@@ -194,7 +194,12 @@ func NewCache(path string) *Cache {
 
 // Key 生成文档缓存键。
 func Key(path string, fi os.FileInfo) string {
-	return path + "|" + strconv.FormatInt(fi.ModTime().UnixNano(), 10) + "|" + strconv.FormatInt(fi.Size(), 10)
+	return KeyParts(path, fi.ModTime().UnixNano(), fi.Size())
+}
+
+// KeyParts 免 stat 的缓存键(索引里已存 mtime/size 时用)。
+func KeyParts(path string, mtimeNano, size int64) string {
+	return path + "|" + strconv.FormatInt(mtimeNano, 10) + "|" + strconv.FormatInt(size, 10)
 }
 
 // Get 读取缓存向量。wantDim>0 且缓存维度不符 → 未命中(调用方重新 embed 覆盖)。

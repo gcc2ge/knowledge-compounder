@@ -172,10 +172,14 @@ cmd/kcp                CLI 入口
 internal/provider     M02 Provider 抽象 + 能力位(OpenAI 兼容/Anthropic)
 internal/agent        M04 循环:Think-Act-Observe + 停止条件 + 错误自愈
 internal/agents       内置角色 system prompt(compiler/query/qa)
-internal/tools        M06 工具注册(状态/检索/读写文件/lint),全 Go 实现
+internal/tools        M06 工具注册(状态/检索/mentions/反链/读写文件/lint),全 Go 实现
+internal/index        内存倒排索引+快照:检索/计数/图查询零全库扫(716 页实测单次检索 307ms→6.6ms)
 internal/wiki         知识库操作(扫描/检索/lint),替代原 Python scripts
+internal/mcp          支柱 B:MCP stdio server(纯标准库实现协议,零 SDK 依赖)
 internal/cli          命令分发
 ```
+
+工具层遵循一条纪律:**能确定性解决的绝不交给概率**。「术语被几个源提及」这类建页判据由 `wiki_mentions` 直接计数返回结论(0/1/≥2 三档话术),LLM 不做模糊搜索去数文件;语义判断才留给模型。索引层用标准库实现(倒排 + gob 字典编码快照 + mtime 增量同步),第三方依赖数保持为零;`KCP_INDEX=off` 一键降级回全扫路径。
 
 `scripts/` 仅保留 pdf2md.sh(T1/T2 PDF 管道)与 export-public.sh(隐私导出)——两者依赖外部工具,保留 shell;Python 工具链已全部移植到 Go。设计见 `docs/harness设计.md`。
 

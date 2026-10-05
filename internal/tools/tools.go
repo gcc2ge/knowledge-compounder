@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/gcc2ge/knowledge-compounder/internal/index"
 	"github.com/gcc2ge/knowledge-compounder/internal/provider"
 	"github.com/gcc2ge/knowledge-compounder/internal/retrieval"
 	"github.com/gcc2ge/knowledge-compounder/internal/wiki"
@@ -17,7 +18,10 @@ import (
 
 // Build 构造工具列表。root 为项目根;ask 为策展决策回调(向用户提问等裁决),nil 则 ask_user 返回非交互提示;
 // opts 为检索选项(embedder/缓存/条数),空则 search_wiki 退回词法检索。
-func Build(root string, ask func(string) string, opts retrieval.Options) []provider.ToolDef {
+// 返回工具列表与内存索引(KCP_INDEX=off 时索引为 nil,工具降级走全扫旧路径);
+// 调用方在进程退出前调 idx.Save(root) 把增量留给下次。
+func Build(root string, ask func(string) string, opts retrieval.Options) ([]provider.ToolDef, *index.Index) {
+	idx := index.Load(root)
 	return []provider.ToolDef{
 		{
 			Name: "wiki_status", Description: "查看知识库状态:页面计数 + 未编译 raw",
@@ -33,7 +37,12 @@ func Build(root string, ask func(string) string, opts retrieval.Options) []provi
 				if k > 0 {
 					opts.Top = k
 				}
-				results := wiki.Retrieve(root, query, opts)
+				var results []retrieval.Result
+				if idx != nil {
+					results = idx.Rank(query, opts)
+				} else {
+					results = wiki.Retrieve(root, query, opts)
+				}
 				if len(results) == 0 {
 					return "知识库中未找到相关页面。"
 				}
@@ -50,7 +59,13 @@ func Build(root string, ask func(string) string, opts retrieval.Options) []provi
 			Parameters: obj(map[string]any{"page": strProp}),
 			Func: func(args map[string]any) string {
 				page := str(args, "page")
-				text, dir, ok := wiki.GetPage(root, page)
+				var text, dir string
+				var ok bool
+				if idx != nil {
+					text, dir, ok = idx.GetPage(page)
+				} else {
+					text, dir, ok = wiki.GetPage(root, page)
+				}
 				if !ok {
 					return fmt.Sprintf("[[%s]] 不存在。", strings.TrimSuffix(page, ".md"))
 				}
@@ -58,32 +73,100 @@ func Build(root string, ask func(string) string, opts retrieval.Options) []provi
 			},
 		},
 		{
-			Name: "wiki_mentions", Description: "统计一个术语被几个已编译源页提及——「2+ 源提及才建概念/实体页」纪律的确定性判据。输入术语,返回提及计数与页面列表",
-			Parameters: obj(map[string]any{"term": strProp}),
+			Name: "wiki_mentions", Description: "统计术语被几个已编译源页提及——「2+ 源提及才建概念/实体页」纪律的确定性判据。支持批量:terms 传数组一次查多个候选(推荐);单数 term 也兼容。每项返回提及计数与建页结论",
+			Parameters: obj(map[string]any{
+				"term":  strProp,
+				"terms": map[string]any{"type": "array", "items": strProp},
+			}),
 			Func: func(args map[string]any) string {
-				term := str(args, "term")
-				if term == "" {
-					return "term 不能为空"
-				}
-				var hits []string
-				files, _ := filepath.Glob(filepath.Join(root, "wiki", "sources", "*.md"))
-				for _, f := range files {
-					b, err := os.ReadFile(f)
-					if err != nil {
-						continue
-					}
-					if strings.Contains(strings.ToLower(string(b)), strings.ToLower(term)) {
-						hits = append(hits, strings.TrimSuffix(filepath.Base(f), ".md"))
+				var terms []string
+				if arr, ok := args["terms"].([]any); ok {
+					for _, v := range arr {
+						if s, ok := v.(string); ok && s != "" {
+							terms = append(terms, s)
+						}
 					}
 				}
-				switch n := len(hits); n {
-				case 0:
-					return fmt.Sprintf("「%s」未被任何源页提及。", term)
-				case 1:
-					return fmt.Sprintf("「%s」仅 1 个源提及(%s)——单次提及,进该源「术语」节,不建页。", term, hits[0])
-				default:
-					return fmt.Sprintf("「%s」被 %d 个源提及(%s)——≥2,满足建页纪律,直接创建/更新对应页面。", term, n, strings.Join(hits, "、"))
+				if t := str(args, "term"); t != "" {
+					terms = append(terms, t)
 				}
+				if len(terms) == 0 {
+					return "term/terms 至少提供一个。"
+				}
+				var results []index.MentionResult
+				if idx != nil {
+					results = idx.Mentions(terms)
+				} else {
+					// 降级:逐 term 全扫 source 页
+					files, _ := filepath.Glob(filepath.Join(root, "wiki", "sources", "*.md"))
+					var texts []struct{ slug, low string }
+					for _, f := range files {
+						if b, err := os.ReadFile(f); err == nil {
+							texts = append(texts, struct{ slug, low string }{strings.TrimSuffix(filepath.Base(f), ".md"), strings.ToLower(string(b))})
+						}
+					}
+					for _, t := range terms {
+						var hits []string
+						for _, te := range texts {
+							if strings.Contains(te.low, strings.ToLower(t)) {
+								hits = append(hits, te.slug)
+							}
+						}
+						results = append(results, index.MentionResult{Term: t, Hits: hits})
+					}
+				}
+				var b strings.Builder
+				for _, r := range results {
+					switch n := len(r.Hits); n {
+					case 0:
+						fmt.Fprintf(&b, "「%s」未被任何源页提及。\n", r.Term)
+					case 1:
+						fmt.Fprintf(&b, "「%s」仅 1 个源提及(%s)——单次提及,进该源「术语」节,不建页。\n", r.Term, r.Hits[0])
+					default:
+						fmt.Fprintf(&b, "「%s」被 %d 个源提及(%s)——≥2,满足建页纪律,直接创建/更新对应页面。\n", r.Term, n, strings.Join(r.Hits, "、"))
+					}
+				}
+				return strings.TrimSuffix(b.String(), "\n")
+			},
+		},
+		{
+			Name: "backlinks", Description: "查一个页面的双向链接:谁链向它(入站)/它链向谁(出站,断链单独标出)。知识网络的结构化导航",
+			Parameters: obj(map[string]any{"page": strProp}),
+			Func: func(args map[string]any) string {
+				slug := strings.TrimSuffix(str(args, "page"), ".md")
+				if slug == "" {
+					return "page 必填。"
+				}
+				if idx != nil {
+					in, out := idx.Backlinks(slug)
+					var b strings.Builder
+					fmt.Fprintf(&b, "[[%s]] 入站 %d 条:", slug, len(in))
+					if len(in) == 0 {
+						b.WriteString(" 无(孤儿页)")
+					} else {
+						b.WriteString(" " + strings.Join(in, "、"))
+					}
+					var okLinks, broken []string
+					for _, o := range out {
+						if idx.HasSlug(o) {
+							okLinks = append(okLinks, o)
+						} else {
+							broken = append(broken, o)
+						}
+					}
+					fmt.Fprintf(&b, "\n出站 %d 条: %s", len(out), strings.Join(okLinks, "、"))
+					if len(broken) > 0 {
+						fmt.Fprintf(&b, "\n断链: %s", strings.Join(broken, "、"))
+					}
+					return b.String()
+				}
+				// 降级:读文件解析
+				text, _, ok := wiki.GetPage(root, slug)
+				if !ok {
+					return fmt.Sprintf("页面 [[%s]] 不存在。", slug)
+				}
+				links := wiki.ParseWikilinks(text)
+				return fmt.Sprintf("[[%s]] 出站 %d 条: %s\n(入站查询需索引;当前为降级模式)", slug, len(links), strings.Join(links, "、"))
 			},
 		},
 		{
@@ -108,6 +191,9 @@ func Build(root string, ask func(string) string, opts retrieval.Options) []provi
 				if err := os.WriteFile(fp, []byte(content), 0o644); err != nil {
 					return fmt.Sprintf("写入失败: %v", err)
 				}
+				if idx != nil {
+					idx.UpdateFile(fp) // 写入即索引:同会话后续检索立即可见
+				}
 				return fmt.Sprintf("已写入 %s", rel(root, fp))
 			},
 		},
@@ -127,7 +213,7 @@ func Build(root string, ask func(string) string, opts retrieval.Options) []provi
 				return ask(q)
 			},
 		},
-	}
+	}, idx
 }
 
 // ---- 工具辅助 ----

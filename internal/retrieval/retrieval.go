@@ -47,7 +47,7 @@ func Search(docs []Doc, query string, opts Options) []Result {
 		return nil
 	}
 
-	terms := tokenize(query)
+	terms := Tokenize(query)
 	if len(terms) == 0 {
 		return nil
 	}
@@ -134,7 +134,7 @@ func Search(docs []Doc, query string, opts Options) []Result {
 			Score:    score,
 			Lexical:  lexN,
 			Semantic: semN,
-			Summary:  summaryOf(d.Text),
+			Summary:  SummaryOf(d.Text),
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Score > out[j].Score })
@@ -196,7 +196,8 @@ var stopwords = map[string]bool{
 	"a": true, "an": true, "of": true, "to": true, "in": true, "and": true, "is": true,
 }
 
-func tokenize(q string) []string {
+// Tokenize 查询/文本分词(小写化+去停用词;中文按连续字母数字串与 >127 码位切分)。索引层共用。
+func Tokenize(q string) []string {
 	var out []string
 	var cur strings.Builder
 	flush := func() {
@@ -209,7 +210,9 @@ func tokenize(q string) []string {
 		}
 	}
 	for _, r := range q {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) || r > 127 {
+		// 汉字/假名等 CJK 属于 unicode 字母类(IsLetter),无需 >127 兜底;
+		// 兜底反而把中文标点(。码位 12290)也当词符,产生「背压。」这类脏 token。
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
 			cur.WriteRune(r)
 		} else {
 			flush()
@@ -232,7 +235,7 @@ func termCounts(text string) []int {
 	m := make([]int, 4096)
 	text = strings.ToLower(text)
 	// 按 token 切分计数(含中文连续串)
-	words := tokenize(text)
+	words := Tokenize(text)
 	for _, w := range words {
 		m[hashSlot(w)%4096]++
 	}
@@ -241,7 +244,8 @@ func termCounts(text string) []int {
 
 var summaryRe = regexp.MustCompile(`(?m)^## (?:一句话结论|定义|概述|问题)\s*\n([^\n]+)`)
 
-func summaryOf(text string) string {
+// SummaryOf 提取页面摘要(「一句话结论/定义/概述/问题」节优先,否则首个非空行)。索引层共用。
+func SummaryOf(text string) string {
 	if m := summaryRe.FindStringSubmatch(text); m != nil {
 		return strings.TrimSpace(m[1])
 	}

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/gcc2ge/knowledge-compounder/internal/config"
+	"github.com/gcc2ge/knowledge-compounder/internal/index"
 	"github.com/gcc2ge/knowledge-compounder/internal/provider"
 	"github.com/gcc2ge/knowledge-compounder/internal/retrieval"
 	"github.com/gcc2ge/knowledge-compounder/internal/wiki"
@@ -23,15 +24,17 @@ import (
 
 const (
 	serverName    = "wiki-context"
-	serverVersion = "0.6.0"
+	serverVersion = "0.7.0"
 	protocolVer   = "2024-11-05"
 )
 
 // Server MCP 服务器:root 为项目根,opts 为检索选项(embedder/缓存,来自 KCP_* 环境)。
+// idx 为内存索引(长驻进程启动加载一次,每次工具调用前增量 Sync;KCP_INDEX=off 时 nil 降级全扫)。
 type Server struct {
 	root  string
 	opts  retrieval.Options
 	tools map[string]toolDef
+	idx   *index.Index
 }
 
 type toolDef struct {
@@ -42,9 +45,16 @@ type toolDef struct {
 
 // New 构造并注册工具。
 func New(root string, opts retrieval.Options) *Server {
-	s := &Server{root: root, opts: opts, tools: map[string]toolDef{}}
+	s := &Server{root: root, opts: opts, tools: map[string]toolDef{}, idx: index.Load(root)}
 	s.register()
 	return s
+}
+
+// sync 增量同步(毫秒级 stat 对比,容忍外部进程改文件)。
+func (s *Server) sync() {
+	if s.idx != nil {
+		s.idx.Sync(s.root)
+	}
 }
 
 func (s *Server) register() {
@@ -60,7 +70,13 @@ func (s *Server) register() {
 			if k := intArg(a, "k", 5); k > 0 {
 				opts.Top = k
 			}
-			res := wiki.Retrieve(s.root, q, opts)
+			s.sync()
+			var res []retrieval.Result
+			if s.idx != nil {
+				res = s.idx.Rank(q, opts)
+			} else {
+				res = wiki.Retrieve(s.root, q, opts)
+			}
 			if len(res) == 0 {
 				return "知识库中未找到与查询匹配的页面。"
 			}
@@ -69,6 +85,105 @@ func (s *Server) register() {
 				fmt.Fprintf(&b, "- [[%s]] %s 命中%.2f: %s\n", r.Label, wiki.EvidenceBadge(s.root, r.Path), r.Score, r.Summary)
 			}
 			return b.String()
+		},
+	}
+	s.tools["wiki_mentions"] = toolDef{
+		name: "wiki_mentions", desc: "统计术语被几个源页提及(建页纪律判据);terms 支持批量",
+		params: obj(map[string]any{
+			"term":  strProp,
+			"terms": map[string]any{"type": "array", "items": strProp},
+		}),
+		call: func(a map[string]any) string {
+			var terms []string
+			if arr, ok := a["terms"].([]any); ok {
+				for _, v := range arr {
+					if s, ok := v.(string); ok && s != "" {
+						terms = append(terms, s)
+					}
+				}
+			}
+			if t := strArg(a, "term"); t != "" {
+				terms = append(terms, t)
+			}
+			if len(terms) == 0 {
+				return "term/terms 至少提供一个。"
+			}
+			s.sync()
+			if s.idx != nil {
+				var b strings.Builder
+				for _, r := range s.idx.Mentions(terms) {
+					switch n := len(r.Hits); n {
+					case 0:
+						fmt.Fprintf(&b, "「%s」未被任何源页提及。\n", r.Term)
+					case 1:
+						fmt.Fprintf(&b, "「%s」仅 1 个源提及(%s)——单次提及,不建页。\n", r.Term, r.Hits[0])
+					default:
+						fmt.Fprintf(&b, "「%s」被 %d 个源提及(%s)——≥2,满足建页纪律。\n", r.Term, n, strings.Join(r.Hits, "、"))
+					}
+				}
+				return strings.TrimSuffix(b.String(), "\n")
+			}
+			// 降级:全扫
+			files, _ := filepath.Glob(filepath.Join(s.root, "wiki", "sources", "*.md"))
+			var b strings.Builder
+			for _, t := range terms {
+				n := 0
+				var hits []string
+				for _, f := range files {
+					if c, err := os.ReadFile(f); err == nil && strings.Contains(strings.ToLower(string(c)), strings.ToLower(t)) {
+						n++
+						hits = append(hits, strings.TrimSuffix(filepath.Base(f), ".md"))
+					}
+				}
+				if n == 0 {
+					fmt.Fprintf(&b, "「%s」未被任何源页提及。\n", t)
+				} else if n == 1 {
+					fmt.Fprintf(&b, "「%s」仅 1 个源提及(%s)——单次提及,不建页。\n", t, hits[0])
+				} else {
+					fmt.Fprintf(&b, "「%s」被 %d 个源提及(%s)——≥2,满足建页纪律。\n", t, n, strings.Join(hits, "、"))
+				}
+			}
+			return strings.TrimSuffix(b.String(), "\n")
+		},
+	}
+	s.tools["backlinks"] = toolDef{
+		name: "backlinks", desc: "查页面双向链接:入站(谁链它)/出站(它链谁,断链单独标出)",
+		params: obj(map[string]any{"page": strProp}),
+		call: func(a map[string]any) string {
+			slug := strings.TrimSuffix(strArg(a, "page"), ".md")
+			if slug == "" {
+				return "参数 page 必填。"
+			}
+			s.sync()
+			if s.idx != nil {
+				in, out := s.idx.Backlinks(slug)
+				var b strings.Builder
+				fmt.Fprintf(&b, "[[%s]] 入站 %d 条:", slug, len(in))
+				if len(in) == 0 {
+					b.WriteString(" 无(孤儿页)")
+				} else {
+					b.WriteString(" " + strings.Join(in, "、"))
+				}
+				var okLinks, broken []string
+				for _, o := range out {
+					if s.idx.HasSlug(o) {
+						okLinks = append(okLinks, o)
+					} else {
+						broken = append(broken, o)
+					}
+				}
+				fmt.Fprintf(&b, "\n出站 %d 条: %s", len(out), strings.Join(okLinks, "、"))
+				if len(broken) > 0 {
+					fmt.Fprintf(&b, "\n断链: %s", strings.Join(broken, "、"))
+				}
+				return b.String()
+			}
+			text, _, ok := wiki.GetPage(s.root, slug)
+			if !ok {
+				return fmt.Sprintf("页面 [[%s]] 不存在。", slug)
+			}
+			links := wiki.ParseWikilinks(text)
+			return fmt.Sprintf("[[%s]] 出站 %d 条: %s\n(入站查询需索引;当前为降级模式)", slug, len(links), strings.Join(links, "、"))
 		},
 	}
 	s.tools["get_page"] = toolDef{
@@ -165,7 +280,13 @@ func (s *Server) synthesize(question string) string {
 		return "未配置 KCP_API_KEY / KCP_BASE_URL,synthesize_for 需要 LLM;其余检索工具可用。"
 	}
 	p := newProvider(cfg)
-	res := retrieval.Search(s.wikiDocs(), question, s.opts)
+	s.sync()
+	var res []retrieval.Result
+	if s.idx != nil {
+		res = s.idx.Rank(question, s.opts)
+	} else {
+		res = retrieval.Search(s.wikiDocs(), question, s.opts)
+	}
 	if len(res) == 0 {
 		return "知识库中未检索到相关内容。"
 	}
