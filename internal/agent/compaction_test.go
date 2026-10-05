@@ -3,7 +3,7 @@ package agent
 import (
 	"testing"
 
-	"github.com/knowledge-compounder/kcp/internal/provider"
+	"github.com/gcc2ge/knowledge-compounder/internal/provider"
 )
 
 // 构造一条带 tool_calls 的 assistant 消息与其 tool 结果,组成一轮。

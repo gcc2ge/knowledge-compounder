@@ -4,7 +4,7 @@ package main
 import (
 	"os"
 
-	"github.com/knowledge-compounder/kcp/internal/cli"
+	"github.com/gcc2ge/knowledge-compounder/internal/cli"
 )
 
 func main() {

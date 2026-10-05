@@ -15,10 +15,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/knowledge-compounder/kcp/internal/config"
-	"github.com/knowledge-compounder/kcp/internal/provider"
-	"github.com/knowledge-compounder/kcp/internal/retrieval"
-	"github.com/knowledge-compounder/kcp/internal/wiki"
+	"github.com/gcc2ge/knowledge-compounder/internal/config"
+	"github.com/gcc2ge/knowledge-compounder/internal/provider"
+	"github.com/gcc2ge/knowledge-compounder/internal/retrieval"
+	"github.com/gcc2ge/knowledge-compounder/internal/wiki"
 )
 
 const (

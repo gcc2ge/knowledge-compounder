@@ -10,15 +10,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/knowledge-compounder/kcp/internal/agent"
-	"github.com/knowledge-compounder/kcp/internal/agents"
-	"github.com/knowledge-compounder/kcp/internal/config"
-	"github.com/knowledge-compounder/kcp/internal/eval"
-	"github.com/knowledge-compounder/kcp/internal/mcp"
-	"github.com/knowledge-compounder/kcp/internal/provider"
-	"github.com/knowledge-compounder/kcp/internal/retrieval"
-	"github.com/knowledge-compounder/kcp/internal/tools"
-	"github.com/knowledge-compounder/kcp/internal/wiki"
+	"github.com/gcc2ge/knowledge-compounder/internal/agent"
+	"github.com/gcc2ge/knowledge-compounder/internal/agents"
+	"github.com/gcc2ge/knowledge-compounder/internal/config"
+	"github.com/gcc2ge/knowledge-compounder/internal/eval"
+	"github.com/gcc2ge/knowledge-compounder/internal/mcp"
+	"github.com/gcc2ge/knowledge-compounder/internal/provider"
+	"github.com/gcc2ge/knowledge-compounder/internal/retrieval"
+	"github.com/gcc2ge/knowledge-compounder/internal/tools"
+	"github.com/gcc2ge/knowledge-compounder/internal/wiki"
 )
 
 const usage = `kcp — 知识编译复利引擎(自研 agent,任意 LLM)

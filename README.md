@@ -115,7 +115,7 @@ kcp 的检索层**本身是 RAG 的生产基线**(BM25+向量 0.55/0.45 融合),
 
 ```bash
 # 1. 克隆模板,进入项目,编译自研 agent
-git clone https://github.com/<you>/knowledge-compounder.git && cd knowledge-compounder
+git clone https://github.com/gcc2ge/knowledge-compounder.git && cd knowledge-compounder
 go build -o kcp ./cmd/kcp
 
 # 2. 先验证安装(以下全部零 LLM,不需要任何 API key)

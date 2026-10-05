@@ -1,10 +1,10 @@
 package eval
 
 import (
-	"github.com/knowledge-compounder/kcp/internal/config"
-	"github.com/knowledge-compounder/kcp/internal/embed"
-	"github.com/knowledge-compounder/kcp/internal/provider"
-	"github.com/knowledge-compounder/kcp/internal/retrieval"
+	"github.com/gcc2ge/knowledge-compounder/internal/config"
+	"github.com/gcc2ge/knowledge-compounder/internal/embed"
+	"github.com/gcc2ge/knowledge-compounder/internal/provider"
+	"github.com/gcc2ge/knowledge-compounder/internal/retrieval"
 )
 
 // RetrievalOpts 按配置构造检索选项:配 KCP_EMBED_MODEL 用在线语义向量,否则本地字符哈希嵌入;

@@ -7,7 +7,7 @@ package agent
 import (
 	"fmt"
 
-	"github.com/knowledge-compounder/kcp/internal/provider"
+	"github.com/gcc2ge/knowledge-compounder/internal/provider"
 )
 
 // CompactionPolicy 压缩策略。零值 = 关闭(行为与旧版一致)。

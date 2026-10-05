@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/knowledge-compounder/kcp/internal/retrieval"
+	"github.com/gcc2ge/knowledge-compounder/internal/retrieval"
 )
 
 // Retrieve 检索 wiki 全部页面(混合:词法 + 可选向量)。返回带私有度徽标的排序结果。

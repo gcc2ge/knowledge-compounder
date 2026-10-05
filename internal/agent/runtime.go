@@ -14,7 +14,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/knowledge-compounder/kcp/internal/provider"
+	"github.com/gcc2ge/knowledge-compounder/internal/provider"
 )
 
 type Runtime struct {

@@ -11,7 +11,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/knowledge-compounder/kcp/internal/embed"
+	"github.com/gcc2ge/knowledge-compounder/internal/embed"
 )
 
 // Doc 检索语料中的一份文档。

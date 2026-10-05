@@ -10,9 +10,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/knowledge-compounder/kcp/internal/provider"
-	"github.com/knowledge-compounder/kcp/internal/retrieval"
-	"github.com/knowledge-compounder/kcp/internal/wiki"
+	"github.com/gcc2ge/knowledge-compounder/internal/provider"
+	"github.com/gcc2ge/knowledge-compounder/internal/retrieval"
+	"github.com/gcc2ge/knowledge-compounder/internal/wiki"
 )
 
 // Build 构造工具列表。root 为项目根;ask 为策展决策回调(向用户提问等裁决),nil 则 ask_user 返回非交互提示;
