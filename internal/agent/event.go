@@ -8,14 +8,15 @@ package agent
 type EventKind int
 
 const (
-	EvText       EventKind = iota // 流式文本增量(SSE delta)
-	EvStep                        // 每一轮循环开始(结构信号,携带步数)
-	EvToolCall                    // 模型决策要执行工具
-	EvToolResult                  // 工具执行返回(Observation 回填前)
-	EvCompact                     // 上下文被压缩(M09 治理触发)
-	EvDone                        // 正常完成(无工具调用,返回最终答案)
-	EvStop                        // 因停止条件退出(MaxSteps/MaxSameAction/MaxTokens/Deadline)
-	EvError                       // 不可恢复错误
+	EvText        EventKind = iota // 流式文本增量(SSE delta)
+	EvStep                         // 每一轮循环开始(结构信号,携带步数)
+	EvToolCall                     // 模型决策要执行工具
+	EvToolResult                   // 工具执行返回(Observation 回填前)
+	EvCompact                      // 上下文被压缩(M09 治理触发)
+	EvDone                         // 正常完成(无工具调用,返回最终答案)
+	EvStop                         // 因停止条件退出(MaxSteps/MaxSameAction/MaxTokens/Deadline)
+	EvError                        // 不可恢复错误
+	EvFinishGuard                  // 模型给出最终答复但任务未完成,注入续跑指令(compiler 落盘兜底)
 )
 
 // Event 一次 agent 生命周期事件。

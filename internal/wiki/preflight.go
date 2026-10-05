@@ -10,7 +10,9 @@ import (
 )
 
 var (
-	preFencedBlock = regexp.MustCompile("(?ms)^```[^\\n]*\\n.*?^```\\s*$")
+	// 围栏允许前导空白:嵌套在列表/引用里的缩进围栏也是合法代码块(实测 deepseek 产物带 3 空格缩进,
+	// 旧正则锚定列首会漏检成 source=0)。[ \t]* 吸收缩进;反引号不能出现在 raw string,故拼接。
+	preFencedBlock = regexp.MustCompile(`(?ms)^[ \t]*` + "```" + `[^\n]*\n.*?^[ \t]*` + "```" + `\s*$`)
 	preTable       = regexp.MustCompile(`(?m)^\|.+\|\s*\n\|(?:\s*:?-{3,}:?\s*\|)+`)
 	preHTMLTable   = regexp.MustCompile(`(?i)<table\b`)
 	preMath        = regexp.MustCompile(`(?s)\$\$.+?\$\$|\\\[.+?\\\]`)
@@ -48,7 +50,26 @@ func Preflight(rawPath, sourcePage string) (string, []string, error) {
 			issues = append(issues, fmt.Sprintf("⚠️ %s: raw=%d, source=%d — 硬资产可能丢失,请逐条核验", name, rawN, pageN))
 		}
 	}
-	check("代码块", raw.fenced, page.fenced)
+	// 代码块特殊核验:允许「模板重复」式语义压缩——raw 里逐字重复的块,source 只需保留一个代表。
+	// 降级为覆盖提示而非缺失;唯一块缺失仍是硬失败(真实内容丢失)。
+	// 实测:deepseek 对 168 节同一代码骨架选择「保留唯一骨架 + 复现规则」,旧逻辑误报 164→0。
+	if raw.fenced > 0 && page.fenced < raw.fenced {
+		rawBlocks, pageBlocks := distinctBlocks(string(rawB)), distinctBlocks(string(pageB))
+		missing := 0
+		for blk := range rawBlocks {
+			if !pageBlocks[blk] {
+				missing++
+			}
+		}
+		if missing == 0 {
+			fmt.Fprintf(&b, "  代码块覆盖核验: raw=%d, source=%d — 缺失 %d 个均为重复块(去重后唯一 %d 个已全部覆盖)→ 语义无损,不阻断\n",
+				raw.fenced, page.fenced, raw.fenced-page.fenced, len(rawBlocks))
+		} else {
+			issues = append(issues, fmt.Sprintf("⚠️ 代码块: raw=%d, source=%d — %d 个唯一代码块未覆盖(真实内容丢失),必须重编", raw.fenced, page.fenced, missing))
+		}
+	} else {
+		check("代码块", raw.fenced, page.fenced)
+	}
 	check("markdown 表", raw.tables, page.tables)
 	check("html 表", raw.htmlTables, page.htmlTables)
 	check("数学表达式", raw.math, page.math)
@@ -83,4 +104,25 @@ func sectionHas(text, heading string) bool {
 		}
 	}
 	return false
+}
+
+// distinctBlocks 提取去重后的代码块集合(规范化:逐行 trim + 去空行)。
+// 用于重复块覆盖判定:raw 里 N 个逐字重复的代码块,source 保留了至少一个代表即视为无损。
+func distinctBlocks(text string) map[string]bool {
+	set := map[string]bool{}
+	for _, m := range preFencedBlock.FindAllString(text, -1) {
+		set[normalizeBlock(m)] = true
+	}
+	return set
+}
+
+func normalizeBlock(b string) string {
+	lines := strings.Split(b, "\n")
+	out := make([]string, 0, len(lines))
+	for _, ln := range lines {
+		if t := strings.TrimSpace(ln); t != "" {
+			out = append(out, t)
+		}
+	}
+	return strings.Join(out, "\n")
 }

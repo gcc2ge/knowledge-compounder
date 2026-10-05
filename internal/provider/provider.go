@@ -22,6 +22,7 @@ type Usage struct {
 type Message struct {
 	Role       string
 	Content    string
+	Reasoning  string // 推理模型(deepseek-reasoner/v4-flash)的 reasoning_content;不出站回传,仅审计/兜底
 	ToolCalls  []ToolCall
 	ToolCallID string
 	Usage      *Usage // 仅 assistant 响应携带;累计消费供 MaxTokens 闸门
@@ -45,6 +46,12 @@ type Capabilities struct {
 type Provider interface {
 	Chat(ctx context.Context, msgs []Message, tools []ToolDef, stop []string) (Message, error)
 	Capabilities() Capabilities
+}
+
+// VisionProvider 可选:能描述图片的提供商(多模态)。
+// compiler 处理 raw/ 图片源时,describe_image 工具经 cli 侧断言到这个接口调用。
+type VisionProvider interface {
+	Vision(ctx context.Context, imagePath, prompt string) (string, error)
 }
 
 // Streamer 流式决策(SSE 增量输出)。Provider 实现它且 runtime.OnStream 非 nil 时走流式。

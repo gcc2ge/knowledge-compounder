@@ -32,8 +32,15 @@ type Runtime struct {
 	Compaction      CompactionPolicy // 上下文治理(M09);零值 = 关闭
 	CheckpointEvery int              // 写 checkpoint 的步频;0 = 默认每 3 步
 
+	// FinishGuard:可选。模型给出最终答复(无工具调用)时,若返回非空消息,视为任务未完成,
+	// 注入该消息强制续跑(compiler 落盘兜底:防弱模型「读而不写」直接退出,glm 实测连读 13 页零落盘)。
+	// MaxFinishPushes 限制续跑次数(0 = 关闭)。
+	FinishGuard     func(reply provider.Message) string
+	MaxFinishPushes int
+
 	// 运行时内部状态(非并发,单循环)
-	usage *provider.Usage // 累计真实 token 消耗
+	usage        *provider.Usage // 累计真实 token 消耗
+	finishPushes int             // 已注入的续跑次数
 }
 
 // Run 执行一次 agent 任务:LLM 决策 → 执行工具 → 观察回填 → 再决策,直到无工具调用或达到停止条件。
@@ -80,6 +87,16 @@ func (r *Runtime) Run(ctx context.Context, input, state string) (string, error) 
 		}
 		r.accumulateUsage(reply)
 		if len(reply.ToolCalls) == 0 {
+			// 落盘兜底:最终答复但任务未完成 → 注入续跑指令,堵住「总结文本代替写文件」的退出路径。
+			if r.FinishGuard != nil && r.finishPushes < r.MaxFinishPushes {
+				if cont := r.FinishGuard(reply); cont != "" {
+					r.finishPushes++
+					r.emit(Event{Kind: EvFinishGuard, Step: step, Text: trunc(cont, 100)})
+					msgs = append(msgs, provider.Message{Role: "assistant", Content: reply.Content})
+					msgs = append(msgs, provider.Message{Role: "user", Content: cont})
+					continue
+				}
+			}
 			_ = r.saveCheckpoint(msgs) // 保留最终对话供审计
 			r.emit(Event{Kind: EvDone, Step: step, Text: reply.Content, Tokens: r.consumedTokens(msgs)})
 			return reply.Content, nil

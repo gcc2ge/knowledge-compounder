@@ -22,11 +22,13 @@ import (
 
 // Build 构造工具列表。root 为项目根;ask 为策展决策回调(向用户提问等裁决),nil 则 ask_user 返回非交互提示;
 // opts 为检索选项(embedder/缓存/条数),空则 search_wiki 退回词法检索。
-// 返回工具列表与内存索引(KCP_INDEX=off 时索引为 nil,工具降级走全扫旧路径);
+// 返回工具列表、内存索引(KCP_INDEX=off 时索引为 nil,工具降级走全扫旧路径)与读覆盖台账
+// (分页读取的确定性记录,compiler 退出前查长源中间 gap——防「读头尾跳过中间」的浅页)。
 // 调用方在进程退出前调 idx.Save(root) 把增量留给下次。
-func Build(root string, ask func(string) string, opts retrieval.Options) ([]provider.ToolDef, *index.Index) {
+func Build(root string, ask func(string) string, vision func(string) string, opts retrieval.Options) ([]provider.ToolDef, *index.Index, *Coverage) {
 	idx := index.Load(root)
 	readsSinceWrite := map[string]int{} // 同文件连续分页读计数:落盘纪律的机械执行(见 read_file)
+	cov := &Coverage{}                  // 读覆盖台账:gap 检测的确定性依据
 	return []provider.ToolDef{
 		{
 			Name: "wiki_status", Description: "查看知识库状态:页面计数 + 未编译 raw",
@@ -167,11 +169,19 @@ func Build(root string, ask func(string) string, opts retrieval.Options) ([]prov
 			Parameters: obj(map[string]any{"path": strProp, "offset": intProp, "limit": intProp}),
 			Func: func(args map[string]any) string {
 				path := str(args, "path")
-				out := readPaged(root, path, intArg(args, "offset", 0), intArg(args, "limit", 0))
+				// 图片文件:不能按文本读,给确定性指引走 describe_image(Tier 2 vision)
+				if p, ok := safeJoin(root, path, "raw"); ok && isImageExt(p) {
+					if fi, err := os.Stat(p); err == nil {
+						return fmt.Sprintf("图片文件 %s(%d KB)。不能按文本读取;请用 describe_image 工具让视觉模型描述其内容,再把描述编译进页面。", path, fi.Size()>>10)
+					}
+				}
+				offset, limit := intArg(args, "offset", 0), intArg(args, "limit", 0)
+				out := readPaged(root, path, offset, limit)
+				markRead(cov, root, path, offset, limit) // 读覆盖台账:gap 检测依据
 				// 落盘纪律的机械执行:同文件连续分页读 ≥3 页未写任何文件时,
 				// 在返回文本里插入强制提醒——实测便宜模型会连读 13 页,上下文压缩
 				// 把早期内容折叠掉,读完已无料可写。纪律进工具返回,不靠 prompt 自觉。
-				if intArg(args, "offset", 0) > 0 || intArg(args, "limit", 0) > 0 {
+				if offset > 0 || limit > 0 {
 					readsSinceWrite[path]++
 					if readsSinceWrite[path] >= 3 {
 						out += fmt.Sprintf("\n\n⚠️ 你已连续读 %d 页未落盘。先停下:把已读段落的要点 write_file 进源页草稿,再继续读后面的页——否则上下文压缩会吃掉早期内容。", readsSinceWrite[path])
@@ -184,6 +194,29 @@ func Build(root string, ask func(string) string, opts retrieval.Options) ([]prov
 			Name: "web_fetch", Description: "抓取 http(s) URL 并转为纯文本(去 HTML 标签,截 8KB)——验证外部主张、查作者/工具背景用;非文本或不可达时返回错误说明",
 			Parameters: obj(map[string]any{"url": strProp}),
 			Func:       func(args map[string]any) string { return webFetch(str(args, "url")) },
+		},
+		{
+			Name: "web_search", Description: "搜索网页(零 key,DuckDuckGo HTML,返回 5 条标题/URL/摘要)——验证外部主张、查作者/工具背景用;要正文时再用 web_fetch 抓具体 URL",
+			Parameters: obj(map[string]any{"query": strProp}),
+			Func:       func(args map[string]any) string { return webSearch(str(args, "query")) },
+		},
+		{
+			Name: "describe_image", Description: "让视觉模型描述 raw/ 里的一张图片(架构图/截图/抓图,传相对路径)。返回的描述文本可直接编译进页面;模型无视觉能力时返回错误说明",
+			Parameters: obj(map[string]any{"path": strProp}),
+			Func: func(args map[string]any) string {
+				path := str(args, "path")
+				if vision == nil {
+					return "[非交互] 未配置视觉描述能力。按 SCHEMA 图片源无法自动编译:在 source 页注明「含图片 N 张,待人工补充描述」,或换多模态模型后重跑。"
+				}
+				fp, ok := safeJoin(root, path, "raw") // 只允许描述 raw/ 下图片(raw 不可变,不可写)
+				if !ok {
+					return "拒绝:describe_image 只允许描述 raw/ 下的图片,收到 " + path
+				}
+				if !isImageExt(fp) {
+					return "不是图片文件(png/jpg/jpeg/gif/webp/bmp): " + path
+				}
+				return vision(fp)
+			},
 		},
 		{
 			Name: "write_file", Description: "写入 wiki/ examples 内的文件(编译写页面用);raw/ 不可变,禁止写入",
@@ -223,7 +256,37 @@ func Build(root string, ask func(string) string, opts retrieval.Options) ([]prov
 				return ask(q)
 			},
 		},
-	}, idx
+	}, idx, cov
+}
+
+// markRead 把一次 read_file 的覆盖区间记入台账(与 readPaged 同判据)。
+// 全文读:≤80KB 记全覆盖;>80KB 只记返回的头部段。分页读:记 [offset, offset+limit-1]。
+func markRead(cov *Coverage, root, path string, offset, limit int) {
+	fp, ok := safeJoin(root, path, "wiki", "raw", "examples", "SCHEMA.md", "templates", "docs")
+	if !ok {
+		return
+	}
+	b, err := os.ReadFile(fp)
+	if err != nil {
+		return
+	}
+	total := strings.Count(string(b), "\n") + 1
+	if offset <= 0 && limit <= 0 {
+		if len(b) <= readWholeCap {
+			cov.Mark(path, 1, total, total)
+		} else {
+			headLines := strings.Count(string(b[:readWholeCap]), "\n") + 1
+			cov.Mark(path, 1, headLines, total)
+		}
+		return
+	}
+	if offset <= 0 {
+		offset = 1
+	}
+	if limit <= 0 || limit > pageLineCap {
+		limit = pageLineCap
+	}
+	cov.Mark(path, offset, offset+limit-1, total)
 }
 
 // ---- 工具辅助 ----
@@ -292,9 +355,9 @@ func readSafe(root, path string) string {
 }
 
 const (
-	readWholeCap  = 80 << 10 // 全读上限 80KB;超过强制分页,防大文件一次挤爆上下文
-	pageLineCap   = 2500     // 单页行数上限(对齐 Claude Read 的 2000 行语义,防一页过巨)
-	pageBytesCap  = 120 << 10
+	readWholeCap = 80 << 10 // 全读上限 80KB;超过强制分页,防大文件一次挤爆上下文
+	pageLineCap  = 2500     // 单页行数上限(对齐 Claude Read 的 2000 行语义,防一页过巨)
+	pageBytesCap = 120 << 10
 )
 
 // readPaged 读取文件;offset(1 起始行)/limit 给定时按 cat -n 格式返回片段并附总行数与续读提示。
@@ -411,4 +474,98 @@ func htmlToText(s string) string {
 func rel(root, fp string) string {
 	r, _ := filepath.Rel(root, fp)
 	return r
+}
+
+// ---- web_search:零 key DuckDuckGo HTML 搜索(粗解析,够验证主张即可) ----
+
+var (
+	ddgTitleRe = regexp.MustCompile(`(?is)<a[^>]*class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>`)
+	ddgSnipRe  = regexp.MustCompile(`(?is)<a[^>]*class="result__snippet"[^>]*>(.*?)</a>`)
+)
+
+type ddgResult struct{ title, url, snippet string }
+
+func webSearch(query string) string {
+	if strings.TrimSpace(query) == "" {
+		return "query 必填。"
+	}
+	u := "https://html.duckduckgo.com/html/?q=" + url.QueryEscape(strings.TrimSpace(query))
+	resp, err := httpClient.Get(u)
+	if err != nil {
+		return fmt.Sprintf("搜索失败: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return fmt.Sprintf("搜索 HTTP %s", resp.Status)
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	results := parseDDGResults(string(body))
+	if len(results) == 0 {
+		return "未搜到结果(网络/反爬)。"
+	}
+	var b strings.Builder
+	for i, r := range results {
+		fmt.Fprintf(&b, "%d. %s\n   %s\n   %s\n", i+1, r.title, r.snippet, r.url)
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func parseDDGResults(html string) []ddgResult {
+	titleMatches := ddgTitleRe.FindAllStringSubmatch(html, -1)
+	snips := ddgSnipRe.FindAllStringSubmatch(html, -1)
+	var out []ddgResult
+	for i, m := range titleMatches {
+		if i >= 5 {
+			break
+		}
+		r := ddgResult{
+			title: collapseWS(htmlToText(m[2])),
+			url:   decodeDDGURL(m[1]),
+		}
+		if i < len(snips) {
+			r.snippet = collapseWS(htmlToText(snips[i][1]))
+		}
+		if r.title != "" {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// decodeDDGURL DDG 结果 href 是跳转 URL(//duckduckgo.com/l/?uddg=…),解出真实地址。
+func decodeDDGURL(href string) string {
+	if u, err := url.Parse(href); err == nil {
+		if q := u.Query().Get("uddg"); q != "" {
+			return q
+		}
+	}
+	switch {
+	case strings.HasPrefix(href, "//"):
+		return "https:" + href
+	case strings.HasPrefix(href, "/"):
+		return "https://duckduckgo.com" + href
+	}
+	return href
+}
+
+// isImageExt 图片扩展名判据(read_file 指引走 describe_image 用)。
+func isImageExt(path string) bool {
+	switch strings.ToLower(filepathExt(path)) {
+	case ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp":
+		return true
+	}
+	return false
+}
+
+// collapseWS 折叠连续空白为单空格(HTML 高亮 <b> 剥掉后残留双空格)。
+func collapseWS(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// filepathExt 取小写扩展名(含点)。
+func filepathExt(path string) string {
+	if i := strings.LastIndexByte(path, '.'); i >= 0 {
+		return path[i:]
+	}
+	return ""
 }

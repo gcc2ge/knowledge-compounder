@@ -5,9 +5,11 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -117,6 +119,7 @@ func (p *OpenAICompatible) Chat(ctx context.Context, msgs []Message, tools []Too
 		Choices []struct {
 			Message struct {
 				Content   string `json:"content"`
+				Reasoning string `json:"reasoning_content"`
 				ToolCalls []struct {
 					ID       string `json:"id"`
 					Function struct {
@@ -135,9 +138,13 @@ func (p *OpenAICompatible) Chat(ctx context.Context, msgs []Message, tools []Too
 		return Message{}, fmt.Errorf("LLM 无输出")
 	}
 	apiMsg := data.Choices[0].Message
-	out := Message{Role: "assistant", Content: apiMsg.Content, Usage: data.Usage}
+	out := Message{Role: "assistant", Content: apiMsg.Content, Reasoning: apiMsg.Reasoning, Usage: data.Usage}
 	for _, tc := range apiMsg.ToolCalls {
 		out.ToolCalls = append(out.ToolCalls, ToolCall{ID: tc.ID, Name: tc.Function.Name, Arguments: tc.Function.Arguments})
+	}
+	// 推理兜底:推理模型只回 reasoning_content 且无工具调用时,把它当最终文本给出
+	if out.Content == "" && len(out.ToolCalls) == 0 && out.Reasoning != "" {
+		out.Content = out.Reasoning
 	}
 	return out, nil
 }
@@ -196,6 +203,7 @@ func (p *OpenAICompatible) Stream(ctx context.Context, msgs []Message, tools []T
 			Choices []struct {
 				Delta struct {
 					Content   string `json:"content"`
+					Reasoning string `json:"reasoning_content"`
 					ToolCalls []struct {
 						Index    int    `json:"index"`
 						ID       string `json:"id"`
@@ -215,6 +223,7 @@ func (p *OpenAICompatible) Stream(ctx context.Context, msgs []Message, tools []T
 			out.Usage = chunk.Usage
 		}
 		for _, c := range chunk.Choices {
+			out.Reasoning += c.Delta.Reasoning
 			if c.Delta.Content != "" {
 				out.Content += c.Delta.Content
 				if onDelta != nil {
@@ -248,5 +257,95 @@ func (p *OpenAICompatible) Stream(ctx context.Context, msgs []Message, tools []T
 	for _, i := range indices {
 		out.ToolCalls = append(out.ToolCalls, *toolByIndex[i])
 	}
+	// 推理兜底:流式下只收到 reasoning_content 且无工具调用 → 当作最终文本
+	if out.Content == "" && len(out.ToolCalls) == 0 && out.Reasoning != "" {
+		out.Content = out.Reasoning
+	}
 	return out, nil
+}
+
+// Vision 让多模态模型描述一张本地图片(compiler 编译 raw/ 图片源的入口)。
+// 走 OpenAI 兼容的 image_url content part;模型无视觉能力时 API 返回错误,原样透出。
+func (p *OpenAICompatible) Vision(ctx context.Context, imagePath, prompt string) (string, error) {
+	b, err := os.ReadFile(imagePath)
+	if err != nil {
+		return "", err
+	}
+	if len(b) > 5<<20 {
+		return "", fmt.Errorf("图片 %d KB 超过 5MB 上限", len(b)>>10)
+	}
+	mime := imageMIME(imagePath)
+	if mime == "" {
+		return "", fmt.Errorf("不支持的图片扩展名(仅 png/jpg/jpeg/gif/webp/bmp)")
+	}
+	payload := map[string]any{
+		"model": p.Model,
+		"messages": []map[string]any{{
+			"role": "user",
+			"content": []map[string]any{
+				{"type": "text", "text": prompt},
+				{"type": "image_url", "image_url": map[string]any{"url": "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(b)}},
+			},
+		}},
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.BaseURL+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if p.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+p.APIKey)
+	}
+	resp, err := p.Client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		var e struct{ Error map[string]any }
+		_ = json.NewDecoder(resp.Body).Decode(&e)
+		return "", fmt.Errorf("视觉 API %d: %v", resp.StatusCode, e.Error)
+	}
+	var data struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return "", err
+	}
+	if len(data.Choices) == 0 {
+		return "", fmt.Errorf("视觉 API 无输出")
+	}
+	return data.Choices[0].Message.Content, nil
+}
+
+// imageMIME 按扩展名给 MIME;不认识返回空(调用方报错)。
+func imageMIME(path string) string {
+	switch strings.ToLower(filepathExt(path)) {
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	case ".bmp":
+		return "image/bmp"
+	}
+	return ""
+}
+
+func filepathExt(path string) string {
+	if i := strings.LastIndexByte(path, '.'); i >= 0 {
+		return path[i:]
+	}
+	return ""
 }

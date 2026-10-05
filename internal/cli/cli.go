@@ -238,7 +238,13 @@ func postCompileQA(root, rawFile string) {
 	fmt.Fprintln(os.Stderr, "\n[自动质检] 编译后检查…")
 	slug := strings.TrimSuffix(filepath.Base(rawFile), ".md")
 	sourcePage := filepath.Join(root, "wiki", "sources", slug+".md")
-	if _, issues, err := wiki.Preflight(filepath.Join(root, rawFile), sourcePage); err == nil {
+	if report, issues, err := wiki.Preflight(filepath.Join(root, rawFile), sourcePage); err == nil {
+		// 覆盖核验是提示不是缺失,单独亮出(重复块以代表保留的语义无损判定)
+		for _, line := range strings.Split(report, "\n") {
+			if strings.Contains(line, "覆盖核验") {
+				fmt.Fprintln(os.Stderr, "  "+strings.TrimSpace(line))
+			}
+		}
 		if len(issues) == 0 {
 			fmt.Fprintln(os.Stderr, "  preflight: 硬资产完整(代码/表/示例无缺失)")
 		} else {
@@ -341,7 +347,21 @@ func runRole(root string, cfg config.Config, role, input, rawFile string) int {
 		}
 	}
 
-	toolList, idx := tools.Build(root, terminalAsk, eval.RetrievalOpts(root, cfg))
+	// describe_image 的视觉回调:type-assert provider 到 VisionProvider;非多模态则提示(Tier 2 vision)。
+	visionFn := func(imagePath string) string {
+		vp, ok := p.(provider.VisionProvider)
+		if !ok {
+			return fmt.Sprintf("当前 provider(%s) 不支持视觉描述。", cfg.Provider)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
+		desc, err := vp.Vision(ctx, imagePath, "这是一张知识库 raw 中的图片。请完整描述其内容(文字、结构、要点);若是图表/架构图,描述节点与关系。描述将编译进 wiki 页面。")
+		if err != nil {
+			return fmt.Sprintf("视觉描述失败: %v", err)
+		}
+		return desc
+	}
+	toolList, idx, readCov := tools.Build(root, terminalAsk, visionFn, eval.RetrievalOpts(root, cfg))
 	if idx != nil {
 		defer idx.Save(root) // 进程退出前把索引增量留给下次(原子写)
 	}
@@ -362,6 +382,34 @@ func runRole(root string, cfg config.Config, role, input, rawFile string) int {
 			KeepRounds: cfg.KeepRounds,
 		},
 	}
+	// 落盘兜底(切片 B):compiler 给出最终答复但目标源页未落盘时,强制注入续跑要求 write_file。
+	// 实测 glm-4.5-air 对长源反复「读 2-3 页→输出总结→放弃工具循环」,事后报告不够,要堵在退出前。
+	if role == "compiler" && rawFile != "" {
+		slug := strings.TrimSuffix(filepath.Base(rawFile), ".md")
+		sourcePage := filepath.Join(root, "wiki", "sources", slug+".md")
+		// 两级判据:①源页不存在→强制首写;②源页存在但 preflight 有阻断性缺失→强制补全。
+		// 实测 glm 会「读头尾→写空心页(9 节齐全但 marker/代码/表全缺)」糊弄过存在性判据,故叠加质量闸门。
+		// preflight 的重复块覆盖第三态保证:deepseek 式语义压缩通过,glm 式整块缺失被拦。
+		rt.FinishGuard = func(provider.Message) string {
+			if _, err := os.Stat(sourcePage); err != nil {
+				return fmt.Sprintf("⚠️ 编译未完成:目标 wiki/sources/%s.md 还不存在。你现在必须调用 write_file 落盘源页草稿(至少 frontmatter + 一句话结论 + 论证链骨架),然后可继续完善;只输出总结文本不算完成。", slug)
+			}
+			if _, issues, err := wiki.Preflight(filepath.Join(root, rawFile), sourcePage); err == nil && len(issues) > 0 {
+				brief := issues[0]
+				if len(issues) > 1 {
+					brief += fmt.Sprintf("(…共 %d 项)", len(issues))
+				}
+				return fmt.Sprintf("⚠️ 源页 preflight 未通过:%s。继续完善 wiki/sources/%s.md——按 SCHEMA 补齐缺失硬资产与节,全部通过后再收尾。", brief, slug)
+			}
+			// ③ 读覆盖 gap:>80KB 长源中间有未读区间 = 内容没读完,拒收浅页。
+			// 实测 glm 只读头+尾就写页,存在性与硬资产都拦不住,只有台账能确定性地抓住。
+			if lo, hi, ok := readCov.Gap(rawFile); ok {
+				return fmt.Sprintf("⚠️ raw %s 还有 %d-%d 行未读(中间跳读了)。先用 read_file offset=%d 补读该段,再据它完善源页 %s——跳过内容写出的页会被拒收。", rawFile, lo, hi, lo, slug)
+			}
+			return "" // 源页存在、硬资产无缺失、长源已读全覆盖,视为完成
+		}
+		rt.MaxFinishPushes = 2 // 最多续跑 2 轮,仍不达标则退出(交由 postCompileQA 如实报告)
+	}
 	streamed := false
 	if cfg.Stream {
 		// 结构化事件流渲染:文本打 stdout(流式),工具调用/返回打 stderr(逐步可见)。
@@ -376,6 +424,8 @@ func runRole(root string, cfg config.Config, role, input, rawFile string) int {
 				fmt.Fprintf(os.Stderr, "[step %d] ← %s: %s\n", ev.Step, ev.Tool, truncStr(ev.Result, 180))
 			case agent.EvCompact:
 				fmt.Fprintf(os.Stderr, "[step %d] ⇥ 上下文压缩:折叠 %d 条早期消息\n", ev.Step, ev.Dropped)
+			case agent.EvFinishGuard:
+				fmt.Fprintf(os.Stderr, "\n[step %d] ⇐ 落盘兜底:强制续跑,要求 write_file 落盘\n", ev.Step)
 			}
 		}
 	}
