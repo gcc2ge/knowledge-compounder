@@ -187,7 +187,7 @@ func Main(args []string) int {
 		}
 		code := runRole(root, cfg, "compiler", compileInput(root, args[1]), args[1])
 		if code == 0 {
-			postCompileQA(root, args[1]) // Stop hook 语义:编译完自动核对,问题就地暴露
+			postCompileQA(root, args[1], cfg) // Stop hook 语义:编译完自动核对,问题就地暴露
 		}
 		return code
 	case "query":
@@ -234,7 +234,7 @@ func compileInput(root, rawFile string) string {
 
 // postCompileQA 编译后自动质检(对标 Claude Code 的 Stop hook):
 // preflight 硬资产完整性 + sources 缩水检查 + lint 摘要;打 stderr,不污染 stdout。
-func postCompileQA(root, rawFile string) {
+func postCompileQA(root, rawFile string, cfg config.Config) {
 	fmt.Fprintln(os.Stderr, "\n[自动质检] 编译后检查…")
 	slug := strings.TrimSuffix(filepath.Base(rawFile), ".md")
 	sourcePage := filepath.Join(root, "wiki", "sources", slug+".md")
@@ -262,6 +262,29 @@ func postCompileQA(root, rawFile string) {
 		fmt.Fprintf(os.Stderr, "  ⚠️ 概念/实体页 sources 缩水 %d 页:\n", len(problems))
 		for _, p := range problems {
 			fmt.Fprintf(os.Stderr, "    - %s\n", p)
+		}
+	}
+	// 矛盾核对落盘检查(切片 A):独立重扫(不依赖运行期日志,防模型跳过/糊弄),
+	// 验证扫描出的相关页是否被链入「连接」或有矛盾标注——没落盘即报警。
+	if b, err := os.ReadFile(sourcePage); err == nil {
+		hits := tools.ScanContradictions(root, slug, string(b), 4)
+		if len(hits) > 0 {
+			labels := make([]string, len(hits))
+			for i, h := range hits {
+				labels[i] = h.Result.Label
+			}
+			linked := false
+			for _, l := range labels {
+				if strings.Contains(string(b), "[["+l+"]]") {
+					linked = true
+					break
+				}
+			}
+			if !linked && !strings.Contains(string(b), "矛盾") && !strings.Contains(string(b), "冲突") {
+				fmt.Fprintf(os.Stderr, "  ⚠️ 矛盾核对:本源与 %d 个已有页相关(%s),但「连接」未链出任何一页且无矛盾标注——核对结论未落盘,需人工补核对。\n", len(hits), strings.Join(labels, ", "))
+			} else {
+				fmt.Fprintln(os.Stderr, "  矛盾核对:相关页已链入「连接」或已标注 ✓")
+			}
 		}
 	}
 	fmt.Fprintln(os.Stderr, "  lint:", lintSummary(root))
@@ -361,7 +384,7 @@ func runRole(root string, cfg config.Config, role, input, rawFile string) int {
 		}
 		return desc
 	}
-	toolList, idx, readCov := tools.Build(root, terminalAsk, visionFn, eval.RetrievalOpts(root, cfg))
+	toolList, idx, readCov, contradictionLog := tools.Build(root, terminalAsk, visionFn, eval.RetrievalOpts(root, cfg))
 	if idx != nil {
 		defer idx.Save(root) // 进程退出前把索引增量留给下次(原子写)
 	}
@@ -405,6 +428,12 @@ func runRole(root string, cfg config.Config, role, input, rawFile string) int {
 			// 实测 glm 只读头+尾就写页,存在性与硬资产都拦不住,只有台账能确定性地抓住。
 			if lo, hi, ok := readCov.Gap(rawFile); ok {
 				return fmt.Sprintf("⚠️ raw %s 还有 %d-%d 行未读(中间跳读了)。先用 read_file offset=%d 补读该段,再据它完善源页 %s——跳过内容写出的页会被拒收。", rawFile, lo, hi, lo, slug)
+			}
+			// ④ 矛盾核对:编译器没回头对照 wiki 就收尾 → 强制补一轮(check_contradictions)。
+			// 此前只有 prompt 指令「有矛盾就标注」,弱模型隔离编译不回头核对,矛盾静默丢失;
+			// 台账把「有没有对照 wiki」变成确定性记录,收尾时必跑,跑过才能放行。
+			if !contradictionLog.Scanned(slug) {
+				return fmt.Sprintf("⚠️ 你还没运行 check_contradictions(source=\"%s\") 对照已有页面。调用它,根据返回的相关页逐个判断 冲突/佐证/无涉,把结论写进「连接」节;有冲突的在源页显式标注(矛盾/冲突)。", slug)
 			}
 			return "" // 源页存在、硬资产无缺失、长源已读全覆盖,视为完成
 		}

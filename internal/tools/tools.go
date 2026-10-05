@@ -25,10 +25,11 @@ import (
 // 返回工具列表、内存索引(KCP_INDEX=off 时索引为 nil,工具降级走全扫旧路径)与读覆盖台账
 // (分页读取的确定性记录,compiler 退出前查长源中间 gap——防「读头尾跳过中间」的浅页)。
 // 调用方在进程退出前调 idx.Save(root) 把增量留给下次。
-func Build(root string, ask func(string) string, vision func(string) string, opts retrieval.Options) ([]provider.ToolDef, *index.Index, *Coverage) {
+func Build(root string, ask func(string) string, vision func(string) string, opts retrieval.Options) ([]provider.ToolDef, *index.Index, *Coverage, *ContradictionLog) {
 	idx := index.Load(root)
 	readsSinceWrite := map[string]int{} // 同文件连续分页读计数:落盘纪律的机械执行(见 read_file)
 	cov := &Coverage{}                  // 读覆盖台账:gap 检测的确定性依据
+	cLog := &ContradictionLog{}         // 矛盾核对台账:收尾是否回头对照 wiki 的确定性记录
 	return []provider.ToolDef{
 		{
 			Name: "wiki_status", Description: "查看知识库状态:页面计数 + 未编译 raw",
@@ -191,6 +192,39 @@ func Build(root string, ask func(string) string, vision func(string) string, opt
 			},
 		},
 		{
+			Name:        "check_contradictions",
+			Description: "编译收尾必做核对:读取你刚编译的源页(source=源页 slug,去 .md),把它的关键声明(一句话结论+论证链)与整个 wiki 已有页面比对,返回相关页——逐个判断 冲突/佐证/无涉:冲突的两边都保留并显式标注(矛盾/冲突)且把相关页链进「连接」,佐证/相关链进「连接」并写关联意义。直接收尾不跑本工具会被 FinishGuard 强制补做",
+			Parameters:  obj(map[string]any{"source": strProp, "k": intProp}),
+			Func: func(args map[string]any) string {
+				slug := strings.TrimSuffix(str(args, "source"), ".md")
+				if slug == "" {
+					return "source 必填(你刚编译的源页 slug,去 .md)。"
+				}
+				fp := filepath.Join(root, "wiki", "sources", slug+".md")
+				b, err := os.ReadFile(fp)
+				if err != nil {
+					return fmt.Sprintf("源页 wiki/sources/%s.md 还不存在——先用 write_file 落盘源页(至少 frontmatter+一句话结论+论证链),再调用本工具核对。", slug)
+				}
+				hits := ScanContradictions(root, slug, string(b), intArg(args, "k", 0))
+				cLog.Mark(slug, pageLabels(hits))
+				var sb strings.Builder
+				fmt.Fprintf(&sb, "## 矛盾核对:源页 × 已有 wiki 页(%d 个相关)\n\n", len(hits))
+				if len(hits) == 0 {
+					sb.WriteString("未找到与本源明显相关的已有页面——这是合法结果,可省略矛盾标注;概念/实体的建页纪律照旧(wiki_mentions 核对)。\n")
+				} else {
+					sb.WriteString("逐个判断 冲突/佐证/无涉,并按下面落盘要求写进「连接」:\n\n")
+					for i, h := range hits {
+						badge := wiki.EvidenceBadge(root, h.Result.Path)
+						fmt.Fprintf(&sb, "%d. [[%s]] %s 相关%.2f\n   相关声明: %s\n   摘要: %s\n",
+							i+1, h.Result.Label, badge, h.Result.Score,
+							truncate(h.Claim, 90), truncate(h.Result.Summary, 140))
+					}
+					sb.WriteString("\n落盘要求:\n- 冲突:两边都保留,本源页显式标注(矛盾/冲突),并把 [[相关页]] 链进「连接」\n- 佐证/相关:链进「连接」并写关联意义\n- 无涉:不用链,建页纪律照旧\n")
+				}
+				return sb.String()
+			},
+		},
+		{
 			Name: "web_fetch", Description: "抓取 http(s) URL 并转为纯文本(去 HTML 标签,截 8KB)——验证外部主张、查作者/工具背景用;非文本或不可达时返回错误说明",
 			Parameters: obj(map[string]any{"url": strProp}),
 			Func:       func(args map[string]any) string { return webFetch(str(args, "url")) },
@@ -256,7 +290,7 @@ func Build(root string, ask func(string) string, vision func(string) string, opt
 				return ask(q)
 			},
 		},
-	}, idx, cov
+	}, idx, cov, cLog
 }
 
 // markRead 把一次 read_file 的覆盖区间记入台账(与 readPaged 同判据)。
