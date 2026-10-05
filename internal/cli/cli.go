@@ -185,9 +185,18 @@ func Main(args []string) int {
 			fmt.Fprintln(os.Stderr, "用法: kcp compile <raw文件>")
 			return 1
 		}
+		start := time.Now() // 本轮是否产出源页的判据起点
 		code := runRole(root, cfg, "compiler", compileInput(root, args[1]), args[1])
 		if code == 0 {
 			postCompileQA(root, args[1], cfg) // Stop hook 语义:编译完自动核对,问题就地暴露
+			// 收尾码反映编译成败:源页本轮未落盘(FinishGuard 推满仍无 write_file)→ 返回失败码,
+			// 脚本/CI 可感知——实测端点配置错误时模型全程未参与,exit 0 会误导自动化。
+			slug := strings.TrimSuffix(filepath.Base(args[1]), ".md")
+			sourcePage := filepath.Join(root, "wiki", "sources", slug+".md")
+			if fi, err := os.Stat(sourcePage); err != nil || !fi.ModTime().After(start) {
+				fmt.Fprintf(os.Stderr, "  ⚠️ compile 未产出源页 wiki/sources/%s.md,返回失败码。\n", slug)
+				return 1
+			}
 		}
 		return code
 	case "query":
