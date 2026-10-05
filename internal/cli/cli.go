@@ -216,7 +216,8 @@ func compileInput(root, rawFile string) string {
 	if len(content) > 20000 {
 		content = content[:20000] + "\n…(截断)"
 	}
-	return fmt.Sprintf("编译以下 raw 源,按 SCHEMA 生成 wiki/sources/ 源摘要页(论证链保留全部代码/表/示例),并检查交叉引用:\n\n%s", content)
+	return fmt.Sprintf("只编译下面这一个 raw 源:%s(禁止读取或编译其他 raw)。源摘要页文件名必须是 wiki/sources/%s.md(与 raw 主干同名,禁止改名/加后缀)。按 SCHEMA 生成源摘要页(论证链保留全部代码/表/示例);再用 search_wiki 检查哪些概念/实体已被 2+ 个源提及,满足条件的直接创建/更新 wiki/concepts/、wiki/entities/ 页面;禁止创建 synthesis 页。\n\n%s",
+		rawFile, strings.TrimSuffix(filepath.Base(rawFile), ".md"), content)
 }
 
 // runSearch 混合检索诊断(零 LLM):词法+向量融合分、词法/语义子分、私有度徽标。
@@ -258,12 +259,22 @@ func runRole(root string, cfg config.Config, role, input string) int {
 		"query":    agents.QueryPrompt,
 		"qa":       agents.QAPrompt,
 	}[role]
+	// 注入当天日期,防模型幻觉编造 compiled/created/updated 日期。
+	system += fmt.Sprintf("\n\n今天日期:%s。frontmatter 的 compiled/created/updated 一律用它,不要自己猜。",
+		time.Now().Format("2006-01-02"))
+
+	// 编译一个源要写 1 个 source 页 + 2-6 个概念/实体页,外加检索核对;默认 10 步不够(实测在调查阶段耗尽)。
+	// 用户显式设 KCP_MAX_STEPS 时不覆盖。
+	steps := cfg.MaxSteps
+	if role == "compiler" && os.Getenv("KCP_MAX_STEPS") == "" {
+		steps = 25
+	}
 
 	rt := &agent.Runtime{
 		Provider:        p,
 		SystemPrompt:    system,
 		Tools:           tools.Build(root, terminalAsk, eval.RetrievalOpts(root, cfg)),
-		MaxSteps:        cfg.MaxSteps,
+		MaxSteps:        steps,
 		MaxSameAction:   cfg.MaxSameAction,
 		MaxTokens:       cfg.MaxTokens,
 		MaxHeal:         cfg.MaxHeal,

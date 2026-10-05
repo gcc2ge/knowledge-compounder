@@ -58,6 +58,35 @@ func Build(root string, ask func(string) string, opts retrieval.Options) []provi
 			},
 		},
 		{
+			Name: "wiki_mentions", Description: "统计一个术语被几个已编译源页提及——「2+ 源提及才建概念/实体页」纪律的确定性判据。输入术语,返回提及计数与页面列表",
+			Parameters: obj(map[string]any{"term": strProp}),
+			Func: func(args map[string]any) string {
+				term := str(args, "term")
+				if term == "" {
+					return "term 不能为空"
+				}
+				var hits []string
+				files, _ := filepath.Glob(filepath.Join(root, "wiki", "sources", "*.md"))
+				for _, f := range files {
+					b, err := os.ReadFile(f)
+					if err != nil {
+						continue
+					}
+					if strings.Contains(strings.ToLower(string(b)), strings.ToLower(term)) {
+						hits = append(hits, strings.TrimSuffix(filepath.Base(f), ".md"))
+					}
+				}
+				switch n := len(hits); n {
+				case 0:
+					return fmt.Sprintf("「%s」未被任何源页提及。", term)
+				case 1:
+					return fmt.Sprintf("「%s」仅 1 个源提及(%s)——单次提及,进该源「术语」节,不建页。", term, hits[0])
+				default:
+					return fmt.Sprintf("「%s」被 %d 个源提及(%s)——≥2,满足建页纪律,直接创建/更新对应页面。", term, n, strings.Join(hits, "、"))
+				}
+			},
+		},
+		{
 			Name: "read_file", Description: "读取项目内文件(相对项目根)",
 			Parameters: obj(map[string]any{"path": strProp}),
 			Func: func(args map[string]any) string {
