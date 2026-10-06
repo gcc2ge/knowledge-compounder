@@ -544,7 +544,13 @@ func runRole(root string, cfg config.Config, role, input, rawFile string) (int, 
 			if !contradictionLog.Scanned(slug) {
 				return fmt.Sprintf("⚠️ 你还没运行 check_contradictions(source=\"%s\") 对照已有页面。调用它,根据返回的相关页逐个判断 冲突/佐证/无涉,把结论写进「连接」节;有冲突的在源页显式标注(矛盾/冲突)。", slug)
 			}
-			return "" // 源页存在、硬资产无缺失、长源已读全覆盖,视为完成
+			// ⑤ 证据回流(evidenceLog):check_contradictions 扫出的相关概念页必须被
+			// update_evidence 逐一裁决(corroborate/contradict/skip)——正向复利与负向张力
+			// 一样确定性执行,不能只口头判断。漏裁决的页被列名强制,模型不能装没看见。
+			if missing := contradictionLog.MissingEvidence(slug); len(missing) > 0 {
+				return fmt.Sprintf("⚠️ check_contradictions 扫出 %d 个相关概念页但尚未回流裁决: %s。对每一页调用 update_evidence(slug=<概念页>, source=\"%s\")——佐证→corroborate(追加源+机器升 confidence) / 冲突→contradict(落 ⚠️ 冲突) / 无关→skip。既有页必须被物理强化,不能只口头判断。", len(missing), strings.Join(missing, "、"), slug)
+			}
+			return "" // 源页存在、硬资产无缺失、长源已读全覆盖、概念页已全裁决,视为完成
 		}
 		rt.MaxFinishPushes = 2 // 最多续跑 2 轮,仍不达标则退出(交由 postCompileQA 如实报告)
 	}

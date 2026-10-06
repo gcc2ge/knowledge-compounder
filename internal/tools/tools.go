@@ -208,6 +208,7 @@ func Build(root string, ask func(string) string, vision func(string) string, opt
 				}
 				hits := ScanContradictions(root, slug, string(b), intArg(args, "k", 0))
 				cLog.Mark(slug, pageLabels(hits))
+				cLog.MarkConcepts(slug, conceptLabels(hits)) // evidenceLog:扫出的概念页需回流裁决
 				var sb strings.Builder
 				fmt.Fprintf(&sb, "## 矛盾核对:源页 × 已有 wiki 页(%d 个相关)\n\n", len(hits))
 				if len(hits) == 0 {
@@ -230,7 +231,7 @@ func Build(root string, ask func(string) string, vision func(string) string, opt
 			},
 		},
 		{
-			Name: "update_evidence", Description: "编译收尾的确定性回流:把本次编译结论写回既有概念页——正向复利(既有页必须被物理强化,不能只在新源页「连接」写一行)。slug=概念页,action=corroborate(佐证:追加源+机器重算 confidence+「外部观点」加佐证行)|contradict(冲突:「张力与缺口」落 ⚠️ 冲突 标注),source=源页 slug,claim=一句话原因/佐证内容。仅限 wiki/concepts/ 页面;compiler 在 check_contradictions 之后对每个相关概念页逐一调用",
+			Name: "update_evidence", Description: "编译收尾的确定性回流:把本次编译结论写回既有概念页——正向复利(既有页必须被物理强化,不能只在新源页「连接」写一行)。slug=概念页,action=corroborate(佐证:追加源+机器重算 confidence+「外部观点」加佐证行)|contradict(冲突:「张力与缺口」落 ⚠️ 冲突 标注)|skip(无涉:仅登记已裁决,不写文件),source=源页 slug,claim=一句话原因/佐证内容。仅限 wiki/concepts/ 页面;compiler 在 check_contradictions 之后对每个相关概念页逐一调用——FinishGuard 会校验每个相关概念页都被裁决(corroborate/contradict/skip),漏掉会强制续跑",
 			Parameters: obj(map[string]any{
 				"slug": strProp, "action": strProp, "source": strProp, "claim": strProp,
 			}),
@@ -239,12 +240,17 @@ func Build(root string, ask func(string) string, vision func(string) string, opt
 				source := strings.TrimSuffix(str(args, "source"), ".md")
 				action, claim := str(args, "action"), str(args, "claim")
 				if slug == "" || action == "" {
-					return "slug 与 action(corroborate|contradict)必填。"
+					return "slug 与 action(corroborate|contradict|skip)必填。"
+				}
+				if action == "skip" {
+					cLog.Applied(source, slug) // 无涉裁决:只登记,不写文件
+					return "已记录: 概念页 [[" + slug + "]] 判定无涉,不回流。"
 				}
 				msg, err := wiki.ApplyEvidence(root, slug, action, source, claim)
 				if err != nil {
 					return "失败: " + err.Error()
 				}
+				cLog.Applied(source, slug) // evidenceLog:该概念页已回流裁决
 				if idx != nil {
 					if p, ok := wiki.ResolveSlug(root, slug); ok {
 						idx.UpdateFile(p) // 写即索引:同会话后续检索立即可见

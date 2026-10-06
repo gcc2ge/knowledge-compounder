@@ -20,8 +20,15 @@ import (
 
 // ContradictionLog 记录源页→已扫相关页的映射(Key=源页 slug,去 .md)。
 // 非并发安全:runtime 主循环串行执行工具,与 Coverage 同约定。
+//
+// 切片 A(矛盾核对):scans 记录「跑过 check_contradictions」这一确定性事实。
+// 证据台账(evidenceLog):concepts 记录扫出的相关概念页,applied 记录已回流裁决——
+// FinishGuard 用它强制「相关概念页必须被 update_evidence 物理强化或显式跳过」,
+// 正向复利(佐证回流)与负向张力(冲突标注)一样成为确定性执行,不再依赖模型自觉。
 type ContradictionLog struct {
-	scans map[string][]string
+	scans    map[string][]string // 源页 slug → 相关页 labels(check_contradictions 结果)
+	concepts map[string][]string // 源页 slug → 相关页中的概念页 labels(需回流裁决的对象)
+	applied  map[string][]string // 源页 slug → 已裁决(corroborate/contradict/skip)的概念页 labels
 }
 
 // Mark 记录一次成功核对:源页 slug 扫到相关页 labels(空=扫过但无相关页,仍视为核对过)。
@@ -30,6 +37,48 @@ func (l *ContradictionLog) Mark(slug string, labels []string) {
 		l.scans = map[string][]string{}
 	}
 	l.scans[slug] = labels
+}
+
+// MarkConcepts 记录扫出的相关概念页(update_evidence 的候选对象)。
+// 只有概念页需要回流;source/entity/synthesis 页由「连接」节照常链接。
+func (l *ContradictionLog) MarkConcepts(slug string, conceptLabels []string) {
+	if l.concepts == nil {
+		l.concepts = map[string][]string{}
+	}
+	l.concepts[slug] = conceptLabels
+}
+
+// Applied 记录对某概念页已完成回流裁决(corroborate/contradict/skip 均视为裁决过)。
+func (l *ContradictionLog) Applied(slug, conceptSlug string) {
+	if l.applied == nil {
+		l.applied = map[string][]string{}
+	}
+	for _, c := range l.applied[slug] {
+		if c == conceptSlug {
+			return // 幂等
+		}
+	}
+	l.applied[slug] = append(l.applied[slug], conceptSlug)
+}
+
+// MissingEvidence 返回扫出的概念页中尚未回流裁决的——FinishGuard 的强制对象。
+// 未跑过 check_contradictions 时返回 nil(不重复触发,由 Scanned 闸先拦)。
+func (l *ContradictionLog) MissingEvidence(slug string) []string {
+	if l.concepts == nil || len(l.concepts[slug]) == 0 {
+		return nil
+	}
+	done := map[string]bool{}
+	for _, c := range l.applied[slug] {
+		done[c] = true
+	}
+	var out []string
+	for _, c := range l.concepts[slug] {
+		if !done[c] {
+			out = append(out, c)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Scanned 该源页是否已跑过矛盾核对。
@@ -246,6 +295,17 @@ func pageLabels(hits []ContradictionHit) []string {
 	out := make([]string, len(hits))
 	for i, h := range hits {
 		out[i] = h.Result.Label
+	}
+	return out
+}
+
+// conceptLabels 提取命中列表中的概念页 label(evidenceLog 的回流裁决对象)。
+func conceptLabels(hits []ContradictionHit) []string {
+	var out []string
+	for _, h := range hits {
+		if strings.Contains(h.Result.Path, "/concepts/") {
+			out = append(out, h.Result.Label)
+		}
 	}
 	return out
 }
