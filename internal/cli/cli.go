@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -278,25 +279,78 @@ func postCompileQA(root, rawFile string, cfg config.Config) {
 	if b, err := os.ReadFile(sourcePage); err == nil {
 		hits := tools.ScanContradictions(root, slug, string(b), 4)
 		if len(hits) > 0 {
+			text := string(b)
 			labels := make([]string, len(hits))
 			for i, h := range hits {
 				labels[i] = h.Result.Label
 			}
 			linked := false
 			for _, l := range labels {
-				if strings.Contains(string(b), "[["+l+"]]") {
+				if strings.Contains(text, "[["+l+"]]") {
 					linked = true
 					break
 				}
 			}
-			if !linked && !strings.Contains(string(b), "矛盾") && !strings.Contains(string(b), "冲突") {
+			if !linked && !strings.Contains(text, "矛盾") && !strings.Contains(text, "冲突") {
 				fmt.Fprintf(os.Stderr, "  ⚠️ 矛盾核对:本源与 %d 个已有页相关(%s),但「连接」未链出任何一页且无矛盾标注——核对结论未落盘,需人工补核对。\n", len(hits), strings.Join(labels, ", "))
 			} else {
 				fmt.Fprintln(os.Stderr, "  矛盾核对:相关页已链入「连接」或已标注 ✓")
 			}
+			// 标注归一化(切片 B 附属):冲突必须用 lint 可识别标记,且须传播到相关概念页「张力与缺口」。
+			hasStdMarker := containsAny(text, "⚠️ 冲突", "⚠️ 矛盾", "矛盾声明", "CONTRADICTION")
+			if (strings.Contains(text, "冲突") || strings.Contains(text, "口径不一致") || strings.Contains(text, "分类不一致")) && !hasStdMarker {
+				fmt.Fprintln(os.Stderr, "  ⚠️ 矛盾标注:本源页出现「冲突/口径不一致」字样但未用 lint 可识别标记(⚠️ 冲突:/⚠️ 矛盾:/<!-- CONTRADICTION -->),lint 矛盾计数将显示 0——请归一化标注。")
+			}
+			conflictLabels := conflictMarkedLabels(text)
+			for _, h := range hits {
+				if !hasStdMarker || !contains(conflictLabels, h.Result.Label) || !strings.Contains(h.Result.Path, "concepts") {
+					continue
+				}
+				if cb, err := os.ReadFile(filepath.Join(root, h.Result.Path)); err == nil {
+					if !containsAny(string(cb), "⚠️ 冲突", "⚠️ 矛盾", "矛盾声明", "CONTRADICTION") {
+						fmt.Fprintf(os.Stderr, "  ⚠️ 冲突传播:本源页对概念页 [[%s]] 标了冲突,但该页「张力与缺口」未同步 ⚠️ 冲突——需补一条(两边保留,不消除冲突)。\n", h.Result.Label)
+					}
+				}
+			}
 		}
 	}
 	fmt.Fprintln(os.Stderr, "  lint:", lintSummary(root))
+}
+
+// conflictMarkedLabels 从文本里抽取出被 lint 可识别冲突标记的行所引用的 wikilink label。
+var cliLinkRe = regexp.MustCompile(`\[\[([^\]|]+)(?:\|[^\]]+)?\]\]`)
+
+func conflictMarkedLabels(text string) []string {
+	var out []string
+	for _, ln := range strings.Split(text, "\n") {
+		if !strings.Contains(ln, "⚠️ 冲突") && !strings.Contains(ln, "⚠️ 矛盾") && !strings.Contains(ln, "矛盾声明") && !strings.Contains(ln, "CONTRADICTION") {
+			continue
+		}
+		for _, m := range cliLinkRe.FindAllStringSubmatch(ln, -1) {
+			out = append(out, m[1])
+		}
+	}
+	return out
+}
+
+// contains 字符串切片包含判断(小工具,避免引入外部依赖)。
+func contains(xs []string, s string) bool {
+	for _, x := range xs {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+// containsAny 任一关键字命中。
+func containsAny(s string, kws ...string) bool {
+	for _, k := range kws {
+		if strings.Contains(s, k) {
+			return true
+		}
+	}
+	return false
 }
 
 // lintSummary 单行 lint 概要(取报告首行)。

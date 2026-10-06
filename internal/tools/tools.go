@@ -29,6 +29,7 @@ func Build(root string, ask func(string) string, vision func(string) string, opt
 	idx := index.Load(root)
 	readsSinceWrite := map[string]int{} // 同文件连续分页读计数:落盘纪律的机械执行(见 read_file)
 	cov := &Coverage{}                  // 读覆盖台账:gap 检测的确定性依据
+	rep := &RepeatDetector{}            // 重复段台账:模板化长源选择性深读的确定性依据(切片 B)
 	cLog := &ContradictionLog{}         // 矛盾核对台账:收尾是否回头对照 wiki 的确定性记录
 	return []provider.ToolDef{
 		{
@@ -177,7 +178,7 @@ func Build(root string, ask func(string) string, vision func(string) string, opt
 					}
 				}
 				offset, limit := intArg(args, "offset", 0), intArg(args, "limit", 0)
-				out := readPaged(root, path, offset, limit)
+				out := readPaged(root, path, offset, limit, rep)
 				markRead(cov, root, path, offset, limit) // 读覆盖台账:gap 检测依据
 				// 落盘纪律的机械执行:同文件连续分页读 ≥3 页未写任何文件时,
 				// 在返回文本里插入强制提醒——实测便宜模型会连读 13 页,上下文压缩
@@ -193,7 +194,7 @@ func Build(root string, ask func(string) string, vision func(string) string, opt
 		},
 		{
 			Name:        "check_contradictions",
-			Description: "编译收尾必做核对:读取你刚编译的源页(source=源页 slug,去 .md),把它的关键声明(一句话结论+论证链)与整个 wiki 已有页面比对,返回相关页——逐个判断 冲突/佐证/无涉:冲突的两边都保留并显式标注(矛盾/冲突)且把相关页链进「连接」,佐证/相关链进「连接」并写关联意义。直接收尾不跑本工具会被 FinishGuard 强制补做",
+			Description: "编译收尾必做核对:读取你刚编译的源页(source=源页 slug,去 .md),把它的关键声明(一句话结论+论证链)与整个 wiki 已有页面比对,返回相关页——逐个判断 冲突/佐证/无涉:冲突用 lint 可识别的标注(⚠️ 冲突:/⚠️ 矛盾:/<!-- CONTRADICTION -->)显式落盘,并把冲突写进相关概念页「张力与缺口」;佐证/相关链进「连接」并写关联意义。直接收尾不跑本工具会被 FinishGuard 强制补做",
 			Parameters:  obj(map[string]any{"source": strProp, "k": intProp}),
 			Func: func(args map[string]any) string {
 				slug := strings.TrimSuffix(str(args, "source"), ".md")
@@ -219,7 +220,11 @@ func Build(root string, ask func(string) string, vision func(string) string, opt
 							i+1, h.Result.Label, badge, h.Result.Score,
 							truncate(h.Claim, 90), truncate(h.Result.Summary, 140))
 					}
-					sb.WriteString("\n落盘要求:\n- 冲突:两边都保留,本源页显式标注(矛盾/冲突),并把 [[相关页]] 链进「连接」\n- 佐证/相关:链进「连接」并写关联意义\n- 无涉:不用链,建页纪律照旧\n")
+					sb.WriteString("\n落盘要求(标注格式固定,改动会被 postCompileQA 报警):\n")
+					sb.WriteString("- 冲突(论点直接对立:同一概念两种分类 / 结论相反 / 口径不一致):两边都保留。本源页「连接」写 `- ⚠️ 冲突: [[相关页]] — 冲突原因`;同时把冲突写进相关概念页「张力与缺口」一条 `- ⚠️ 冲突: 本源 [[本源页]] — 冲突原因`。冲突不消除,只标注。\n")
+					sb.WriteString("- 佐证/相关:本源页「连接」写 `- → [[相关页]] — 佐证:关联意义`,并写清这页关联对用户意味着什么。\n")
+					sb.WriteString("- 无涉:不用链,建页纪律照旧。\n")
+					sb.WriteString("冲突≠佐证:仅在论点层面直接对立才算冲突(如两种 taxonomy 并存、同一断言两个版本);单纯语义/细节互补是佐证。\n")
 				}
 				return sb.String()
 			},
@@ -397,7 +402,9 @@ const (
 // readPaged 读取文件;offset(1 起始行)/limit 给定时按 cat -n 格式返回片段并附总行数与续读提示。
 // 语义对齐 Claude Code 的 Read:文件内容经工具结果进上下文(一次),而不是塞进初始消息反复重发。
 // 单页受行数与字节双闸限制——实测一次性 4000 行请求单条工具结果 ~150KB,足以毒化小上下文模型。
-func readPaged(root, path string, offset, limit int) string {
+// 切片 B(选择性深读):rep 非空时,本页与已读内容逐字重复的模板段被紧凑标记替换
+// (内容首次读入已在上下文,跳过不丢信息);Coverage 仍由 markRead 记整段,不影响 gap 判据。
+func readPaged(root, path string, offset, limit int, rep *RepeatDetector) string {
 	fp, ok := safeJoin(root, path, "wiki", "raw", "examples", "SCHEMA.md", "templates", "docs")
 	if !ok {
 		return "拒绝:路径超出项目根或不在白名单目录。"
@@ -427,36 +434,51 @@ func readPaged(root, path string, offset, limit int) string {
 	if offset+limit-1 < end {
 		end = offset + limit - 1
 	}
-	// 字节闸:超出单页字节上限时提前截断该页
+
+	// 重复段检测(切片 B):把 [offset,end] 切成输出段,重复段用标记省略。
+	segs := []outSeg{{offset, end, 0}}
+	if rep != nil {
+		segs = rep.compact(path, lines, offset, end)
+	}
+
+	// 字节闸 + 组装:普通行逐行写,重复段写紧凑标记;超单页字节上限提前截断。
 	var sb strings.Builder
 	cut := end
-	for i := offset; i <= end; i++ {
-		sb.WriteString(lines[i-1])
-		sb.WriteByte('\n')
-		if sb.Len() > pageBytesCap {
-			cut = i - 1
-			sb.Reset()
+	atCap := false
+	for _, s := range segs {
+		if s.first > 0 {
+			if sb.Len() > 0 && !strings.HasSuffix(sb.String(), "\n") {
+				sb.WriteByte('\n')
+			}
+			sb.WriteString(fmt.Sprintf("[第 %d–%d 行与已读内容逐字重复(模板段,首次见于第 %d 行),省略]\n", s.lo, s.hi, s.first))
+			if sb.Len() > pageBytesCap {
+				atCap = true
+				cut = s.lo - 1
+				break
+			}
+			continue
+		}
+		for i := s.lo; i <= s.hi; i++ {
+			fmt.Fprintf(&sb, "%6d\t%s\n", i, lines[i-1])
+			if sb.Len() > pageBytesCap {
+				cut = i - 1
+				atCap = true
+				break
+			}
+		}
+		if atCap {
 			break
 		}
 	}
-	if cut < end {
-		end = cut
-		sb.Reset()
-		for i := offset; i <= end; i++ {
-			fmt.Fprintf(&sb, "%6d\t%s\n", i, lines[i-1])
-		}
-		fmt.Fprintf(&sb, "(第 %d–%d 行触达单页字节上限,共 %d 行;继续读:offset=%d)", offset, end, len(lines), end+1)
-		return sb.String()
-	}
-	sb.Reset()
-	for i := offset; i <= end; i++ {
-		fmt.Fprintf(&sb, "%6d\t%s\n", i, lines[i-1])
-	}
+
+	tail := fmt.Sprintf("(第 %d–%d 行,共 %d 行;已到文件末尾)", offset, end, len(lines))
 	if end < len(lines) {
-		fmt.Fprintf(&sb, "(第 %d–%d 行,共 %d 行;继续读:offset=%d)", offset, end, len(lines), end+1)
-	} else {
-		fmt.Fprintf(&sb, "(第 %d–%d 行,共 %d 行;已到文件末尾)", offset, end, len(lines))
+		tail = fmt.Sprintf("(第 %d–%d 行,共 %d 行;继续读:offset=%d)", offset, end, len(lines), end+1)
 	}
+	if atCap {
+		tail = fmt.Sprintf("(第 %d–%d 行触达单页字节上限,共 %d 行;继续读:offset=%d)", offset, cut, len(lines), cut+1)
+	}
+	sb.WriteString(tail)
 	return sb.String()
 }
 

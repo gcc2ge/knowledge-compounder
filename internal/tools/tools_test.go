@@ -26,11 +26,11 @@ func TestReadPaged(t *testing.T) {
 	}
 
 	// 小文件无参数:原文返回
-	if got := readPaged(root, "raw/small.md", 0, 0); got != sb.String() {
+	if got := readPaged(root, "raw/small.md", 0, 0, nil); got != sb.String() {
 		t.Errorf("小文件应原样返回")
 	}
 	// 分页:offset=2 limit=3 → 第 2-4 行,带行号与续读提示
-	got := readPaged(root, "raw/small.md", 2, 3)
+	got := readPaged(root, "raw/small.md", 2, 3, nil)
 	if !strings.Contains(got, "     2\t") || !strings.Contains(got, "     4\t") || strings.Contains(got, "     5\t") {
 		t.Errorf("分页应只含第 2-4 行,得:\n%s", got)
 	}
@@ -38,26 +38,26 @@ func TestReadPaged(t *testing.T) {
 		t.Errorf("未到末尾应给续读提示,得:\n%s", got)
 	}
 	// 读到末尾:提示已到文件末尾
-	got = readPaged(root, "raw/small.md", 8, 10)
+	got = readPaged(root, "raw/small.md", 8, 10, nil)
 	if !strings.Contains(got, "已到文件末尾") {
 		t.Errorf("末页应提示结束,得:\n%s", got)
 	}
 	// 越界
-	if got := readPaged(root, "raw/small.md", 99, 1); !strings.Contains(got, "超出总行数") {
+	if got := readPaged(root, "raw/small.md", 99, 1, nil); !strings.Contains(got, "超出总行数") {
 		t.Errorf("越界应报错,得 %s", got)
 	}
 	// 大文件无参数:返回头部 + 分页指示
-	got = readPaged(root, "raw/big.md", 0, 0)
+	got = readPaged(root, "raw/big.md", 0, 0, nil)
 	if !strings.Contains(got, "分页读取") || !strings.Contains(got, "offset=1") {
 		t.Errorf("大文件应强制分页指示,得末尾:\n%s", got[len(got)-200:])
 	}
 	// 大文件分页:行号正确
-	got = readPaged(root, "raw/big.md", 2000, 2)
+	got = readPaged(root, "raw/big.md", 2000, 2, nil)
 	if !strings.Contains(got, "  2000\t") {
 		t.Errorf("分页行号应正确,得:\n%s", got[:80])
 	}
 	// 白名单外拒绝
-	if got := readPaged(root, "go.mod", 0, 0); !strings.Contains(got, "拒绝") {
+	if got := readPaged(root, "go.mod", 0, 0, nil); !strings.Contains(got, "拒绝") {
 		t.Errorf("白名单外应拒绝,得 %s", got)
 	}
 }
