@@ -298,8 +298,8 @@ func postCompileQA(root, rawFile string, cfg config.Config) {
 			}
 			// 标注归一化(切片 B 附属):冲突必须用 lint 可识别标记,且须传播到相关概念页「张力与缺口」。
 			hasStdMarker := containsAny(text, "⚠️ 冲突", "⚠️ 矛盾", "矛盾声明", "CONTRADICTION")
-			if (strings.Contains(text, "冲突") || strings.Contains(text, "口径不一致") || strings.Contains(text, "分类不一致")) && !hasStdMarker {
-				fmt.Fprintln(os.Stderr, "  ⚠️ 矛盾标注:本源页出现「冲突/口径不一致」字样但未用 lint 可识别标记(⚠️ 冲突:/⚠️ 矛盾:/<!-- CONTRADICTION -->),lint 矛盾计数将显示 0——请归一化标注。")
+			if (strings.Contains(text, "冲突") || strings.Contains(text, "口径不一致") || strings.Contains(text, "分类不一致") || strings.Contains(text, "分类口径差异") || strings.Contains(text, "口径差异")) && !hasStdMarker {
+				fmt.Fprintln(os.Stderr, "  ⚠️ 矛盾标注:本源页出现「冲突/口径不一致/分类口径差异」字样但未用 lint 可识别标记(⚠️ 冲突:/⚠️ 矛盾:/<!-- CONTRADICTION -->),lint 矛盾计数将显示 0——请归一化标注。")
 			}
 			conflictLabels := conflictMarkedLabels(text)
 			for _, h := range hits {
@@ -311,6 +311,11 @@ func postCompileQA(root, rawFile string, cfg config.Config) {
 						fmt.Fprintf(os.Stderr, "  ⚠️ 冲突传播:本源页对概念页 [[%s]] 标了冲突,但该页「张力与缺口」未同步 ⚠️ 冲突——需补一条(两边保留,不消除冲突)。\n", h.Result.Label)
 					}
 				}
+			}
+			// 概念页张力节归一化检查:概念页记录真实冲突(分类口径差异/口径不一致)时也必须用 lint
+			// 可识别标记——否则源页标记日后被改时,概念页的冲突会静默脱离 lint 矛盾计数。
+			for _, label := range conceptWeakMarkerProblems(root, hits) {
+				fmt.Fprintf(os.Stderr, "  ⚠️ 矛盾归一化:概念页 [[%s]]「张力与缺口」出现「分类口径差异/口径不一致」但未用 lint 可识别标记(⚠️ 冲突:/⚠️ 矛盾:/<!-- CONTRADICTION -->),lint 矛盾计数将显示 0——请归一化为 ⚠️ 冲突: 格式(两边保留,不消除冲突)。\n", label)
 			}
 		}
 	}
@@ -328,6 +333,25 @@ func conflictMarkedLabels(text string) []string {
 		}
 		for _, m := range cliLinkRe.FindAllStringSubmatch(ln, -1) {
 			out = append(out, m[1])
+		}
+	}
+	return out
+}
+
+// conceptWeakMarkerProblems 扫描相关概念页:若其「张力与缺口」用非 lint 可识别标记(分类口径差异/
+// 口径不一致等)记录真实冲突,返回问题页 label 列表——供 QA 报警归一化为 ⚠️ 冲突: 格式。
+// 已带任一 lint 可识别标记的页面不报警(允许既有正常冲突页存在)。
+func conceptWeakMarkerProblems(root string, hits []tools.ContradictionHit) []string {
+	var out []string
+	for _, h := range hits {
+		if !strings.Contains(h.Result.Path, "concepts") {
+			continue
+		}
+		if cb, err := os.ReadFile(filepath.Join(root, h.Result.Path)); err == nil {
+			cp := string(cb)
+			if (strings.Contains(cp, "分类口径差异") || strings.Contains(cp, "口径差异") || strings.Contains(cp, "分类不一致") || strings.Contains(cp, "口径不一致")) && !containsAny(cp, "⚠️ 冲突", "⚠️ 矛盾", "矛盾声明", "CONTRADICTION") {
+				out = append(out, h.Result.Label)
+			}
 		}
 	}
 	return out

@@ -14,7 +14,7 @@ Layer 1: RAW SOURCES(raw/)    ← 不可变,事实来源(source of truth)
 
 - `raw/` 不可变。永不修改 raw 中的任何文件。`raw/assets/` 存本地图片附件,`raw/books/` 存转换入库的书籍 md。
 - `wiki/` 是编译产物,自由创建/修改/删除。子目录:`sources/`(每 raw 源一个摘要页,1:1)、`concepts/`(跨源综合)、`entities/`(人物/工具/项目/组织)、`synthesis/`(比较分析综合文档)、`health/`(lint 健康报告)、`notes/`(低置信度工作笔记)。
-- 页面计数与未编译源统一用 `python3 scripts/wiki-status.py --json` 的机器口径。
+- 页面计数与未编译源统一用 `wiki_status` 工具的机器口径。
 
 ## 三个核心操作
 
@@ -144,4 +144,4 @@ question: "触发这个分析的问题"
 ## 协作纪律
 
 - 共享文件 `wiki/index.md`、`log.md`、健康报告由 coordinator 串行维护;compiler/batch-compiler 并发写各自页面但不碰共享文件。
-- 每次 ingest/batch/update 的 Git 闭环:raw 入库 → 编译 → index → log → `wiki-status.py --json` → lint 落盘 → 用户确认后 commit。
+- 每次 ingest/batch/update 的 Git 闭环:raw 入库 → 编译 → index → log → `wiki_status` → lint 落盘 → 用户确认后 commit。
