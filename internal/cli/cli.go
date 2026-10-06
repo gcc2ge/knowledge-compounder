@@ -187,16 +187,21 @@ func Main(args []string) int {
 			return 1
 		}
 		start := time.Now() // 本轮是否产出源页的判据起点
-		code := runRole(root, cfg, "compiler", compileInput(root, args[1]), args[1])
+		code, toolCalls := runRole(root, cfg, "compiler", compileInput(root, args[1]), args[1])
 		if code == 0 {
 			postCompileQA(root, args[1], cfg) // Stop hook 语义:编译完自动核对,问题就地暴露
 			// 收尾码反映编译成败:源页本轮未落盘(FinishGuard 推满仍无 write_file)→ 返回失败码,
 			// 脚本/CI 可感知——实测端点配置错误时模型全程未参与,exit 0 会误导自动化。
+			// 区分两态:真偷懒(零工作假成功)→ 失败;合法幂等重编译(源页已最新、模型有真实参与)→ 成功。
 			slug := strings.TrimSuffix(filepath.Base(args[1]), ".md")
 			sourcePage := filepath.Join(root, "wiki", "sources", slug+".md")
 			if fi, err := os.Stat(sourcePage); err != nil || !fi.ModTime().After(start) {
-				fmt.Fprintf(os.Stderr, "  ⚠️ compile 未产出源页 wiki/sources/%s.md,返回失败码。\n", slug)
-				return 1
+				idempotent := idempotentRecompile(root, args[1], fi, sourcePage, toolCalls)
+				if !idempotent {
+					fmt.Fprintf(os.Stderr, "  ⚠️ compile 未产出源页 wiki/sources/%s.md,返回失败码。\n", slug)
+					return 1
+				}
+				fmt.Fprintf(os.Stderr, "  ℹ️ 源页 %s.md 本轮未重写:raw 未变、页面已最新且模型有真实参与,判定为幂等重编译(成功)。\n", slug)
 			}
 		}
 		return code
@@ -205,7 +210,8 @@ func Main(args []string) int {
 			fmt.Fprintln(os.Stderr, "用法: kcp query <问题>")
 			return 1
 		}
-		return runRole(root, cfg, "query", strings.Join(args[1:], " "), "")
+		code, _ := runRole(root, cfg, "query", strings.Join(args[1:], " "), "")
+		return code
 	default:
 		// 兜底:把第一个参数当角色
 		if args[0] == "compiler" || args[0] == "qa" || args[0] == "query" {
@@ -213,7 +219,8 @@ func Main(args []string) int {
 			if len(args) > 1 {
 				input = strings.Join(args[1:], " ")
 			}
-			return runRole(root, cfg, args[0], input, "")
+			code, _ := runRole(root, cfg, args[0], input, "")
+			return code
 		}
 		fmt.Fprintf(os.Stderr, "未知命令: %s\n%s", args[0], usage)
 		return 1
@@ -427,7 +434,7 @@ func indexDesc(idx *index.Index) string {
 }
 
 // runRole 用自研运行时跑一个角色(provider + 工具 + M04 循环)。rawFile 为 compile 场景的源路径(步数自适应用)。
-func runRole(root string, cfg config.Config, role, input, rawFile string) int {
+func runRole(root string, cfg config.Config, role, input, rawFile string) (int, int) {
 	timeout := time.Duration(cfg.Deadline) * time.Second
 	if timeout <= 0 {
 		timeout = 10 * time.Minute
@@ -548,14 +555,34 @@ func runRole(root string, cfg config.Config, role, input, rawFile string) int {
 	out, err := rt.Run(ctx, input, "")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		return 1
+		return 1, 0
 	}
 	if streamed {
 		fmt.Println() // 内容已实时输出,补换行
 	} else {
 		fmt.Println(out)
 	}
-	return 0
+	return 0, rt.ToolCalls
+}
+
+// idempotentRecompile 判定「合法幂等重编译」:源页本轮未重写但可放行——
+// ①源页存在;②raw 自源页编译后未变(页面不陈旧);③模型本轮有真实参与(≥1 次工具调用,
+// 排除零工作假成功);④源页 preflight 无阻断性缺失(硬资产完整)。
+// 真偷懒(零工作但声称完成)不满足③ → 仍判失败。
+func idempotentRecompile(root, rawRel string, fi os.FileInfo, sourcePage string, toolCalls int) bool {
+	if fi == nil || toolCalls == 0 {
+		return false // 源页不存在或模型零参与 → 不是幂等,是失败
+	}
+	// raw 自源页编译后未变(源页不陈旧)
+	rawFi, err := os.Stat(filepath.Join(root, rawRel))
+	if err != nil || rawFi.ModTime().After(fi.ModTime()) {
+		return false // raw 比源页新 = 页面陈旧,必须重写
+	}
+	// preflight 无阻断性缺失
+	if _, issues, err := wiki.Preflight(filepath.Join(root, rawRel), sourcePage); err != nil || len(issues) > 0 {
+		return false
+	}
+	return true
 }
 
 // runUpdate 确定性页面编辑:add-source / touch / add-link(无 LLM,对齐 wiki-update.py)。

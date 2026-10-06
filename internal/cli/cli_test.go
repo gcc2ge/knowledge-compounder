@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/gcc2ge/knowledge-compounder/internal/retrieval"
 	"github.com/gcc2ge/knowledge-compounder/internal/tools"
@@ -67,5 +68,112 @@ func writeFixture(t *testing.T, root, rel, body string) {
 	}
 	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// ---- 幂等重编译判定(FinishGuard 收尾码区分子句) ----
+
+// 完整 9 节源页骨架(preflight 节检查要求:一句话结论/论证链/关键细节/作者立场与定位/
+// 意外发现/疑点/术语/连接/引用,缺任何一节都会阻断)。
+func fullSourcePage(slug string) string {
+	return "# " + slug + "\n\n" +
+		"## 一句话结论\nok\n" +
+		"## 论证链\nok\n" +
+		"## 关键细节\nok\n" +
+		"## 作者立场与定位\nok\n" +
+		"## 意外发现\nok\n" +
+		"## 疑点\nok\n" +
+		"## 术语\nok\n" +
+		"## 连接\nok\n" +
+		"## 引用\nok\n"
+}
+
+// 基础 fixture:纯文本 raw(无硬资产,preflight 天然零问题)+ 已存在的完整源页。
+// 默认时间:raw 比源页旧 2 小时(页面不陈旧),模拟"上一轮已编译、本轮重编译"。
+func idempotentFixture(t *testing.T) (dir, rawRel, srcP string) {
+	t.Helper()
+	dir = t.TempDir()
+	rawRel = "raw/x.md"
+	srcP = filepath.Join(dir, "wiki", "sources", "x.md")
+	writeFixture(t, dir, rawRel, "纯文本 raw,无代码块/表/示例,preflight 天然零问题。")
+	writeFixture(t, dir, "wiki/sources/x.md", fullSourcePage("x"))
+	now := time.Now()
+	if err := os.Chtimes(filepath.Join(dir, rawRel), now.Add(-2*time.Hour), now.Add(-2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(srcP, now.Add(-1*time.Hour), now.Add(-1*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	return dir, rawRel, srcP
+}
+
+// 源页已最新 + 模型有真实参与(≥1 工具调用)→ 合法幂等重编译,放行。
+func TestIdempotentRecompile_AllowsFreshPage(t *testing.T) {
+	dir, rawRel, srcP := idempotentFixture(t)
+	fi, err := os.Stat(srcP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !idempotentRecompile(dir, rawRel, fi, srcP, 5) {
+		t.Fatal("源页最新 + 模型有参与应判幂等成功")
+	}
+}
+
+// 零工具调用(真偷懒/假成功)→ 不放行,仍判失败。
+func TestIdempotentRecompile_RejectsZeroWork(t *testing.T) {
+	dir, rawRel, srcP := idempotentFixture(t)
+	fi, err := os.Stat(srcP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if idempotentRecompile(dir, rawRel, fi, srcP, 0) {
+		t.Fatal("零工具调用(假成功)不应判幂等")
+	}
+}
+
+// raw 比源页新 = 源页陈旧 → 不放行,必须重写。
+func TestIdempotentRecompile_RejectsStalePage(t *testing.T) {
+	dir, rawRel, srcP := idempotentFixture(t)
+	now := time.Now()
+	// 翻转:raw 新、源页旧 → 页面陈旧
+	if err := os.Chtimes(filepath.Join(dir, rawRel), now.Add(-30*time.Minute), now.Add(-30*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(srcP, now.Add(-3*time.Hour), now.Add(-3*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(srcP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if idempotentRecompile(dir, rawRel, fi, srcP, 5) {
+		t.Fatal("源页陈旧(比 raw 旧)不应判幂等")
+	}
+}
+
+// 源页不存在 → 不放行(1:1 映射要求源页存在)。
+func TestIdempotentRecompile_RejectsMissingPage(t *testing.T) {
+	dir, rawRel, _ := idempotentFixture(t)
+	if idempotentRecompile(dir, rawRel, nil, filepath.Join(dir, "wiki/sources/x.md"), 3) {
+		t.Fatal("源页不存在不应判幂等")
+	}
+}
+
+// preflight 硬资产缺失 → 不放行(页面有阻断性缺失)。
+func TestIdempotentRecompile_RejectsMissingHardAssets(t *testing.T) {
+	dir := t.TempDir()
+	rawRel := "raw/x.md"
+	writeFixture(t, dir, rawRel, "```go\npackage main\n```\n")
+	writeFixture(t, dir, "wiki/sources/x.md", fullSourcePage("x"))
+	now := time.Now()
+	os.Chtimes(filepath.Join(dir, rawRel), now.Add(-2*time.Hour), now.Add(-2*time.Hour))
+	srcP := filepath.Join(dir, "wiki", "sources", "x.md")
+	os.Chtimes(srcP, now.Add(-1*time.Hour), now.Add(-1*time.Hour))
+	fi, err := os.Stat(srcP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if idempotentRecompile(dir, rawRel, fi, srcP, 5) {
+		t.Fatal("源页硬资产缺失(preflight 阻断)不应判幂等")
 	}
 }

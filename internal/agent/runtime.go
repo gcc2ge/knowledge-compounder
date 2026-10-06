@@ -38,6 +38,10 @@ type Runtime struct {
 	FinishGuard     func(reply provider.Message) string
 	MaxFinishPushes int
 
+	// ToolCalls 本轮实际执行的工具调用数(cli 编译收尾判据:区分「模型真实参与但幂等跳写源页」
+	// 与「零工作假成功」——零工作 = 0 次工具调用;幂等重编译 = ≥1 次调用但源页已最新无需重写)。
+	ToolCalls int
+
 	// 运行时内部状态(非并发,单循环)
 	usage        *provider.Usage // 累计真实 token 消耗
 	finishPushes int             // 已注入的续跑次数
@@ -103,6 +107,7 @@ func (r *Runtime) Run(ctx context.Context, input, state string) (string, error) 
 		}
 		for _, tc := range reply.ToolCalls {
 			r.emit(Event{Kind: EvToolCall, Step: step, Tool: tc.Name, Args: tc.Arguments})
+			r.ToolCalls++ // 真实执行计数器:编译收尾区分幂等跳写与零工作假成功
 			obs := r.execTool(tc)
 			r.emit(Event{Kind: EvToolResult, Step: step, Tool: tc.Name, Result: trunc(obs, 300)})
 			msgs = append(msgs, provider.Message{Role: "assistant", Content: reply.Content, ToolCalls: []provider.ToolCall{tc}})
