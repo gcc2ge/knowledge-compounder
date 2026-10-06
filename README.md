@@ -127,11 +127,15 @@ go build -o kcp ./cmd/kcp
 export KCP_PROVIDER=openai-compatible   # 或 anthropic
 export KCP_MODEL=deepseek-chat          # 换成你的模型(本地 ollama 可留空 key)
 export KCP_API_KEY=sk-xxx
-export KCP_BASE_URL=https://api.deepseek.com/v1   # ⚠ 必须与你选的模型一致!
+export KCP_BASE_URL=https://api.deepseek.com/v1   # ⚠ 必须与你选的模型一致,且必须带 /v1
+#  ⚠ kcp 在 BaseURL 后直接拼 /chat/completions——BaseURL 必须带提供商的 API 版本路径
+#  (通常 /v1),否则请求打到站点首页/根路由,返回 HTML 而非 JSON,compile 静默空转
+#  (实测:BaseURL 漏 /v1 时模型全程未参与、源页零产出,靠 exit code 已拦为失败码)。
 #   DeepSeek → https://api.deepseek.com/v1
 #   Ollama   → http://localhost:11434/v1
 #   智谱 GLM → https://open.bigmodel.cn/api/paas/v4
 #   OpenRouter→ https://openrouter.ai/api/v1
+#   其他服务商(含中转):以该服务商文档为准,拼到 /chat/completions 能返回 JSON 即对。
 
 # 4. 装一个笔记源,然后编译(raw/ 直接放 .md/.txt;PDF 先 scripts/pdf2md.sh,epub/docx 先转 md)
 ./kcp compile raw/你的文件.md # compiler agent 按 SCHEMA 编译(SSE 流式,策展点暂停问人)
@@ -157,7 +161,7 @@ go build -o kcp ./cmd/kcp
 export KCP_PROVIDER=openai-compatible  # 或 anthropic
 export KCP_MODEL=deepseek-chat
 export KCP_API_KEY=sk-xxx
-export KCP_BASE_URL=https://api.deepseek.com/v1   # 与模型对应,见上方快速上手
+export KCP_BASE_URL=https://api.deepseek.com/v1   # 与模型对应,必须带 /v1(见上方快速上手)
 ./kcp status                 # 知识库状态(零 LLM 依赖)
 ./kcp compile examples/raw-demo.md   # 单源编译(compiler agent)
 ./kcp query "知识库里对 X 有哪些结论?"
