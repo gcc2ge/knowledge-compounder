@@ -18,9 +18,9 @@ Layer 1: RAW SOURCES(raw/)    ← 不可变,事实来源(source of truth)
 
 ## 三个核心操作
 
-1. **Ingest(编译)**:读 raw 全文 → 判断 origin → 编译进 wiki(sources/concepts/entities)→ 检查与已有页面的**矛盾**(有则显式标注并反映到「张力与缺口」)→ 加 `[[wikilinks]]` → 返回变更清单。
-2. **Query(查询 + 知识复利)**:定位相关页 → 读取 → 合成带引用答案 → **有持久价值的答案主动建议 filed back 到 `wiki/synthesis/`**。每次好提问都应让 wiki 更丰富(query-as-contribution)。
-3. **Lint(健康检查)**:断链 / 孤儿 / 矛盾 / 过时(`review_after` 优先)/ 覆盖(未编译 raw)/ 格式 / 知识网络(单源概念、单向链接、slug 冲突)。健康报告落盘 `wiki/health/` 并与上次比较。
+1. **Ingest(编译)**:读 raw 全文 → 判断 origin → 编译进 wiki(sources/concepts/entities)→ 检查与已有页面的**矛盾**(有则显式标注并反映到「张力与缺口」)→ **佐证回流**:新源佐证既有概念页时用 `update_evidence` 追加源、机器重算 confidence——既有页每次编译都物理变强(正向复利,不只写新源页「连接」)→ 加 `[[wikilinks]]` → 返回变更清单。
+2. **Query(查询 + 知识复利)**:定位相关页 → 读取 → 合成带引用答案 → **跨页综合答案用 `filed_back` 落盘 `wiki/synthesis/`**(query-as-contribution 的机械执行:≥2 支撑源、未决问题非空、同名不覆盖)。每次好提问都应让 wiki 更丰富。
+3. **Lint(健康检查)**:断链 / 孤儿 / 矛盾 / 过时(`review_after` 优先)/ 覆盖(未编译 raw)/ 格式 / 知识网络(单源概念、单向链接、slug 冲突)/ **私有 edge 检查**(「意外发现」节无联想信号词则标弱——私有价值是复利载体)/ **疑似同义概念页**(命名漂移检测)。健康报告落盘 `wiki/health/` 并与上次比较(趋势行)。
 
 ## Origin 分流(决定概念页内容路由)
 

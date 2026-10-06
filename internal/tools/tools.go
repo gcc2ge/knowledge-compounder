@@ -230,6 +230,30 @@ func Build(root string, ask func(string) string, vision func(string) string, opt
 			},
 		},
 		{
+			Name: "update_evidence", Description: "编译收尾的确定性回流:把本次编译结论写回既有概念页——正向复利(既有页必须被物理强化,不能只在新源页「连接」写一行)。slug=概念页,action=corroborate(佐证:追加源+机器重算 confidence+「外部观点」加佐证行)|contradict(冲突:「张力与缺口」落 ⚠️ 冲突 标注),source=源页 slug,claim=一句话原因/佐证内容。仅限 wiki/concepts/ 页面;compiler 在 check_contradictions 之后对每个相关概念页逐一调用",
+			Parameters: obj(map[string]any{
+				"slug": strProp, "action": strProp, "source": strProp, "claim": strProp,
+			}),
+			Func: func(args map[string]any) string {
+				slug := strings.TrimSuffix(str(args, "slug"), ".md")
+				source := strings.TrimSuffix(str(args, "source"), ".md")
+				action, claim := str(args, "action"), str(args, "claim")
+				if slug == "" || action == "" {
+					return "slug 与 action(corroborate|contradict)必填。"
+				}
+				msg, err := wiki.ApplyEvidence(root, slug, action, source, claim)
+				if err != nil {
+					return "失败: " + err.Error()
+				}
+				if idx != nil {
+					if p, ok := wiki.ResolveSlug(root, slug); ok {
+						idx.UpdateFile(p) // 写即索引:同会话后续检索立即可见
+					}
+				}
+				return msg
+			},
+		},
+		{
 			Name: "web_fetch", Description: "抓取 http(s) URL 并转为纯文本(去 HTML 标签,截 8KB)——验证外部主张、查作者/工具背景用;非文本或不可达时返回错误说明",
 			Parameters: obj(map[string]any{"url": strProp}),
 			Func:       func(args map[string]any) string { return webFetch(str(args, "url")) },
@@ -285,6 +309,15 @@ func Build(root string, ask func(string) string, vision func(string) string, opt
 			Func:       func(map[string]any) string { return wiki.ReportLint(root) },
 		},
 		{
+			Name: "filed_back", Description: "query 角色把有持久价值的跨页综合答案落盘为 wiki/synthesis/ 永久页(query-as-contribution)。question=触发问题,title=页面名(中文简短,不含 /),summary=一句话摘要(可空),analysis=正文分析,evidence=证据与张力(每条标私有度 A/B/C),unresolved=未决问题(不能留空),conclusion=结论,sources=支撑源 slug 列表(逗号分隔,须 ≥2 个已存在页——单页答案不值得落盘)",
+			Parameters: obj(map[string]any{
+				"question": strProp, "title": strProp, "summary": strProp,
+				"analysis": strProp, "evidence": strProp, "unresolved": strProp,
+				"conclusion": strProp, "sources": strProp,
+			}),
+			Func: func(args map[string]any) string { return filedBack(root, args, idx) },
+		},
+		{
 			Name: "ask_user", Description: "策展决策点向用户提问并等待裁决(如:是否值得建概念页/是否 filed back)。人策展>自动,拿不准就调用。",
 			Parameters: obj(map[string]any{"question": strProp}),
 			Func: func(args map[string]any) string {
@@ -326,6 +359,61 @@ func markRead(cov *Coverage, root, path string, offset, limit int) {
 		limit = pageLineCap
 	}
 	cov.Mark(path, offset, offset+limit-1, total)
+}
+
+// ---- 工具辅助 ----
+
+// filedBack 把 query 的综合答案确定性落盘为 wiki/synthesis/ 永久页(模板校验 + 幂等防覆盖)。
+// query-as-contribution 的机械执行:跨页综合(≥2 源)才允许落盘,未决问题不能留空,
+// 已存在同名页拒绝覆盖——保证 synthesis 是收敛的知识产品而不是答案垃圾场。
+func filedBack(root string, args map[string]any, idx *index.Index) string {
+	question := str(args, "question")
+	title := strings.TrimSpace(str(args, "title"))
+	if question == "" || title == "" {
+		return "question 与 title 必填。"
+	}
+	if strings.ContainsAny(title, `/\<>:"|?*`) {
+		return "title 含非法路径字符(/\\<>:\"|?*),请用简短中文文件名。"
+	}
+	var sources []string
+	for _, s := range strings.Split(str(args, "sources"), ",") {
+		s = strings.TrimSpace(strings.TrimSuffix(s, ".md"))
+		if s != "" {
+			sources = append(sources, s)
+		}
+	}
+	if len(sources) < 2 {
+		return "sources 须 ≥2 个支撑页(单页答案不值得落盘为 synthesis),当前 " + strconv.Itoa(len(sources)) + " 个。"
+	}
+	for _, s := range sources {
+		if _, ok := wiki.ResolveSlug(root, s); !ok {
+			return "支撑页 [[" + s + "]] 不存在——先核实页面再落盘。"
+		}
+	}
+	unresolved := strings.TrimSpace(str(args, "unresolved"))
+	if unresolved == "" {
+		return "unresolved(未决问题)不能留空——按 SCHEMA,未收敛的分析必须显式写出未解决之处,不替你脑补结论。"
+	}
+	fp := filepath.Join(root, "wiki", "synthesis", title+".md")
+	if _, err := os.Stat(fp); err == nil {
+		return "已存在 wiki/synthesis/" + title + ".md——不要覆盖,给 title 加区分前缀后重试。"
+	}
+	var sb strings.Builder
+	sb.WriteString("---\ntype: synthesis\ntrigger: query\ncreated: " + time.Now().Format("2006-01-02") + "\nquestion: \"" + question + "\"\n---\n\n")
+	sb.WriteString("# " + title + "\n\n## 一句话摘要\n" + str(args, "summary") + "\n\n## 问题\n" + question + "\n\n## 分析\n" + str(args, "analysis") + "\n\n## 证据与张力\n" + str(args, "evidence") + "\n\n## 未决问题\n" + unresolved + "\n\n## 结论\n" + str(args, "conclusion") + "\n\n## 来源\n")
+	for _, s := range sources {
+		sb.WriteString("- [[" + s + "]]\n")
+	}
+	if err := os.MkdirAll(filepath.Dir(fp), 0o755); err != nil {
+		return "写入失败: " + err.Error()
+	}
+	if err := os.WriteFile(fp, []byte(sb.String()), 0o644); err != nil {
+		return "写入失败: " + err.Error()
+	}
+	if idx != nil {
+		idx.UpdateFile(fp) // 写即索引:同会话后续检索立即可见
+	}
+	return "已 filed back → wiki/synthesis/" + title + ".md(query-as-contribution 落盘成功)"
 }
 
 // ---- 工具辅助 ----

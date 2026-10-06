@@ -90,6 +90,95 @@ func AddLink(root, slug, target string) (string, error) {
 	return fmt.Sprintf("已加链接 %s → %s", slug, link), nil
 }
 
+// Evidence 佐证/冲突回流(update_evidence 工具底座):给既有概念页追加证据。
+// 佐证(corroborate)时机器重算 confidence——正向复利:每次编译都在物理上强化既有页,
+// 而不只是往新源页「连接」写一行。冲突(contradict)时往「张力与缺口」落 lint 可识别标注。
+// confidence 规则:独立源数 <2=low,2-3=medium,≥4=high;页面已有冲突标注时封顶 medium
+// (证据打架的页面不该标 high,但也不降级——冲突另在「张力与缺口」显式呈现)。
+func ApplyEvidence(root, slug, action, source, claim string) (string, error) {
+	fp, ok := ResolveSlug(root, slug)
+	if !ok {
+		return "", fmt.Errorf("页面不存在: %s", slug)
+	}
+	if filepath.Base(filepath.Dir(fp)) != "concepts" {
+		return "", fmt.Errorf("update_evidence 只作用于概念页(wiki/concepts/),%s 位于 %s 目录", slug, filepath.Base(filepath.Dir(fp)))
+	}
+	b, err := os.ReadFile(fp)
+	if err != nil {
+		return "", err
+	}
+	vals, body := ParseFrontmatter(string(b))
+	sources := FrontmatterList(vals, "sources")
+	switch action {
+	case "corroborate":
+		if source != "" && !contains(sources, source) {
+			sources = append(sources, source)
+		}
+		n := len(sources)
+		conf := "low"
+		if n >= 2 {
+			conf = "medium"
+		}
+		if n >= 4 {
+			conf = "high"
+		}
+		if containsAny(body, "⚠️ 冲突", "⚠️ 矛盾", "矛盾声明", "CONTRADICTION") && conf == "high" {
+			conf = "medium"
+		}
+		vals["sources"] = sources
+		vals["confidence"] = conf
+		line := "- 被 [[" + strings.TrimSuffix(source, ".md") + "]] 佐证"
+		if claim != "" {
+			line += ": " + claim
+		}
+		body, ok = appendToSection(body, "外部观点", line)
+		if !ok {
+			body = strings.TrimRight(body, "\n") + "\n\n## 外部观点\n" + line + "\n"
+		}
+	case "contradict":
+		if strings.TrimSpace(claim) == "" {
+			return "", fmt.Errorf("contradict 需要 claim(冲突原因)不能留空")
+		}
+		line := "- ⚠️ 冲突: [[" + strings.TrimSuffix(source, ".md") + "]] — " + claim
+		body, ok = appendToSection(body, "张力与缺口", line)
+		if !ok {
+			return "", fmt.Errorf("概念页 %s 缺「张力与缺口」节,无法落冲突标注", slug)
+		}
+	default:
+		return "", fmt.Errorf("action 只能是 corroborate|contradict,收到 %s", action)
+	}
+	vals["updated"] = today()
+	if err := writePage(fp, vals, body); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("已更新 %s: action=%s → confidence=%s, sources=%d", slug, action, FrontmatterString(vals, "confidence"), len(sources)), nil
+}
+
+// appendToSection 在正文指定节(## 标题)末尾追加一行;节不存在返回 (原body, false)。
+// 插入点取「下一个 ## 」之前或文末,保证只动该节、不碰其他节。
+func appendToSection(body, section, line string) (string, bool) {
+	idx := strings.Index(body, "## "+section)
+	if idx < 0 {
+		return body, false
+	}
+	rest := body[idx+len("## "+section):]
+	end := strings.Index(rest, "\n## ")
+	if end < 0 {
+		return strings.TrimRight(body, "\n") + "\n" + line + "\n", true
+	}
+	at := idx + len("## "+section) + end
+	return body[:at] + "\n" + line + body[at:], true
+}
+
+func containsAny(s string, kws ...string) bool {
+	for _, k := range kws {
+		if strings.Contains(s, k) {
+			return true
+		}
+	}
+	return false
+}
+
 // readPageBodyForEdit 解析页面 frontmatter + 正文,返回 (vals, body, fp, err)。
 // update 类操作必须保留原正文,否则会清空页面。
 func readPageBodyForEdit(root, slug string) (map[string]any, string, string, error) {

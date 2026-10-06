@@ -34,6 +34,8 @@ const usage = `kcp — 知识编译复利引擎(自研 agent,任意 LLM)
   kcp update add-source <slug> <源>   确定性页面编辑(无 LLM)
   kcp update touch <slug>             更新 updated 日期
   kcp update add-link <slug> <目标>   往「相关」节加 wikilink
+  kcp update evidence <slug> <corroborate|contradict> <source> [claim]
+                                      佐证/冲突回流既有概念页(机器重算 confidence)
   kcp index                           重建 wiki/index.md(从页面 frontmatter)
   kcp skeleton <raw文件> [--tags a,b] [--origin external|self] [--write]
                                       生成 source 页骨架
@@ -41,7 +43,7 @@ const usage = `kcp — 知识编译复利引擎(自研 agent,任意 LLM)
                                       硬资产完整性核验(代码块/表/示例不丢)
   kcp check-sources                   检查概念/实体页 sources 是否被错误替换(git)
   kcp search "<查询>"                混合检索诊断(词法+向量,零 LLM,带私有度徽标)
-  kcp eval [--seeds <文件>] [--k <n>] RAG-vs-编译复利对照实验(Agent-as-a-Judge 打分)
+  kcp eval [--seeds <文件>] [--k <n>] [--rebaseline] RAG-vs-编译复利对照实验(Agent-as-a-Judge 打分;--rebaseline 与上次基线比「wiki 复利 Δ」)
   kcp mcp                      MCP stdio server(支柱 B:wiki 暴露为 5 个工具,喂 coding/trading agents)
   kcp <role> "<输入>"           直接跑一个角色(compiler/qa/query)
   kcp list                      列出角色
@@ -147,6 +149,7 @@ func Main(args []string) int {
 		return runSearch(root, cfg, strings.Join(args[1:], " "))
 	case "eval":
 		seeds, k := "", 0
+		rebaseline := false
 		for i := 1; i < len(args); i++ {
 			switch args[i] {
 			case "--seeds":
@@ -159,6 +162,8 @@ func Main(args []string) int {
 					fmt.Sscanf(args[i+1], "%d", &k)
 					i++
 				}
+			case "--rebaseline":
+				rebaseline = true
 			}
 		}
 		if k > 0 {
@@ -169,7 +174,7 @@ func Main(args []string) int {
 			fmt.Fprintln(os.Stderr, err)
 			return 1
 		}
-		if _, err := eval.RunCompare(root, cfg, seedList); err != nil {
+		if _, err := eval.RunCompare(root, cfg, seedList, rebaseline); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return 1
 		}
@@ -483,6 +488,16 @@ func runRole(root string, cfg config.Config, role, input, rawFile string) (int, 
 		defer idx.Save(root) // 进程退出前把索引增量留给下次(原子写)
 	}
 
+	// StateFile 按 raw slug 隔离(compile 场景):连续编译多个源若共用同一个 KCP_STATE_FILE,
+	// runtime 会无条件 loadCheckpoint() 把上一次的消息历史带进这一次——模型可能误以为该源已编译
+	// 或被困在旧任务。隔离后每个源有自己的 checkpoint,互不污染(P5)。
+	if role == "compiler" && rawFile != "" && cfg.StateFile != "" {
+		slug := strings.TrimSuffix(filepath.Base(rawFile), ".md")
+		dir := filepath.Join(root, ".kcp", "state")
+		_ = os.MkdirAll(dir, 0o755)
+		cfg.StateFile = filepath.Join(dir, slug+".json")
+	}
+
 	rt := &agent.Runtime{
 		Provider:        p,
 		SystemPrompt:    system,
@@ -611,6 +626,12 @@ func runUpdate(root string, args []string) int {
 			err = fmt.Errorf("用法: kcp update add-link <slug> <目标>")
 		} else {
 			msg, err = wiki.AddLink(root, args[1], args[2])
+		}
+	case "evidence":
+		if len(args) < 4 {
+			err = fmt.Errorf("用法: kcp update evidence <slug> <corroborate|contradict> <source> [claim]")
+		} else {
+			msg, err = wiki.ApplyEvidence(root, args[1], args[2], args[3], strings.Join(args[4:], " "))
 		}
 	default:
 		err = fmt.Errorf("未知 update 操作: %s(支持 add-source/touch/add-link)", args[0])

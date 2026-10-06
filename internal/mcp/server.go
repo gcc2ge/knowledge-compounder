@@ -244,6 +244,28 @@ func (s *Server) register() {
 			return s.synthesize(strArg(a, "question"))
 		},
 	}
+	s.tools["capture_note"] = toolDef{
+		name: "capture_note", desc: "把消费 wiki 时产生的新发现/观察回灌知识库(双向复利):写 raw/observations/<时间戳>-<标题>.md,作为新的 observation 源(不改动既有 raw,只新增)。title 必填,content/tags 可选",
+		params: obj(map[string]any{"title": strProp, "content": strProp, "tags": strProp}),
+		call: func(a map[string]any) string {
+			title := strings.TrimSpace(strArg(a, "title"))
+			if title == "" {
+				return "参数 title 必填。"
+			}
+			dir := filepath.Join(s.root, "raw", "observations")
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				return "写入失败: " + err.Error()
+			}
+			ts := time.Now().Format("2006-01-02-150405")
+			name := fmt.Sprintf("%s-%s.md", ts, title)
+			md := fmt.Sprintf("---\n类型: observation\n标题: %s\n时间: %s\n标签: %s\n---\n\n%s\n",
+				title, time.Now().Format(time.RFC3339), strArg(a, "tags"), strArg(a, "content"))
+			if err := os.WriteFile(filepath.Join(dir, name), []byte(md), 0o644); err != nil {
+				return "写入失败: " + err.Error()
+			}
+			return "已回灌观察 → raw/observations/" + name + "(origin: self,编译时回灌「我的实践」)"
+		},
+	}
 }
 
 // ---- synthesize_for:检索 + LLM 综合 ----

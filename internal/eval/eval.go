@@ -329,8 +329,56 @@ type CaseResult struct {
 	Traj      trajScores
 }
 
+// Baseline 上次评估的快照(供 --rebaseline 对比)。复利是时间序列:
+// 「wiki 得分随时间 Δ」才是编译复利本身的曲线——同种子重跑,看 wiki 有没有越变越强。
+type Baseline struct {
+	Time  time.Time `json:"time"`
+	Model string    `json:"model"`
+	// seedID → mode(rag|wiki) → dim → score
+	Seeds map[string]map[string]map[string]int `json:"seeds"`
+}
+
+// CollectBaseline 从本轮结果构造基线快照。
+func CollectBaseline(cases []CaseResult, model string) Baseline {
+	bl := Baseline{Time: time.Now(), Model: model, Seeds: map[string]map[string]map[string]int{}}
+	for _, c := range cases {
+		bl.Seeds[c.Seed.ID] = map[string]map[string]int{"rag": {}, "wiki": {}}
+		for _, mode := range []string{"rag", "wiki"} {
+			for dim, v := range c.Judge.Scores[mode] {
+				bl.Seeds[c.Seed.ID][mode][dim] = v
+			}
+		}
+	}
+	return bl
+}
+
+// LoadBaseline 读最近一次评估快照;缺失/损坏返回 nil(首次评估无基线)。
+func LoadBaseline(root string) *Baseline {
+	b, err := os.ReadFile(filepath.Join(root, "eval", "reports", "latest.json"))
+	if err != nil {
+		return nil
+	}
+	var bl Baseline
+	if err := json.Unmarshal(b, &bl); err != nil || len(bl.Seeds) == 0 {
+		return nil
+	}
+	return &bl
+}
+
+// Save 原子写基线快照(最新一次评估的机器可读分数,供下次 --rebaseline 读)。
+func (bl *Baseline) Save(root string) {
+	dir := filepath.Join(root, "eval", "reports")
+	_ = os.MkdirAll(dir, 0o755)
+	b, err := json.MarshalIndent(bl, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(filepath.Join(dir, "latest.json"), b, 0o644)
+}
+
 // RunCompare 跑完整对照实验:两方案各答题 → 评审 → 报告。
-func RunCompare(root string, cfg config.Config, seeds []Seed) (string, error) {
+// rebaseline=true 时读上次基线,报告里输出「wiki 复利 Δ」——同种子重跑才测得复利曲线。
+func RunCompare(root string, cfg config.Config, seeds []Seed, rebaseline bool) (string, error) {
 	p := newProvider(cfg)
 	if cfg.APIKey == "" && cfg.BaseURL == "" {
 		return "", fmt.Errorf("未配置 KCP_API_KEY,无法运行 LLM 评估")
@@ -367,16 +415,29 @@ func RunCompare(root string, cfg config.Config, seeds []Seed) (string, error) {
 			RAGTrace: ragTrace, WikiTrace: wikiTrace, Traj: tj})
 		fmt.Printf("✓ %s: verdict=%s · 轨迹优=%s\n", s.ID, j.Verdict, trajWinner(tj))
 	}
-	report := render(cases, cfg.Model)
+	report := render(cases, cfg.Model, prevBaseline(root, rebaseline))
+	bl := CollectBaseline(cases, cfg.Model)
+	bl.Save(root) // 写最新基线:下次 --rebaseline 有对比对象
 	fp := writeReport(root, report)
 	fmt.Println("报告已写入: " + fp)
 	return report, nil
 }
 
-func render(cases []CaseResult, model string) string {
+// prevBaseline rebaseline 模式才加载上次基线;普通评估跑无 Δ(基线仍会写,供下次)。
+func prevBaseline(root string, rebaseline bool) *Baseline {
+	if !rebaseline {
+		return nil
+	}
+	return LoadBaseline(root)
+}
+
+func render(cases []CaseResult, model string, prev *Baseline) string {
 	var b strings.Builder
 	b.WriteString("# 对照实验报告: RAG 外挂 vs 知识编译复利\n\n")
 	b.WriteString(fmt.Sprintf("时间: %s · 模型: %s · 种子数: %d\n\n", time.Now().Format("2006-01-02 15:04"), model, len(cases)))
+	if prev != nil {
+		b.WriteString(fmt.Sprintf("> **复利对比(--rebaseline)**: vs 上次(%s, %s)\n\n", prev.Time.Format("2006-01-02 15:04"), prev.Model))
+	}
 
 	avg := func(mode string, dim string) float64 {
 		total, n := 0, 0
@@ -439,6 +500,19 @@ func render(cases []CaseResult, model string) string {
 		note = strings.TrimSpace(note)
 		b.WriteString(fmt.Sprintf("\n---\n\n## %s %s\n\n> 期望: %s\n\n**RAG 答案**:\n\n%s\n\n**编译复利答案**:\n\n%s\n\n**评审**: verdict=%s · %s\n",
 			c.Seed.ID, c.Seed.Question, note, c.RAGAns, c.WikiAns, c.Judge.Verdict, c.Judge.Rationale))
+		// 复利 Δ:wiki 侧总分 vs 上次(同种子)——wiki 是否越变越强是复利曲线的直接读数。
+		if prev != nil {
+			if p, ok := prev.Seeds[c.Seed.ID]; ok {
+				nowTotal, beforeTotal := 0, 0
+				for dim, v := range c.Judge.Scores["wiki"] {
+					nowTotal += v
+					if pv, ok2 := p["wiki"][dim]; ok2 {
+						beforeTotal += pv
+					}
+				}
+				b.WriteString(fmt.Sprintf("\n**复利 Δ(wiki vs 上次)**: %+d\n", nowTotal-beforeTotal))
+			}
+		}
 		scores := map[string]map[string]int{"RAG": c.Judge.Scores["rag"], "WIKI": c.Judge.Scores["wiki"]}
 		dimList := DefaultRubric
 		if len(c.Seed.Rubric) > 0 {
