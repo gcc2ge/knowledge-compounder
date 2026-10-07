@@ -47,6 +47,10 @@ func Lint(root string) LintResult {
 		}
 	}
 
+	var conceptBodies []struct {
+		slug string
+		body string
+	}
 	for _, p := range pages {
 		slug := filepath.Base(p)
 		content := Read(p)
@@ -57,6 +61,13 @@ func Lint(root string) LintResult {
 			res.NoFrontmatter = append(res.NoFrontmatter, slug)
 		}
 		vals, body := ParseFrontmatter(content)
+		// 疑似同义概念页检测复用的正文:主循环已读,不必 nearDuplicateConcepts 再读盘
+		if filepath.Base(filepath.Dir(p)) == "concepts" {
+			conceptBodies = append(conceptBodies, struct {
+				slug string
+				body string
+			}{strings.TrimSuffix(slug, ".md"), body})
+		}
 		// 压缩占位符污染:内容被系统历史压缩占位符覆盖(弱模型把占位符当真实内容写入)。
 		// 任何页面含此前缀即判损坏——概念页没有 preflight 硬资产闸门,这是唯一能抓住它的扫描。
 		if strings.Contains(content, CompactionMarker) {
@@ -103,7 +114,7 @@ func Lint(root string) LintResult {
 	res.Uncompiled = Scan(root).UncompiledFiles
 	// 疑似同义概念页(命名漂移 → 图碎片化的确定性检测):概念页两两算字符 bigram Jaccard,
 	// 相似度过高报「疑似同一概念的两个页面」——同义归一靠模型候选词 + 此检测兜底。
-	res.NearDup = nearDuplicateConcepts(pages)
+	res.NearDup = nearDuplicateConcepts(conceptBodies)
 	sort.Strings(res.Orphans)
 	sort.Strings(res.NoFrontmatter)
 	sort.Strings(res.Format)
@@ -204,32 +215,28 @@ func containsInsightSignal(sec string) bool {
 // nearDuplicateConcepts 疑似同义概念页检测:概念页两两算字符 bigram Jaccard,
 // 相似度 ≥ 阈值报对。命名漂移(中英别称/近似名)会让同一概念裂成两页——这是图碎片化的确定性信号。
 // O(n²) 仅对 concepts/ 子集;字符 bigram 对中文鲁棒(词切分不依赖词表)。
-func nearDuplicateConcepts(pages []string) []string {
+// 接收 Lint 主循环已解析的正文,避免重复读盘。
+func nearDuplicateConcepts(concepts []struct {
+	slug string
+	body string
+}) []string {
 	const threshold = 0.5
-	var concepts []struct {
+	type grams struct {
 		slug  string
 		grams map[string]struct{}
 	}
-	for _, p := range pages {
-		if filepath.Base(filepath.Dir(p)) != "concepts" {
-			continue
-		}
-		content := Read(p)
-		vals, body := ParseFrontmatter(content)
-		// 去掉 frontmatter 的哈希痕迹干扰:只对正文算相似
-		_ = vals
-		concepts = append(concepts, struct {
-			slug  string
-			grams map[string]struct{}
-		}{filepath.Base(p), charBigrams(body)})
+	vecs := make([]grams, 0, len(concepts))
+	for _, c := range concepts {
+		// 去掉 frontmatter 的哈希痕迹干扰:只对正文算相似(传入的 body 已剥离 frontmatter)
+		vecs = append(vecs, grams{c.slug, charBigrams(c.body)})
 	}
 	var out []string
-	for i := 0; i < len(concepts); i++ {
-		for j := i + 1; j < len(concepts); j++ {
-			s := jaccard(concepts[i].grams, concepts[j].grams)
+	for i := 0; i < len(vecs); i++ {
+		for j := i + 1; j < len(vecs); j++ {
+			s := jaccard(vecs[i].grams, vecs[j].grams)
 			if s >= threshold {
-				a := strings.TrimSuffix(concepts[i].slug, ".md")
-				b := strings.TrimSuffix(concepts[j].slug, ".md")
+				a := strings.TrimSuffix(vecs[i].slug, ".md")
+				b := strings.TrimSuffix(vecs[j].slug, ".md")
 				out = append(out, fmt.Sprintf("%s ~ %s(相似 %.2f)——疑似同一概念的两个页面,合并或互链", a, b, s))
 			}
 		}

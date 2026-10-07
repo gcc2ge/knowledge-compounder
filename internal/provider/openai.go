@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -21,6 +22,10 @@ type OpenAICompatible struct {
 	BaseURL   string
 	MaxTokens int // 0 = 模型默认上限;>0 透传 max_tokens 限制单次输出长度
 	Client    *http.Client
+
+	// 工具定义序列化缓存:一次运行的工具集固定(工具名唯一),避免每步 Chat 重建 map。
+	toolCacheKey  string
+	toolCacheDefs []map[string]any
 }
 
 func NewOpenAICompatible(model, apiKey, baseURL string) *OpenAICompatible {
@@ -51,6 +56,34 @@ func buildOpenAITools(tools []ToolDef) []map[string]any {
 		})
 	}
 	return defs
+}
+
+// openAITools 缓存版 buildOpenAITools:一次运行的工具集固定,按工具名列表签名缓存,
+// 避免每步 Chat/Stream 重建 map。签名含 name+参数个数,足以区分不同工具集。
+func (p *OpenAICompatible) openAITools(tools []ToolDef) []map[string]any {
+	if len(tools) == 0 {
+		return nil
+	}
+	key := toolsSignature(tools)
+	if key == p.toolCacheKey {
+		return p.toolCacheDefs
+	}
+	defs := buildOpenAITools(tools)
+	p.toolCacheKey, p.toolCacheDefs = key, defs
+	return defs
+}
+
+// toolsSignature 工具集指纹:name+参数个数。一次运行内工具名唯一且参数绑定 name,
+// 此签名足以区分不同工具集;O(len(tools)) 免哈希。
+func toolsSignature(tools []ToolDef) string {
+	var b strings.Builder
+	for _, t := range tools {
+		b.WriteString(t.Name)
+		b.WriteByte(':')
+		b.WriteString(strconv.Itoa(len(t.Parameters)))
+		b.WriteByte('\n')
+	}
+	return b.String()
 }
 
 // messagesToAPI 把统一 Message 转成 OpenAI chat 格式(tool_calls / tool 角色)。
@@ -85,7 +118,7 @@ func (p *OpenAICompatible) Chat(ctx context.Context, msgs []Message, tools []Too
 	if p.MaxTokens > 0 {
 		payload["max_tokens"] = p.MaxTokens
 	}
-	if defs := buildOpenAITools(tools); len(defs) > 0 {
+	if defs := p.openAITools(tools); len(defs) > 0 {
 		payload["tools"] = defs
 	}
 	if len(stop) > 0 {
@@ -155,7 +188,7 @@ func (p *OpenAICompatible) Stream(ctx context.Context, msgs []Message, tools []T
 	if p.MaxTokens > 0 {
 		payload["max_tokens"] = p.MaxTokens
 	}
-	if defs := buildOpenAITools(tools); len(defs) > 0 {
+	if defs := p.openAITools(tools); len(defs) > 0 {
 		payload["tools"] = defs
 	}
 	// stream_options.include_usage 让流式末帧携带 usage(真实 token 消耗,供 MaxTokens 闸门)

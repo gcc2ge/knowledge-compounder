@@ -19,6 +19,10 @@ type Anthropic struct {
 	BaseURL   string
 	MaxTokens int // 0 = 默认 8192;>0 覆盖单次输出上限
 	Client    *http.Client
+
+	// 工具定义序列化缓存:一次运行的工具集固定,避免每步 Chat/Stream 重建 map。
+	toolCacheKey  string
+	toolCacheDefs []map[string]any
 }
 
 func NewAnthropic(model, apiKey, baseURL string) *Anthropic {
@@ -41,6 +45,20 @@ func buildAnthropicTools(tools []ToolDef) []map[string]any {
 	for _, t := range tools {
 		defs = append(defs, map[string]any{"name": t.Name, "description": t.Description, "input_schema": t.Parameters})
 	}
+	return defs
+}
+
+// anthropicTools 缓存版 buildAnthropicTools:签名复用 toolsSignature,避免每步重建 map。
+func (p *Anthropic) anthropicTools(tools []ToolDef) []map[string]any {
+	if len(tools) == 0 {
+		return nil
+	}
+	key := toolsSignature(tools)
+	if key == p.toolCacheKey {
+		return p.toolCacheDefs
+	}
+	defs := buildAnthropicTools(tools)
+	p.toolCacheKey, p.toolCacheDefs = key, defs
 	return defs
 }
 
@@ -97,8 +115,8 @@ func (p *Anthropic) Chat(ctx context.Context, msgs []Message, tools []ToolDef, s
 	if system != "" {
 		payload["system"] = system
 	}
-	if len(tools) > 0 {
-		payload["tools"] = buildAnthropicTools(tools)
+	if defs := p.anthropicTools(tools); len(defs) > 0 {
+		payload["tools"] = defs
 	}
 	if len(stop) > 0 {
 		payload["stop_sequences"] = stop
@@ -166,7 +184,7 @@ func (p *Anthropic) Stream(ctx context.Context, msgs []Message, tools []ToolDef,
 	if system != "" {
 		payload["system"] = system
 	}
-	if defs := buildAnthropicTools(tools); len(defs) > 0 {
+	if defs := p.anthropicTools(tools); len(defs) > 0 {
 		payload["tools"] = defs
 	}
 	if len(stop) > 0 {

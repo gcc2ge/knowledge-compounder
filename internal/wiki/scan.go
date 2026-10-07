@@ -23,10 +23,13 @@ type Status struct {
 // Scan 扫描 wiki 状态:计数各子目录页数,找出未编译的 raw 源。
 func Scan(root string) Status {
 	st := Status{}
+	// 未编译 raw 判据:文件名主干是否出现在 wiki/sources/。单遍遍历同时完成计数与 compiled map。
+	compiled := map[string]bool{}
 	for _, p := range Pages(root) {
 		switch filepath.Base(filepath.Dir(p)) {
 		case "sources":
 			st.Sources++
+			compiled[filepath.Base(p)] = true
 		case "concepts":
 			st.Concepts++
 		case "entities":
@@ -39,13 +42,6 @@ func Scan(root string) Status {
 	}
 	st.Total = st.Sources + st.Concepts + st.Entities + st.Synthesis + st.Notes
 
-	// 未编译 raw:raw/ 与 raw/books/ 的 .md,若文件名主干未出现在 wiki/sources/
-	compiled := map[string]bool{}
-	for _, p := range Pages(root) {
-		if filepath.Base(filepath.Dir(p)) == "sources" {
-			compiled[filepath.Base(p)] = true
-		}
-	}
 	var uncompiled []string
 	for _, dir := range []string{filepath.Join(root, "raw"), filepath.Join(root, "raw", "books")} {
 		matches, err := filepath.Glob(filepath.Join(dir, "*.md"))

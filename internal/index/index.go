@@ -259,13 +259,78 @@ func (idx *Index) hydrate(m *PageMeta) {
 }
 
 // UpdateFile 单页重解析(write_file 写入后的 hook;仅 wiki/ 内页面入索引)。
+// 与 Build/Sync 的全量路径不同:这里是写密集热路径(compiler 一次编译多次写页),
+// 只增量同步受影响的 Back/slugIndex 条目,不做全量 rebuildGraph。
 func (idx *Index) UpdateFile(absPath string) {
 	rel := idx.rel(absPath)
 	if !strings.HasPrefix(rel, "wiki/") {
 		return
 	}
+	old := idx.Pages[rel] // 增量 Back 对比的旧出链(新增页为 nil)
 	idx.addPage(absPath)
-	idx.rebuildGraph()
+	idx.syncBack(rel, old)
+}
+
+// syncBack 把单页出链变化增量反映到 Back/slugIndex,替代全量 rebuildGraph。
+// 与 rebuildGraph 同语义:跳过 raw/ 前缀链接,target 去 .md 后缀。
+func (idx *Index) syncBack(rel string, old *PageMeta) {
+	slug := strings.TrimSuffix(filepath.Base(rel), ".md")
+	idx.slugIndex[slug] = rel
+	cur := idx.Pages[rel]
+	if cur == nil {
+		return
+	}
+	var oldSet, newSet map[string]struct{}
+	if old != nil {
+		oldSet = linkTargetSet(old.OutLinks)
+	}
+	newSet = linkTargetSet(cur.OutLinks)
+	for t := range oldSet {
+		if _, keep := newSet[t]; !keep {
+			removeBackEntry(idx.Back, t, slug)
+		}
+	}
+	for t := range newSet {
+		if _, had := oldSet[t]; !had {
+			addBackEntry(idx.Back, t, slug)
+		}
+	}
+}
+
+// linkTargetSet 出链 → 目标 slug 集合(与 rebuildGraph 同过滤:跳过 raw/ 前缀,去 .md)。
+func linkTargetSet(links []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(links))
+	for _, l := range links {
+		if strings.HasPrefix(l, "raw/") {
+			continue
+		}
+		set[strings.TrimSuffix(l, ".md")] = struct{}{}
+	}
+	return set
+}
+
+// addBackEntry 向 Back[target] 追加链接者 slug(幂等:已存在不重复)。
+func addBackEntry(back map[string][]string, target, slug string) {
+	for _, s := range back[target] {
+		if s == slug {
+			return
+		}
+	}
+	back[target] = append(back[target], slug)
+}
+
+// removeBackEntry 从 Back[target] 移除链接者 slug;清空后删除该 key。
+func removeBackEntry(back map[string][]string, target, slug string) {
+	xs := back[target]
+	for i, s := range xs {
+		if s == slug {
+			back[target] = append(xs[:i], xs[i+1:]...)
+			break
+		}
+	}
+	if len(back[target]) == 0 {
+		delete(back, target)
+	}
 }
 
 func (idx *Index) addPage(absPath string) {

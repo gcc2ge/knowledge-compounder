@@ -16,8 +16,15 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/gcc2ge/knowledge-compounder/internal/provider"
+)
+
+// 工具参数恢复/打转检测用的正则——热路径(每次工具调用/写历史),编译一次复用。
+var (
+	writePathRe    = regexp.MustCompile(`"path"\s*:\s*"([^"]*)"`) // write_file 的 path 字段
+	writeContentRe = regexp.MustCompile(`"content"\s*:`)           // write_file 的 content 键
 )
 
 type Runtime struct {
@@ -127,12 +134,14 @@ func (r *Runtime) Run(ctx context.Context, input, state string) (string, error) 
 			msgs = next
 			_ = r.saveCheckpoint(msgs)
 		}
-		if r.MaxTokens > 0 && r.consumedTokens(msgs) >= r.MaxTokens {
-			err := fmt.Errorf("达到 token 预算 %d(累计已用 %d),停止", r.MaxTokens, r.consumedTokens(msgs))
-			r.emit(Event{Kind: EvStop, Step: step, Tokens: r.consumedTokens(msgs), Err: err})
+		// token 预算闸门:每轮只估算一次,复用于停止判据与事件(avoid 重复全量扫描)。
+		tok := r.consumedTokens(msgs)
+		if r.MaxTokens > 0 && tok >= r.MaxTokens {
+			err := fmt.Errorf("达到 token 预算 %d(累计已用 %d),停止", r.MaxTokens, tok)
+			r.emit(Event{Kind: EvStop, Step: step, Tokens: tok, Err: err})
 			return "", err
 		}
-		r.emit(Event{Kind: EvStep, Step: step, Tokens: r.consumedTokens(msgs)})
+		r.emit(Event{Kind: EvStep, Step: step, Tokens: tok})
 		reply, err := r.callProvider(ctx, msgs)
 		if err != nil {
 			r.emit(Event{Kind: EvError, Step: step, Err: err})
@@ -311,12 +320,22 @@ func textTokens(s string) int {
 }
 
 // trunc 截断长文本(工具结果/参数渲染),避免事件刷屏。
+// 用 range 遍历只解码到前 n 个 rune 即停,避免超长输入整体分配 rune 切片。
 func trunc(s string, n int) string {
-	r := []rune(s)
-	if len(r) <= n {
+	if n <= 0 {
+		return "…"
+	}
+	if len(s) <= n { // 快路径:ASCII/短串无需解码计数
 		return s
 	}
-	return string(r[:n]) + "…"
+	cnt := 0
+	for i := range s {
+		if cnt == n {
+			return s[:i] + "…"
+		}
+		cnt++
+	}
+	return s
 }
 
 // execTool 执行工具并返回 Observation;失败/panic 喂回模型而非崩溃(错误自愈)。
@@ -374,12 +393,12 @@ func (r *Runtime) execTool(tc provider.ToolCall) (out string) {
 //     模型输出截断导致无收尾引号时取到 EOF),再还原 \n / \" / \\。
 func recoverWriteFileArgs(raw string) map[string]any {
 	args := map[string]any{}
-	if m := regexp.MustCompile(`"path"\s*:\s*"([^"]*)"`).FindStringSubmatch(raw); m != nil {
+	if m := writePathRe.FindStringSubmatch(raw); m != nil {
 		args["path"] = m[1]
 	} else {
 		return nil
 	}
-	idx := regexp.MustCompile(`"content"\s*:`).FindStringIndex(raw)
+	idx := writeContentRe.FindStringIndex(raw)
 	if idx == nil {
 		return nil
 	}
@@ -443,12 +462,12 @@ func compactWriteArgs(arguments string) string {
 	if err := json.Unmarshal([]byte(arguments), &args); err == nil {
 		if p, ok := args["path"].(string); ok {
 			if c, ok := args["content"].(string); ok {
-				return fmt.Sprintf(`{"path": %q, "content": "[系统已压缩省略 %d 字符——你实际写入的是完整内容,如需查看请 read_file 读回文件当前状态]"}`, p, len([]rune(c)))
+				return fmt.Sprintf(`{"path": %q, "content": "[系统已压缩省略 %d 字符——你实际写入的是完整内容,如需查看请 read_file 读回文件当前状态]"}`, p, utf8.RuneCountInString(c))
 			}
 			return fmt.Sprintf(`{"path": %q}`, p)
 		}
 	}
-	if m := regexp.MustCompile(`"path"\s*:\s*"([^"]*)"`).FindStringSubmatch(arguments); m != nil {
+	if m := writePathRe.FindStringSubmatch(arguments); m != nil {
 		return fmt.Sprintf(`{"path": %q, "content": "[系统已压缩省略]"}`, m[1])
 	}
 	return `{"content": "[系统已压缩省略]"}`
@@ -596,7 +615,7 @@ func toolNames(tools []provider.ToolDef) []string {
 // (查询/对象即语义,get_page 同页重复、edit_file 同锚点重复都会被计数)。
 func actionKey(name, args string) string {
 	if name == "write_file" {
-		if m := regexp.MustCompile(`"path"\s*:\s*"([^"]*)"`).FindStringSubmatch(args); m != nil {
+		if m := writePathRe.FindStringSubmatch(args); m != nil {
 			return "write_file:" + m[1]
 		}
 	}

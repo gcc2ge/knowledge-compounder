@@ -43,14 +43,17 @@ func Build(root string, ask func(string) string, vision func(string) string, opt
 			Func: func(args map[string]any) string {
 				query := str(args, "query")
 				k := intArg(args, "k", 0)
+				// 副本隔离:k 只影响本次检索,不污染闭包共享的 opts(旧实现直接改 opts.Top,
+				// 一次 k=8 后所有后续检索残留 Top=8,条数被静默放大)。
+				o := opts
 				if k > 0 {
-					opts.Top = k
+					o.Top = k
 				}
 				var results []retrieval.Result
 				if idx != nil {
-					results = idx.Rank(query, opts)
+					results = idx.Rank(query, o)
 				} else {
-					results = wiki.Retrieve(root, query, opts)
+					results = wiki.Retrieve(root, query, o)
 				}
 				if len(results) == 0 {
 					return "知识库中未找到相关页面。"
@@ -178,8 +181,8 @@ func Build(root string, ask func(string) string, vision func(string) string, opt
 					}
 				}
 				offset, limit := intArg(args, "offset", 0), intArg(args, "limit", 0)
-				out := readPaged(root, path, offset, limit, rep)
-				markRead(cov, root, path, offset, limit) // 读覆盖台账:gap 检测依据
+				out, lo, hi, total := readPagedDetail(root, path, offset, limit, rep)
+				markRead(cov, path, lo, hi, total) // 读覆盖台账:gap 检测依据(记实际返回区间,字节截断时不超记)
 				// 落盘纪律的机械执行:同文件连续分页读 ≥3 页未写任何文件时,
 				// 在返回文本里插入强制提醒——实测便宜模型会连读 13 页,上下文压缩
 				// 把早期内容折叠掉,读完已无料可写。纪律进工具返回,不靠 prompt 自觉。
@@ -403,34 +406,16 @@ func Build(root string, ask func(string) string, vision func(string) string, opt
 	}, idx, cov, cLog
 }
 
-// markRead 把一次 read_file 的覆盖区间记入台账(与 readPaged 同判据)。
-// 全文读:≤80KB 记全覆盖;>80KB 只记返回的头部段。分页读:记 [offset, offset+limit-1]。
-func markRead(cov *Coverage, root, path string, offset, limit int) {
-	fp, ok := safeJoin(root, path, "wiki", "raw", "examples", "SCHEMA.md", "templates", "docs")
-	if !ok {
+// markRead 把一次 read_file 的覆盖区间记入台账(与 readPagedDetail 同判据)。
+// 区间由 readPagedDetail 返回的实际渲染行 [lo,hi] 提供:字节闸截断时只记截断前,
+// 不超记未返回的行(旧实现按请求区间 offset+limit-1 记录,大页截断后把未读行
+// 误判为已读,FinishGuard 的 gap 判据会放行「中间漏读」的浅页)。
+// lo<=0 = 读取被拒/失败,不记覆盖(与旧行为一致:未知文件不阻断)。
+func markRead(cov *Coverage, path string, lo, hi, total int) {
+	if lo <= 0 || hi < lo {
 		return
 	}
-	b, err := os.ReadFile(fp)
-	if err != nil {
-		return
-	}
-	total := strings.Count(string(b), "\n") + 1
-	if offset <= 0 && limit <= 0 {
-		if len(b) <= readWholeCap {
-			cov.Mark(path, 1, total, total)
-		} else {
-			headLines := strings.Count(string(b[:readWholeCap]), "\n") + 1
-			cov.Mark(path, 1, headLines, total)
-		}
-		return
-	}
-	if offset <= 0 {
-		offset = 1
-	}
-	if limit <= 0 || limit > pageLineCap {
-		limit = pageLineCap
-	}
-	cov.Mark(path, offset, offset+limit-1, total)
+	cov.Mark(path, lo, hi, total)
 }
 
 // ---- 工具辅助 ----
@@ -565,27 +550,38 @@ const (
 // 切片 B(选择性深读):rep 非空时,本页与已读内容逐字重复的模板段被紧凑标记替换
 // (内容首次读入已在上下文,跳过不丢信息);Coverage 仍由 markRead 记整段,不影响 gap 判据。
 func readPaged(root, path string, offset, limit int, rep *RepeatDetector) string {
+	text, _, _, _ := readPagedDetail(root, path, offset, limit, rep)
+	return text
+}
+
+// readPagedDetail 同 readPaged,额外返回实际渲染的覆盖区间 [lo,hi] 与文件总行数 total,
+// 供 markRead 记读覆盖台账。关键:字节闸截断时 hi=cut(实际返回的最后一行),而非请求区间
+// 上限 offset+limit-1——大页截断后,未返回的行绝不能记为「已读」(否则 FinishGuard 的
+// gap 判据放行中间漏读的浅页)。读取被拒/失败/offset 超界返回 hi=0(无有效覆盖)。
+func readPagedDetail(root, path string, offset, limit int, rep *RepeatDetector) (text string, lo, hi, total int) {
 	fp, ok := safeJoin(root, path, "wiki", "raw", "examples", "SCHEMA.md", "templates", "docs")
 	if !ok {
-		return "拒绝:路径超出项目根或不在白名单目录。"
+		return "拒绝:路径超出项目根或不在白名单目录。", 0, 0, 0
 	}
 	b, err := os.ReadFile(fp)
 	if err != nil {
-		return fmt.Sprintf("读取失败: %v", err)
+		return fmt.Sprintf("读取失败: %v", err), 0, 0, 0
 	}
+	total = strings.Count(string(b), "\n") + 1
 	if offset <= 0 && limit <= 0 {
 		if len(b) <= readWholeCap {
-			return string(b)
+			return string(b), 1, total, total
 		}
 		return fmt.Sprintf("%s\n…(文件 %d KB / %d 行,超过单次读取上限;请用 offset/limit 分页读取,如 offset=1 limit=2000,逐页读完)\n",
-			b[:readWholeCap], len(b)>>10, strings.Count(string(b), "\n")+1)
+			b[:readWholeCap], len(b)>>10, total), 1, strings.Count(string(b[:readWholeCap]), "\n") + 1, total
 	}
 	lines := strings.Split(string(b), "\n")
 	if offset <= 0 {
 		offset = 1
 	}
+	lo = offset
 	if offset > len(lines) {
-		return fmt.Sprintf("offset %d 超出总行数 %d。", offset, len(lines))
+		return fmt.Sprintf("offset %d 超出总行数 %d。", offset, len(lines)), 0, 0, total
 	}
 	if limit <= 0 || limit > pageLineCap {
 		limit = pageLineCap
@@ -605,15 +601,19 @@ func readPaged(root, path string, offset, limit int, rep *RepeatDetector) string
 	}
 
 	// 字节闸 + 组装:普通行逐行写,重复段写紧凑标记;超单页字节上限提前截断。
+	// lastByte 跟踪 builder 末尾字节,避免用 strings.HasSuffix(sb.String(),"\n") 每次整体拷贝(O(n²))。
 	var sb strings.Builder
+	lastByte := byte(0)
 	cut := end
 	atCap := false
 	for _, s := range segs {
 		if s.first > 0 {
-			if sb.Len() > 0 && !strings.HasSuffix(sb.String(), "\n") {
+			if sb.Len() > 0 && lastByte != '\n' {
 				sb.WriteByte('\n')
+				lastByte = '\n'
 			}
 			sb.WriteString(fmt.Sprintf("[第 %d–%d 行与已读内容逐字重复(模板段,首次见于第 %d 行),省略]\n", s.lo, s.hi, s.first))
+			lastByte = '\n'
 			if sb.Len() > pageBytesCap {
 				atCap = true
 				cut = s.lo - 1
@@ -623,6 +623,7 @@ func readPaged(root, path string, offset, limit int, rep *RepeatDetector) string
 		}
 		for i := s.lo; i <= s.hi; i++ {
 			fmt.Fprintf(&sb, "%6d\t%s\n", i, lines[i-1])
+			lastByte = '\n'
 			if sb.Len() > pageBytesCap {
 				cut = i - 1
 				atCap = true
@@ -642,7 +643,11 @@ func readPaged(root, path string, offset, limit int, rep *RepeatDetector) string
 		tail = fmt.Sprintf("(第 %d–%d 行触达单页字节上限,共 %d 行;继续读:offset=%d)", offset, cut, len(lines), cut+1)
 	}
 	sb.WriteString(tail)
-	return sb.String()
+	hi = end
+	if atCap {
+		hi = cut
+	}
+	return sb.String(), lo, hi, total
 }
 
 // ---- web_fetch:纯标准库 HTTP 抓取 → 粗粒度 HTML 转文本 ----

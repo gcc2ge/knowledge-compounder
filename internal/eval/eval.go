@@ -34,6 +34,12 @@ var DefaultRubric = []string{"论证完整性", "连接价值", "矛盾标注", 
 // TrajRubric 轨迹质量维度(过程评估,M10 Agent-as-a-Judge 轨迹判官)。
 var TrajRubric = []string{"检索相关度", "证据覆盖", "证据忠实"}
 
+// 评审 JSON 清洗正则:剥离首尾非 JSON 前缀/后缀(模型常包 md 代码块或解释文字)。
+var (
+	stripJSONPrefix = regexp.MustCompile(`^[^{]*`)
+	stripJSONSuffix = regexp.MustCompile(`}[^}]*$`)
+)
+
 // TraceHit 一次检索命中的证据(M10 轨迹:检索到了什么)。
 type TraceHit struct {
 	Label string  `json:"label"` // 页面/文档标签(含路径)
@@ -301,8 +307,8 @@ func parseJudgeJSON(text string) (judgeScores, error) {
 	text = strings.TrimPrefix(text, "```")
 	text = strings.TrimSuffix(text, "```")
 	text = strings.TrimSpace(text)
-	text = regexp.MustCompile(`^[^{]*`).ReplaceAllString(text, "")
-	text = regexp.MustCompile(`}[^}]*$`).ReplaceAllString(text, "}")
+	text = stripJSONPrefix.ReplaceAllString(text, "")
+	text = stripJSONSuffix.ReplaceAllString(text, "}")
 	if err := json.Unmarshal([]byte(text), &out); err != nil {
 		return judgeScores{}, fmt.Errorf("评审 JSON 解析失败: %v\n原文: %.200s", err, text)
 	}
@@ -389,8 +395,8 @@ func parseTrajJSON(text string) (trajScores, error) {
 	text = strings.TrimPrefix(text, "```")
 	text = strings.TrimSuffix(text, "```")
 	text = strings.TrimSpace(text)
-	text = regexp.MustCompile(`^[^{]*`).ReplaceAllString(text, "")
-	text = regexp.MustCompile(`}[^}]*$`).ReplaceAllString(text, "}")
+	text = stripJSONPrefix.ReplaceAllString(text, "")
+	text = stripJSONSuffix.ReplaceAllString(text, "}")
 	if err := json.Unmarshal([]byte(text), &out); err != nil {
 		return trajScores{}, fmt.Errorf("轨迹评审 JSON 解析失败: %v\n原文: %.200s", err, text)
 	}
