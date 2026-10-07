@@ -333,3 +333,55 @@ func TestMidRunGuardInjectsNote(t *testing.T) {
 		t.Fatalf("工具原始结果应保留,得 %q", toolResult)
 	}
 }
+
+// ---- 原地打转检测(actionKey)----
+
+// write_file 同 path 不同 content = 反复重写同一文件 = 打转,签名应一致;
+// 不同 path 不同签名;其余工具保留完整参数(查询/对象即语义)。
+func TestActionKey_WriteFilePathBased(t *testing.T) {
+	a := actionKey("write_file", `{"path": "wiki/sources/X.md", "content": "版本一"}`)
+	b := actionKey("write_file", `{"path": "wiki/sources/X.md", "content": "版本二"}`)
+	if a != b {
+		t.Fatalf("同 path 不同 content 应同签名,得 %q vs %q", a, b)
+	}
+	if !strings.Contains(a, "wiki/sources/X.md") || !strings.HasPrefix(a, "write_file:") {
+		t.Fatalf("签名应含工具名与 path,得 %q", a)
+	}
+	c := actionKey("write_file", `{"path": "wiki/sources/Y.md", "content": "版本一"}`)
+	if c == a {
+		t.Fatal("不同 path 应不同签名")
+	}
+	// 其他工具:参数即语义,保留完整参数
+	if actionKey("search_wiki", `{"query":"agent"}`) == actionKey("search_wiki", `{"query":"rag"}`) {
+		t.Fatal("search_wiki 不同 query 应不同签名")
+	}
+	if actionKey("get_page", `{"page":"A"}`) == actionKey("get_page", `{"page":"B"}`) {
+		t.Fatal("get_page 不同页应不同签名")
+	}
+}
+
+// 集成:4 次 write_file 同 path 不同 content,MaxSameAction=3 → 第 4 次触发打转。
+// 旧签名含 content 会漏判(4 个不同 sig),path 签名在第 4 次即停。
+func TestSameActionDetectsWriteFileLoop(t *testing.T) {
+	fp := &scriptedProvider{replies: []provider.Message{
+		{ToolCalls: []provider.ToolCall{{ID: "w1", Name: "write_file", Arguments: `{"path": "wiki/sources/X.md", "content": "一"}`}}},
+		{ToolCalls: []provider.ToolCall{{ID: "w2", Name: "write_file", Arguments: `{"path": "wiki/sources/X.md", "content": "二"}`}}},
+		{ToolCalls: []provider.ToolCall{{ID: "w3", Name: "write_file", Arguments: `{"path": "wiki/sources/X.md", "content": "三"}`}}},
+		{ToolCalls: []provider.ToolCall{{ID: "w4", Name: "write_file", Arguments: `{"path": "wiki/sources/X.md", "content": "四"}`}}},
+	}}
+	rt := &Runtime{
+		Provider:      fp,
+		SystemPrompt:  "你是编译器",
+		MaxSteps:      10,
+		MaxSameAction: 3,
+		Tools: []provider.ToolDef{{Name: "write_file",
+			Func: func(map[string]any) string { return "已写入" }}},
+	}
+	_, err := rt.Run(context.Background(), "编译任务", "")
+	if err == nil {
+		t.Fatal("同 path 反复 write_file 应触发原地打转停止")
+	}
+	if fp.i != 3 {
+		t.Fatalf("应在第 4 次 write_file 停止(同 path 计数=4>3),得调用 %d 次", fp.i+1)
+	}
+}

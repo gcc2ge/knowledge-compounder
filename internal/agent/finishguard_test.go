@@ -156,3 +156,47 @@ func TestFinishGuardExhaustsBudgetThenFails(t *testing.T) {
 		t.Fatal("预算耗光仍未完成应报错")
 	}
 }
+
+// 预算边界假失败修复:step 撞满预算但 FinishGuard 通过(任务按闸门定义已完成)
+// → 应视为成功收尾(nil error),而不是「达到最大步数」误杀。页面交给 cli 的
+// postCompileQA 独立复核,运行时不做「边界完成 = 失败」的错判。
+func TestFinishGuardBudgetBoundaryPassIsSuccess(t *testing.T) {
+	fp := &loopToolProvider{}
+	rt := &Runtime{
+		Provider:        fp,
+		SystemPrompt:    "你是编译器",
+		MaxSteps:        3,
+		MaxSameAction:   100,
+		FinishGuard:     func(provider.Message) string { return "" }, // 闸门全过
+		MaxFinishPushes: 2,
+		Tools:           []provider.ToolDef{{Name: "noop", Func: func(map[string]any) string { return "ok" }}},
+	}
+	if _, err := rt.Run(context.Background(), "编译任务", ""); err != nil {
+		t.Fatalf("预算边界 + 闸门通过应成功收尾,得 err=%v", err)
+	}
+}
+
+// 预算边界 + push 已用满仍不合格 → 如实失败(修复不掩盖真残缺)。
+func TestFinishGuardBudgetBoundaryPushesExhaustedFails(t *testing.T) {
+	fp := &loopToolProvider{}
+	rt := &Runtime{
+		Provider:        fp,
+		SystemPrompt:    "你是编译器",
+		MaxSteps:        3,
+		MaxSameAction:   100,
+		FinishGuard:     func(provider.Message) string { return "⚠️ 编译未完成:继续" },
+		MaxFinishPushes: 1,
+		Tools:           []provider.ToolDef{{Name: "noop", Func: func(map[string]any) string { return "ok" }}},
+	}
+	if _, err := rt.Run(context.Background(), "编译任务", ""); err == nil {
+		t.Fatal("预算耗光 + push 用满仍未完成应报错")
+	}
+}
+
+// loopToolProvider 永远返回工具调用(把预算耗尽触发边界路径)。
+type loopToolProvider struct{}
+
+func (p *loopToolProvider) Chat(_ context.Context, _ []provider.Message, _ []provider.ToolDef, _ []string) (provider.Message, error) {
+	return provider.Message{Role: "assistant", ToolCalls: []provider.ToolCall{{ID: "t", Name: "noop", Arguments: `{}`}}}, nil
+}
+func (p *loopToolProvider) Capabilities() provider.Capabilities { return provider.Capabilities{} }

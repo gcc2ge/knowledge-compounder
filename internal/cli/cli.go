@@ -195,27 +195,35 @@ func Main(args []string) int {
 			return 1
 		}
 		start := time.Now() // 本轮是否产出源页的判据起点
-		code, toolCalls := runRole(root, cfg, "compiler", compileInput(root, args[1]), args[1])
-		if code == 0 {
-			blocking := postCompileQA(root, args[1], cfg) // Stop hook 语义:编译完自动核对;返回阻断性缺失数
-			// 收尾码反映编译成败,否则脚本/CI 会把「写了但严重残缺」当成功(M11 只填 31/101 代码块仍 RESULT_OK):
-			// ①源页本轮未落盘(FinishGuard 推满仍无 write_file)→ 失败;
-			// ②落盘但 preflight 仍有阻断性缺失 → 失败。只有「页面达标」或「合法幂等重编译」才成功。
-			slug := strings.TrimSuffix(filepath.Base(args[1]), ".md")
-			sourcePage := filepath.Join(root, "wiki", "sources", slug+".md")
-			if fi, err := os.Stat(sourcePage); err != nil || !fi.ModTime().After(start) {
-				idempotent := idempotentRecompile(root, args[1], fi, sourcePage, toolCalls)
-				if !idempotent {
-					fmt.Fprintf(os.Stderr, "  ⚠️ compile 未产出源页 wiki/sources/%s.md,返回失败码。\n", slug)
-					return 1
-				}
-				fmt.Fprintf(os.Stderr, "  ℹ️ 源页 %s.md 本轮未重写:raw 未变、页面已最新且模型有真实参与,判定为幂等重编译(成功)。\n", slug)
-			} else if blocking > 0 {
+		_, toolCalls := runRole(root, cfg, "compiler", compileInput(root, args[1]), args[1])
+		// 收尾以确定性闸门为准,而非进程退出码:
+		// 预算边界完成(step 撞满但 FinishGuard 全过)→ runRole 仍可能返回错误,但页面已达标;
+		// 反之 API 失败/超时也可能留下完整页。postCompileQA 无条件跑——
+		// 「写了但严重残缺」必须 RESULT_FAIL(M11 只填 31/101 代码块仍 RESULT_OK 的教训),
+		// 「完成于边界却被误杀」同样不允许。三态:
+		//  ①源页本轮已落盘且闸门全过 → 成功;
+		//  ②落盘但 preflight 有阻断性缺失 → 失败;
+		//  ③本轮未落盘 → 幂等判定(模型真实参与 + raw 未变 + 页面达标)才成功。
+		slug := strings.TrimSuffix(filepath.Base(args[1]), ".md")
+		sourcePage := filepath.Join(root, "wiki", "sources", slug+".md")
+		fi, statErr := os.Stat(sourcePage)
+		writtenThisRound := statErr == nil && fi.ModTime().After(start)
+
+		blocking := postCompileQA(root, args[1], cfg) // Stop hook 语义:编译完自动核对;返回阻断性缺失数
+		if writtenThisRound {
+			if blocking > 0 {
 				fmt.Fprintf(os.Stderr, "  ⚠️ 源页 %s.md 本轮已写入但 preflight 仍有 %d 项阻断性缺失,返回失败码(详情见上方自动质检)。\n", slug, blocking)
 				return 1
 			}
+			fmt.Fprintf(os.Stderr, "  ✅ 源页 %s.md 本轮已写入且闸门全过。\n", slug)
+			return 0
 		}
-		return code
+		if idempotentRecompile(root, args[1], fi, sourcePage, toolCalls) {
+			fmt.Fprintf(os.Stderr, "  ℹ️ 源页 %s.md 本轮未重写:raw 未变、页面已最新且模型有真实参与,判定为幂等重编译(成功)。\n", slug)
+			return 0
+		}
+		fmt.Fprintf(os.Stderr, "  ⚠️ compile 未产出源页 wiki/sources/%s.md,返回失败码。\n", slug)
+		return 1
 	case "relink-all":
 		// 独立命令形态(usage/批量脚本用 `kcp relink-all`);等价于 `kcp relink all`。
 		force := len(args) >= 2 && (args[1] == "--force" || args[1] == "-f")

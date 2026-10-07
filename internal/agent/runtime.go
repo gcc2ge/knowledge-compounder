@@ -79,14 +79,27 @@ func (r *Runtime) Run(ctx context.Context, input, state string) (string, error) 
 			// 步数用尽:MaxSteps 是预算不是完成标志——中途撞上限时任务可能只完成一半
 			// (源页半成品/未跑核对)。给 FinishGuard 一个判断机会,未达标则注入续跑
 			// 指令并延长预算(最多 MaxFinishPushes 次),而不是带半成品死掉。
-			if r.FinishGuard != nil && r.finishPushes < r.MaxFinishPushes {
-				if cont := r.FinishGuard(provider.Message{}); cont != "" {
+			// 边界裁决:预算耗尽 ≠ 失败——FinishGuard 通过(页面按闸门定义已完成)时
+			// 正常收尾;否则 push 未满则续跑、push 已满则如实失败。
+			if r.FinishGuard != nil {
+				cont := r.FinishGuard(provider.Message{})
+				if cont == "" {
+					// 闸门判定任务已完成:预算边界完成与正常收尾同判成功,
+					// 交由 cli 的 postCompileQA 独立复核,不在此误杀。
+					_ = r.saveCheckpoint(msgs)
+					r.emit(Event{Kind: EvDone, Step: step})
+					return "", nil
+				}
+				if r.finishPushes < r.MaxFinishPushes {
 					r.finishPushes++
 					r.emit(Event{Kind: EvFinishGuard, Step: step, Text: trunc(cont, 100)})
 					msgs = append(msgs, provider.Message{Role: "user", Content: cont})
 					budget += r.MaxSteps // 每次续跑再给一整份预算
 					continue
 				}
+				err := fmt.Errorf("达到最大步数 %d,停止: 任务未通过闸门(续跑 %d 次仍不合格)", r.MaxSteps, r.finishPushes)
+				r.emit(Event{Kind: EvStop, Step: step, Err: err})
+				return "", err
 			}
 			err := fmt.Errorf("达到最大步数 %d,停止", r.MaxSteps)
 			r.emit(Event{Kind: EvStop, Step: step, Err: err})
@@ -149,7 +162,7 @@ func (r *Runtime) Run(ctx context.Context, input, state string) (string, error) 
 			msgs = append(msgs, provider.Message{Role: "assistant", Content: reply.Content, ToolCalls: []provider.ToolCall{histTC}})
 			msgs = append(msgs, provider.Message{Role: "tool", Content: obs, ToolCallID: tc.ID})
 
-			sig := tc.Name + ":" + tc.Arguments
+			sig := actionKey(tc.Name, tc.Arguments)
 			same[sig]++
 			if same[sig] > r.MaxSameAction {
 				err := fmt.Errorf("同一动作重复 %d 次(%s),判定原地打转,停止", r.MaxSameAction, sig)
@@ -562,4 +575,17 @@ func toolNames(tools []provider.ToolDef) []string {
 		names = append(names, t.Name)
 	}
 	return names
+}
+
+// actionKey 原地打转检测的动作签名。write_file 用「工具:path」——
+// 反复重写同一文件(即使 content 每次略变)就是打转(实测「read/write 测试循环」,
+// 旧签名含完整 content 导致每次 sig 不同、检测器管不住);其余工具保留完整参数
+// (查询/对象即语义,get_page 同页重复、edit_file 同锚点重复都会被计数)。
+func actionKey(name, args string) string {
+	if name == "write_file" {
+		if m := regexp.MustCompile(`"path"\s*:\s*"([^"]*)"`).FindStringSubmatch(args); m != nil {
+			return "write_file:" + m[1]
+		}
+	}
+	return name + ":" + args
 }
