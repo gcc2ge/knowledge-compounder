@@ -1,5 +1,9 @@
 # Knowledge Compounder — 知识编译复利引擎
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Go](https://img.shields.io/badge/Go-1.24%2B-00ADD8)](https://go.dev/dl/)
+[![GitHub stars](https://img.shields.io/github/stars/gcc2ge/knowledge-compounder?style=social)](https://github.com/gcc2ge/knowledge-compounder)
+
 > **你的 AI 每次都像新员工:不知道你踩过的坑、验证过的策略、定下的约定,所以你只能一遍遍重新交代背景。你的知识呢?躺在收藏夹里吃灰——越收越多,从不回头看。** 这套系统把碎片编译成一份**会复利的私有知识库**:AI 干起活来像老员工,你的研究越查越富。
 
 ## 为什么现在需要一个会复利的知识库
@@ -111,19 +115,32 @@ kcp 的检索层**本身是 RAG 的生产基线**(BM25+向量 0.55/0.45 融合),
 
 **类型不是给 agent 选的菜单,是编译时埋好的分工**:写的时候决定知识放哪层、什么置信度;读的时候 agent 只管相关性排序 + 徽标——结构红利自动兑现。
 
+**一篇真实的编译产物**(来自 `examples/`,格式真实;完整对照:`examples/raw-demo.md` → `examples/compiled/source-demo.md`):
+
+输入 `raw-demo.md` 里的一段 Go:
+
+```go
+select {
+case ch <- v:
+case <-ctx.Done():
+    return // 消费者已退出,别阻塞泄漏
+}
+```
+
+编译成 `source-demo.md` 后,SCHEMA 的纪律各落在哪:
+
+| 编译纪律 | 产物里长什么样 |
+|---|---|
+| 一句话结论 | 「Go channel 并发有三个铁律——生产者负责关闭、发送时 select 监听取消、错误走同一个 channel——共同解决发送阻塞导致的 goroutine 泄漏」 |
+| 论证链逐字保留 | 上面那段 Go 代码**原样**躺在论证链里,不缩写、不转述 |
+| 意外发现 | 「泄漏 bug 在测试期几乎测不出来,只在长期压力下浮出——防泄漏必须靠结构纪律而不是测试」 |
+| 疑点 | 「错误走同一 channel 在并行多路时会成瓶颈——未验证边界,不影响单对场景正确性」 |
+
+一篇文章编译成一个**自包含的知识单元**:结论、证据、联想、边界全在里面,不看 raw 也能带走全部论证——这才是 agent 下次能直接用的手册。
+
 ## 也在给人用:研究工作台,不是收藏夹
 
-传统云笔记(有道云/印象笔记/Notion)是仓库:收藏、分类、按关键词搜原文,知识躺着不动。kcp 把研究过程本身变成工作台——**存的是原文,长的是你自己的知识网络**:
-
-| | 传统云笔记 | kcp |
-|---|---|---|
-| 笔记之间的关系 | 无——文件夹是柜子,笔记各自独立 | 交叉引用网络,每页至少 2 个出站链接 |
-| AI 的角色 | 一次性摘要,用完即弃 | **编译**:综合、连网、标注矛盾、回灌 |
-| 两篇文章冲突 | 并排躺着,你不知道 | 显式写进「张力与缺口」,置信度分层 |
-| 收藏的后果 | 越收越多,从不回头看(收藏夹吃灰) | 不综合进不了库——**读过不等于拥有,编译过才连网** |
-| 数据 | 锁在他们的云里 | 纯文本 + git,属于你,可导出带走 |
-
-一句话:云笔记让你**存得更整齐**,kcp 让你**想得更深入**——写的时候综合连网,想的时候 `kcp query` 跨页综合出带引用的答案,发现冲突时冲突不消失、进「张力与缺口」。研究恰恰是追踪矛盾的过程。
+这套系统不只喂 agent——**你自己就是第一个用户**。和云笔记(有道云/印象笔记/Notion)的差别一句话:它们**锁数据、存原文**;kcp 数据属于你(纯文本 + git,每页至少 2 个出站链接),而且**不综合进不了库**——读过不等于拥有,编译过才连网。存的是原文,长的是你自己的知识网络。
 
 ## 快速上手
 
@@ -151,6 +168,26 @@ export KCP_BASE_URL=https://api.deepseek.com/v1   # ⚠ 必须带 /v1,否则返�
 ./kcp mcp                      # wiki → MCP server(支柱 B,纯 Go 零依赖),接入见 context/.mcp.json.example
 ./kcp eval                     # 对照实验:编译复利 vs RAG 外挂(评估种子见 eval/seeds/)
 ```
+
+## 看它跑起来:零 LLM,克隆即玩
+
+构建之后**不用配任何 key**,先跑这两个看真实输出(全新 clone 就是这两个结果):
+
+```bash
+$ ./kcp status
+---
+总页面数 1 | sources 1 / concepts 0 / entities 0 / synthesis 0 / notes 0
+未编译 raw: 0
+---
+
+$ KCP_RETRIEVE_K=1 ./kcp search "go channel 泄漏"
+检索「go channel 泄漏」: 1 条(索引=on(1 页))
+- [[go-channel-三铁律]] [C]私有 融合0.72 词法1.00 语义0.37: Go channel 的 goroutine 泄漏源于"发送阻塞而接收方已退出";三铁律——谁创建谁关闭、发送时监听取消、错误与结果同通道——配合 `defer close`,系统性地消除泄漏。
+```
+
+一条命中自带**私有度徽标(`[C]`)、混合分数(词法+语义)、一句话结论**——这就是 agent 拿到手的证据格式。完整的 `compile → query` 流需配 key(见 `docs/上手.md`);60 秒录屏 GIF 待补:
+
+<!-- 在此插入终端录屏:compile 一篇 raw → query 出带引用答案 → observe 一条踩坑 -->
 
 ## 自研 agent:全 Go,任意 LLM 可跑
 
@@ -198,6 +235,14 @@ knowledge-compounder/
 - `scripts/export-public.sh` 一键导出公开版,自动替换薪资/股权/本地路径等敏感字段
 - **开源的是方法论,不是你的知识**:你的 `wiki/` 与 `raw/` 不进入本项目(见 `.gitignore`)
 
+## 常见疑问
+
+**「会把我的库编译脏吗?」** 编译错误会固化,但有两道兜底:`kcp lint`(断链/孤儿/格式)+ `review_after` 复核;概念页建不建由你裁决;`wiki/` 是纯文本 + git,错了可回滚。
+
+**「费不费钱?」** 写时付费 vs 读时付费:编译那一下贵,但摊到未来每次查询;查询读到挤干水分的页面,读侧便宜。账可以自己算——`kcp eval` 做 RAG-vs-编译复利对照实验,报告落 `eval/reports/`。
+
+**「我已经有 Obsidian/Notion 了,干嘛迁?」** 它们是仓库,你是工作台,不冲突:云笔记负责「存」,kcp 负责「想」。kcp 产物是纯文本 + git,想继续用 Obsidian 双链渲染完全可共存。
+
 ## 文档导航
 
 - `docs/运行原理.md` — 系统怎么运转(raw → 编译 → 复利闭环 → 喂给 agent)
@@ -206,6 +251,10 @@ knowledge-compounder/
 - `docs/场景应用.md` — 编程 / 交易 / 个人学习 / 办公四个场景
 - `docs/上手.md` — 逐步入门
 - `docs/隐私模型.md` / `docs/harness设计.md` — 隐私与自研 harness 设计
+
+## 贡献
+
+觉得有用?点个 ⭐。欢迎 issue / PR——动手前先读 `SCHEMA.md`(编译纪律)与 `docs/harness设计.md`(自研 agent 架构)。
 
 ## License
 
