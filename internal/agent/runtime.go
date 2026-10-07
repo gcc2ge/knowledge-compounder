@@ -40,6 +40,10 @@ type Runtime struct {
 	FinishGuard     func(reply provider.Message) string
 	MaxFinishPushes int
 
+	// MidRunGuard 每步工具执行后校验(compile 用):写页工具调用后追加一次 preflight 检查,
+	// 巨量硬资产缺失时把指引注入该工具观察——当场纠正「自造/近似代码」,避免收尾才抓、被迫整页重写(M11 实证)。
+	MidRunGuard func(step int, tool, args string) string
+
 	// ToolCalls 本轮实际执行的工具调用数(cli 编译收尾判据:区分「模型真实参与但幂等跳写源页」
 	// 与「零工作假成功」——零工作 = 0 次工具调用;幂等重编译 = ≥1 次调用但源页已最新无需重写)。
 	ToolCalls int
@@ -129,6 +133,11 @@ func (r *Runtime) Run(ctx context.Context, input, state string) (string, error) 
 			r.emit(Event{Kind: EvToolCall, Step: step, Tool: tc.Name, Args: tc.Arguments})
 			r.ToolCalls++ // 真实执行计数器:编译收尾区分幂等跳写与零工作假成功
 			obs := r.execTool(tc)
+			if r.MidRunGuard != nil {
+				if note := r.MidRunGuard(step, tc.Name, tc.Arguments); note != "" {
+					obs = obs + "\n\n" + note // 指引并入工具观察,模型当场可见
+				}
+			}
 			r.emit(Event{Kind: EvToolResult, Step: step, Tool: tc.Name, Result: trunc(obs, 300)})
 			// 历史里 write_file 的 arguments 压缩成占位:整页 content 是上下文最大消费源,
 			// 而分块写页的每轮全文若不压缩会永久留在上下文(compaction 保留所有 write 轮)——

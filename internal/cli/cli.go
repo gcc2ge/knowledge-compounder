@@ -29,8 +29,8 @@ const usage = `kcp — 知识编译复利引擎(自研 agent,任意 LLM)
   kcp status                    查看知识库状态(页面计数 + 未编译 raw)
   kcp lint                      健康检查(断链/孤儿)
   kcp compile <raw文件>         单源编译(compiler agent 按 SCHEMA 生成 source 页)
-  kcp relink <slug>             回访补强单个源页(全集就绪后补交叉引用+重新矛盾核对)
-  kcp relink-all                串行回访全部源页(知识复利第二拍:先存进去,再让全集强化)
+  kcp relink <slug>             回访补强单个源页(脚本预筛候选链接 + 重新矛盾核对)
+  kcp relink-all                串行回访全部源页;增量(自上次编译后未回访的才跑,已回访的跳过),--force 强制全量
   kcp query "<问题>"           检索知识库 + 综合回答
   kcp observe -s <策略> -T <标题> -c <内容>   捕获观察
   kcp update add-source <slug> <源>   确定性页面编辑(无 LLM)
@@ -197,10 +197,10 @@ func Main(args []string) int {
 		start := time.Now() // 本轮是否产出源页的判据起点
 		code, toolCalls := runRole(root, cfg, "compiler", compileInput(root, args[1]), args[1])
 		if code == 0 {
-			postCompileQA(root, args[1], cfg) // Stop hook 语义:编译完自动核对,问题就地暴露
-			// 收尾码反映编译成败:源页本轮未落盘(FinishGuard 推满仍无 write_file)→ 返回失败码,
-			// 脚本/CI 可感知——实测端点配置错误时模型全程未参与,exit 0 会误导自动化。
-			// 区分两态:真偷懒(零工作假成功)→ 失败;合法幂等重编译(源页已最新、模型有真实参与)→ 成功。
+			blocking := postCompileQA(root, args[1], cfg) // Stop hook 语义:编译完自动核对;返回阻断性缺失数
+			// 收尾码反映编译成败,否则脚本/CI 会把「写了但严重残缺」当成功(M11 只填 31/101 代码块仍 RESULT_OK):
+			// ①源页本轮未落盘(FinishGuard 推满仍无 write_file)→ 失败;
+			// ②落盘但 preflight 仍有阻断性缺失 → 失败。只有「页面达标」或「合法幂等重编译」才成功。
 			slug := strings.TrimSuffix(filepath.Base(args[1]), ".md")
 			sourcePage := filepath.Join(root, "wiki", "sources", slug+".md")
 			if fi, err := os.Stat(sourcePage); err != nil || !fi.ModTime().After(start) {
@@ -210,16 +210,24 @@ func Main(args []string) int {
 					return 1
 				}
 				fmt.Fprintf(os.Stderr, "  ℹ️ 源页 %s.md 本轮未重写:raw 未变、页面已最新且模型有真实参与,判定为幂等重编译(成功)。\n", slug)
+			} else if blocking > 0 {
+				fmt.Fprintf(os.Stderr, "  ⚠️ 源页 %s.md 本轮已写入但 preflight 仍有 %d 项阻断性缺失,返回失败码(详情见上方自动质检)。\n", slug, blocking)
+				return 1
 			}
 		}
 		return code
+	case "relink-all":
+		// 独立命令形态(usage/批量脚本用 `kcp relink-all`);等价于 `kcp relink all`。
+		force := len(args) >= 2 && (args[1] == "--force" || args[1] == "-f")
+		return relinkAll(root, cfg, force)
 	case "relink":
 		if len(args) < 2 {
-			fmt.Fprintln(os.Stderr, "用法: kcp relink <slug> | kcp relink-all")
+			fmt.Fprintln(os.Stderr, "用法: kcp relink <slug> | kcp relink-all [--force]")
 			return 1
 		}
 		if args[1] == "all" || args[1] == "--all" {
-			return relinkAll(root, cfg)
+			force := len(args) >= 3 && (args[2] == "--force" || args[2] == "-f")
+			return relinkAll(root, cfg, force)
 		}
 		slug := strings.TrimSuffix(args[1], ".md")
 		rawFile := filepath.Join("raw", slug+".md")
@@ -227,7 +235,10 @@ func Main(args []string) int {
 			fmt.Fprintf(os.Stderr, "⚠️ raw/%s.md 不存在。relink 输入用 raw 主干名(如 M02-LLM全平台接入)。\n", slug)
 			return 1
 		}
-		code, _ := runRole(root, cfg, "relink", relinkInput(root, slug), rawFile)
+		// 确定性第一拍:单条 relink 也先脚本筛候选,再进 LLM。
+		text := wiki.Read(filepath.Join(root, "wiki", "sources", slug+".md"))
+		cands := wiki.SuggestLinks(text, slug, wiki.BuildRegistry(root), 12)
+		code, _ := runRole(root, cfg, "relink", relinkInput(root, slug, cands), rawFile)
 		return code
 	case "query":
 		if len(args) < 2 {
@@ -275,7 +286,9 @@ func compileInput(root, rawFile string) string {
 
 // postCompileQA 编译后自动质检(对标 Claude Code 的 Stop hook):
 // preflight 硬资产完整性 + sources 缩水检查 + lint 摘要;打 stderr,不污染 stdout。
-func postCompileQA(root, rawFile string, cfg config.Config) {
+// 返回 preflight 阻断性缺失项数(compile 收尾判据:落盘但严重残缺 → 失败码)。
+func postCompileQA(root, rawFile string, cfg config.Config) int {
+	blocking := 0
 	fmt.Fprintln(os.Stderr, "\n[自动质检] 编译后检查…")
 	slug := strings.TrimSuffix(filepath.Base(rawFile), ".md")
 	sourcePage := filepath.Join(root, "wiki", "sources", slug+".md")
@@ -289,6 +302,7 @@ func postCompileQA(root, rawFile string, cfg config.Config) {
 		if len(issues) == 0 {
 			fmt.Fprintln(os.Stderr, "  preflight: 硬资产完整(代码/表/示例无缺失)")
 		} else {
+			blocking = len(issues)
 			fmt.Fprintf(os.Stderr, "  ⚠️ preflight 缺失 %d 项(重编或人工补齐):\n", len(issues))
 			for i, it := range issues {
 				if i >= 8 {
@@ -351,6 +365,7 @@ func postCompileQA(root, rawFile string, cfg config.Config) {
 		}
 	}
 	fmt.Fprintln(os.Stderr, "  lint:", lintSummary(root))
+	return blocking
 }
 
 // conflictMarkedLabels 从文本里抽取出被 lint 可识别冲突标记的行所引用的 wikilink label。
@@ -595,6 +610,43 @@ func runRole(root string, cfg config.Config, role, input, rawFile string) (int, 
 			return "" // 源页存在、硬资产无缺失、长源已读全覆盖、概念页已全裁决,视为完成
 		}
 		rt.MaxFinishPushes = 2 // 最多续跑 2 轮,仍不达标则退出(交由 postCompileQA 如实报告)
+		// mid-run 覆盖守卫:骨架期后每 ~10 步查一次 preflight,巨量缺失当场注入「逐字补代码」
+		// 指引——拦截「先写自造/近似代码→收尾才被抓→被迫整页重写」的预算黑洞(M11 实证)。
+		var midLastStep, midInjected int
+		rt.MidRunGuard = func(step int, tool, args string) string {
+			if midInjected >= 3 || step-midLastStep < 10 {
+				return ""
+			}
+			if tool != "write_file" && tool != "edit_file" {
+				return ""
+			}
+			if !strings.Contains(args, "wiki/sources/"+slug+".md") {
+				return ""
+			}
+			b, rerr := os.ReadFile(sourcePage)
+			if rerr != nil || strings.Contains(string(b), "(待填充") { // 骨架/占位期不扰
+				midLastStep = step
+				return ""
+			}
+			// 优先注入读覆盖缺口:模型没读全 raw 就去写页,未读段的覆盖只能靠编造——
+			// 这正是 M11 重编后仍缺 13 块的根因(raw 601-2840 从未读)。告诉它具体行号,先读完再补。
+			if lo, hi, ok := readCov.Gap(rawFile); ok {
+				midLastStep = step
+				midInjected++
+				return fmt.Sprintf("⚠️ raw %s 还有 %d-%d 行未读。先用 read_file 逐页读完该段(offset=%d 起),再据它补源页——跳过内容写出的页会被覆盖核验拒收,补读比事后返工省预算。", rawFile, lo, hi, lo)
+			}
+			if _, issues, perr := wiki.Preflight(filepath.Join(root, rawFile), sourcePage); perr == nil && len(issues) >= 2 {
+				midLastStep = step
+				midInjected++
+				brief := issues[0]
+				if len(issues) > 1 {
+					brief += fmt.Sprintf("(…共 %d 项)", len(issues))
+				}
+				return fmt.Sprintf("⚠️ 源页 %s.md 当前缺失 %d 项硬资产(%s)。read_file 读回 raw 对应段落,把这些代码块/表/示例**逐字**补进源页对应节再继续推进——不要先写完整页再回头补,预算会被烧光。", slug, len(issues), brief)
+			}
+			midLastStep = step
+			return ""
+		}
 	}
 	// relink 补强角色:源页已存在,闸门与 compiler 不同——不要求首写、不查长源读覆盖(不重读 raw),
 	// 但要求 ①源页存在 ②结构无重复节 ③preflight 硬资产未在补强中丢失 ④矛盾核对真跑 ⑤证据全裁决。
@@ -677,14 +729,27 @@ func idempotentRecompile(root, rawRel string, fi os.FileInfo, sourcePage string,
 	return true
 }
 
-// relinkInput 组装回访补强任务输入:指明目标页与任务边界(只补强,不重写)。
-func relinkInput(root, slug string) string {
-	return fmt.Sprintf("目标源页:wiki/sources/%s.md(已编译)。\n任务:现在整个 wiki 已填充,请对照全集补强本页的交叉引用——重新运行 check_contradictions(source=%q),用 update_evidence 物理强化相关概念页,并用 edit_file 补「连接」节(只增不删,关联必写意义)。不要重写论证链/关键细节。", slug, slug)
+// relinkInput 组装回访补强任务输入:目标页 + 任务边界 + 脚本预筛候选链接。
+// cands 由确定性层(wiki.BuildRegistry + SuggestLinks)产出,零 LLM 成本——
+// LLM 不再通读全集找连接点,只对候选逐一判断相关性与写关联意义。
+func relinkInput(root, slug string, cands []wiki.Candidate) string {
+	linkLine := ""
+	if len(cands) > 0 {
+		var b strings.Builder
+		b.WriteString("\n【脚本预筛的候选链接(确定性第一拍,仅供参考)——逐一判断是否相关:相关的补进「连接」节并写关联意义,不相关的忽略;页内已链的不用重复】\n")
+		for i, c := range cands {
+			b.WriteString(fmt.Sprintf("  %d. [[%s]] — %s (%s, score=%d)\n", i+1, c.Slug, c.Title, c.Type, c.Score))
+		}
+		linkLine = b.String()
+	}
+	return fmt.Sprintf("目标源页:wiki/sources/%s.md(已编译)。\n任务:现在整个 wiki 已填充,请对照全集补强本页的交叉引用——重新运行 check_contradictions(source=%q),用 update_evidence 物理强化相关概念页,并用 edit_file 补「连接」节(只增不删,关联必写意义)。不要重写论证链/关键细节。%s", slug, slug, linkLine)
 }
 
 // relinkAll 串行回访全部已编译源页(知识复利第二拍:先存进去,再让全集反过来强化先存的那批)。
 // 每页独立进程 + 独立 checkpoint(relink-<slug>.json);收尾重建 index。
-func relinkAll(root string, cfg config.Config) int {
+// 增量:frontmatter 记 relinked 日期,只有「自上次编译后未回访」的页才进 LLM 会话;
+// --force 跳过增量判断。候选链接一次性 BuildRegistry,复用于所有目标页。
+func relinkAll(root string, cfg config.Config, force bool) int {
 	pages, err := filepath.Glob(filepath.Join(root, "wiki", "sources", "*.md"))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -694,16 +759,41 @@ func relinkAll(root string, cfg config.Config) int {
 		fmt.Println("wiki/sources/ 无已编译页,无需 relink。")
 		return 0
 	}
-	failed := 0
+	reg := wiki.BuildRegistry(root) // 确定性第一拍:注册表只建一次
+	today := time.Now().Format("2006-01-02")
+	failed, skipped := 0, 0
 	for _, p := range pages {
 		slug := strings.TrimSuffix(filepath.Base(p), ".md")
 		rawFile := filepath.Join("raw", slug+".md")
+		sourcePage := filepath.Join(root, "wiki", "sources", slug+".md")
 		if _, err := os.Stat(filepath.Join(root, rawFile)); err != nil {
 			fmt.Printf("SKIP: %s(raw 缺失,非 raw 1:1 页)\n", slug)
+			skipped++
 			continue
 		}
-		code, _ := runRole(root, cfg, "relink", relinkInput(root, slug), rawFile)
+		// 增量:relinked >= compiled(自上次编译后已回访,页面未变)→ 跳过。
+		// 新编译页无 relinked → 必进;旧页被重编(compiled 更新)→ 必进。
+		if !force {
+			if rel, comp := wiki.RelinkedDates(sourcePage); rel != "" && comp != "" && rel >= comp {
+				fmt.Printf("SKIP: %s(自上次编译后已回访 %s,未变;--force 可强制)\n", slug, rel)
+				skipped++
+				continue
+			}
+		}
+		text := wiki.Read(sourcePage)
+		cands := wiki.SuggestLinks(text, slug, reg, 12)
+		code, _ := runRole(root, cfg, "relink", relinkInput(root, slug, cands), rawFile)
 		if code == 0 {
+			// relink 收尾同样要 honest:补强后 preflight 仍有阻断性缺失 → FAIL(FinishGuard 推满会提前退出,
+			// 不能靠退出码为 0 就判 OK——与 compile 的 RESULT_OK 掩盖同一类缺口)。
+			if _, issues, perr := wiki.Preflight(filepath.Join(root, rawFile), sourcePage); perr == nil && len(issues) > 0 {
+				fmt.Printf("RESULT_FAIL: %s (preflight 仍有 %d 项缺失)\n", slug, len(issues))
+				failed++
+				continue
+			}
+			if err := wiki.SetRelinked(sourcePage, today); err != nil {
+				fmt.Printf("WARN: %s 回访完成但写 relinked 时间戳失败: %v\n", slug, err)
+			}
 			fmt.Printf("RESULT_OK: %s\n", slug)
 		} else {
 			fmt.Printf("RESULT_FAIL: %s\n", slug)
@@ -714,7 +804,7 @@ func relinkAll(root string, cfg config.Config) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	fmt.Printf("RELINK_DONE: %d 页失败\n", failed)
+	fmt.Printf("RELINK_DONE: %d 页失败, %d 页跳过\n", failed, skipped)
 	return 0
 }
 

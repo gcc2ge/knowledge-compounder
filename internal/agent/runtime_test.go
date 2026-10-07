@@ -291,3 +291,45 @@ func TestExecToolTruncatedEvenWhenRepairFails(t *testing.T) {
 		t.Fatal("repair 失败(nil)的截断参数也应标记 truncated=true——否则工具误报缺字段")
 	}
 }
+
+// ---- mid-run 覆盖守卫 ----
+
+// MidRunGuard 在写页工具执行后把指引注入工具观察(EvToolResult 可见)——模型当场看到
+// 「逐字补代码」,拦截「先写自造代码→收尾才被抓→被迫整页重写」的预算黑洞。
+func TestMidRunGuardInjectsNote(t *testing.T) {
+	fp := &scriptedProvider{replies: []provider.Message{
+		{ToolCalls: []provider.ToolCall{{ID: "t1", Name: "write_file", Arguments: `{"path": "wiki/sources/X.md", "content": "页"}`}}},
+		{Role: "assistant", Content: "完成"},
+	}}
+	var toolResult string
+	rt := &Runtime{
+		Provider:      fp,
+		SystemPrompt:  "你是编译器",
+		MaxSteps:      10,
+		MaxSameAction: 100,
+		Tools: []provider.ToolDef{{
+			Name: "write_file",
+			Func: func(args map[string]any) string { return "已写入" },
+		}},
+		OnEvent: func(ev Event) {
+			if ev.Kind == EvToolResult {
+				toolResult = ev.Result
+			}
+		},
+		MidRunGuard: func(step int, tool, args string) string {
+			if tool == "write_file" && strings.Contains(args, "wiki/sources/X.md") {
+				return "⚠️ 缺失 10 项硬资产,逐字补代码"
+			}
+			return ""
+		},
+	}
+	if _, err := rt.Run(context.Background(), "编译任务", ""); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(toolResult, "逐字补代码") {
+		t.Fatalf("MidRunGuard 指引应并入工具观察,得 %q", toolResult)
+	}
+	if !strings.Contains(toolResult, "已写入") {
+		t.Fatalf("工具原始结果应保留,得 %q", toolResult)
+	}
+}
