@@ -288,10 +288,13 @@ func Build(root string, ask func(string) string, vision func(string) string, opt
 			},
 		},
 		{
-			Name: "write_file", Description: "写入 wiki/ examples 内的文件(编译写页面用);raw/ 不可变,禁止写入",
+			Name: "write_file", Description: "写入 wiki/ examples 内的文件(编译写页面用)。⚠️ 覆盖语义:整页替换,不是追加——写新页/整页重写时用,重写前必须先 read_file 读回当前内容;增量补写/追加一律用 edit_file。raw/ 不可变,禁止写入",
 			Parameters: obj(map[string]any{"path": strProp, "content": strProp}),
 			Func: func(args map[string]any) string {
 				path, content := str(args, "path"), str(args, "content")
+				if path == "" {
+					return "拒绝:未收到 path 参数(工具参数解析失败)。write_file 必须以 JSON 传 path(如 wiki/sources/xxx.md)与 content;content 内的换行要转义为 \\n、引号要转义为 \\\"。"
+				}
 				fp, ok := safeJoin(root, path, "wiki", "examples")
 				if !ok {
 					return fmt.Sprintf("拒绝:只允许写 wiki/ examples/(raw/ 不可变,禁止写入),收到 %s", path)
@@ -306,7 +309,59 @@ func Build(root string, ask func(string) string, vision func(string) string, opt
 				if idx != nil {
 					idx.UpdateFile(fp) // 写入即索引:同会话后续检索立即可见
 				}
+				if tr, _ := args["content_truncated"].(bool); tr {
+					// 参数被模型输出截断(无完整收尾):写下的内容必然不全。必须明说,
+					// 否则模型以为整页已落盘,靠 FinishGuard 的 preflight 兜底才发现缺节、
+					// 反复读-write 测试。且截断时模型多尝试「整页覆盖重试」→ 必然再次截断。
+					// 正确路径是 read_file 读回 + edit_file 逐块补写,不靠整页重写。
+					return fmt.Sprintf("已写入 %s ⚠️ 注意:本次 content 参数疑似被模型输出截断(未闭合),只写入了前 %d 行,页面不完整。不要再整页 write_file 覆盖(会再次截断);请 read_file 读回当前内容,再用 edit_file 逐块补写,每块 <3KB。", rel(root, fp), strings.Count(content, "\n")+1)
+				}
 				return fmt.Sprintf("已写入 %s", rel(root, fp))
+			},
+		},
+		{
+			Name: "edit_file", Description: "修改 wiki/ examples 内文件的内容(增量补写用;write_file 是整页覆盖,不用于追加)。old_string=当前文件里的唯一原文锚点(必须与 read_file 读回的原文逐字一致,含缩进/换行),new_string=替换后的内容。精确替换一次:old_string 找不到或出现多次时不改并返回说明。**写长页面纪律(防输出截断)**:先 write_file 写第一块骨架,再 read_file 读回确认,然后 edit_file 逐块填充——old_string 取**要补写的那一节当前结尾**的唯一原文锚点(不是无脑文件尾),new_string=锚点原文+新增块,每块 <3KB;**已存在的节标题(## 意外发现 等)绝不重复输出,每节只写一次**;绝不要整页 write_file 覆盖重试,超长 content 会被模型输出截断、只写一半。raw/ 不可变,禁止编辑",
+			Parameters: obj(map[string]any{"path": strProp, "old_string": strProp, "new_string": strProp}),
+			Func: func(args map[string]any) string {
+				path, old, new := str(args, "path"), str(args, "old_string"), str(args, "new_string")
+				// 截断判断放最前:repair 失败(截断到无收尾引号)会解析出空参数,此时缺字段
+				// 是截断的果不是因——先报截断,模型才知道要分块,而不是对着假缺字段空转。
+				if tr, _ := args["truncated"].(bool); tr {
+					return "拒绝:本次 edit_file 参数疑似被模型输出截断(对象未以 } 收尾),未做任何修改。new_string 请保持 <3KB,分块编辑(每块一个 edit_file 调用)。"
+				}
+				if path == "" || old == "" {
+					// 形状感知的拒绝:区分「只传了新内容」vs「全缺」,给可执行的字段顺序。
+					// 弱模型偶尔把 new_string 放最前、或干脆只发 new_string——此时 path/old_string
+					// 必然拿不到(短字段在长内容之后或根本没发),无法定位替换位置。
+					if str(args, "new_string") != "" {
+						return "拒绝:你这次只传了 new_string,丢了 path 与 old_string——无法定位要替换的位置。edit_file 三参必填,JSON 键顺序固定为 path → old_string → new_string(new_string 是新增内容,放最后);对象必须以 } 收尾。请按此顺序重发。"
+					}
+					return "拒绝:path 与 old_string 必填。old_string 必须是当前文件里的唯一原文锚点(先 read_file 读回确认),new_string 为替换内容。"
+				}
+				fp, ok := safeJoin(root, path, "wiki", "examples")
+				if !ok {
+					return fmt.Sprintf("拒绝:只允许编辑 wiki/ examples/(raw/ 不可变,禁止写入),收到 %s", path)
+				}
+				b, err := os.ReadFile(fp)
+				if err != nil {
+					return fmt.Sprintf("编辑失败:%s 不存在——先 write_file 建页(首块),再 edit_file 补写。", rel(root, fp))
+				}
+				text := string(b)
+				switch n := strings.Count(text, old); {
+				case n == 0:
+					return fmt.Sprintf("编辑失败:old_string 在 %s 中未找到。锚点必须与文件当前内容逐字一致(含缩进/换行)——先 read_file 读回确认再编辑。", rel(root, fp))
+				case n > 1:
+					return fmt.Sprintf("编辑失败:old_string 在 %s 中出现 %d 次,锚点不唯一。请用更长/更靠文件尾的锚点,或包含上文数行使之一一唯一。", rel(root, fp), n)
+				}
+				text = strings.Replace(text, old, new, 1)
+				if err := os.WriteFile(fp, []byte(text), 0o644); err != nil {
+					return fmt.Sprintf("编辑失败: %v", err)
+				}
+				delete(readsSinceWrite, path)
+				if idx != nil {
+					idx.UpdateFile(fp) // 写即索引:同会话后续检索立即可见
+				}
+				return fmt.Sprintf("已编辑 %s:替换 1 处(%d 字符→%d 字符)。若继续补写:read_file 读回目标节,用该节当前结尾的唯一原文作锚点插入(已存在的节标题绝不重复输出)。", rel(root, fp), len(old), len(new))
 			},
 		},
 		{

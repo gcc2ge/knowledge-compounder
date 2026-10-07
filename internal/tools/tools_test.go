@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/gcc2ge/knowledge-compounder/internal/retrieval"
 )
 
 // TestReadPaged 分页语义:cat -n 行号、续读提示、越界、大文件强制分页、白名单外拒绝。
@@ -72,5 +74,87 @@ func TestHTMLToText(t *testing.T) {
 	}
 	if !strings.Contains(got, "标题") || !strings.Contains(got, "第一段 & 细节") {
 		t.Errorf("正文与实体解码应保留,得:%s", got)
+	}
+}
+
+// TestEditFile edit_file 增量补写语义:唯一锚点替换、未找到/不唯一不改、截断拒绝、白名单外拒绝。
+func TestEditFile(t *testing.T) {
+	root := t.TempDir()
+	tools, _, _, _ := Build(root, nil, nil, retrieval.Options{})
+	var wf, ef struct {
+		name string
+		fn   func(map[string]any) string
+	}
+	for _, td := range tools {
+		if td.Name == "write_file" {
+			wf.fn = td.Func
+		}
+		if td.Name == "edit_file" {
+			ef.fn = td.Func
+		}
+	}
+	if ef.fn == nil {
+		t.Fatal("缺少 edit_file 工具")
+	}
+	path := "wiki/sources/X.md"
+	// 建页(首块)
+	if got := wf.fn(map[string]any{"path": path, "content": "行A\n行B\n"}); !strings.Contains(got, "已写入") {
+		t.Fatalf("write_file 建页失败: %s", got)
+	}
+	// 1. 唯一锚点追加:old=尾锚点,new=锚点+新块
+	got := ef.fn(map[string]any{"path": path, "old_string": "行B", "new_string": "行B\n行C"})
+	if !strings.Contains(got, "已编辑") {
+		t.Fatalf("追加应成功,得 %s", got)
+	}
+	b, _ := os.ReadFile(filepath.Join(root, path))
+	if string(b) != "行A\n行B\n行C\n" {
+		t.Fatalf("追加后内容错,得 %q", string(b))
+	}
+	// 2. 锚点找不到 → 不改文件
+	got = ef.fn(map[string]any{"path": path, "old_string": "不存在的锚点", "new_string": "X"})
+	if !strings.Contains(got, "未找到") {
+		t.Fatalf("未找到锚点应报错,得 %s", got)
+	}
+	b, _ = os.ReadFile(filepath.Join(root, path))
+	if string(b) != "行A\n行B\n行C\n" {
+		t.Fatalf("锚点未找到时不应改文件,得 %q", string(b))
+	}
+	// 3. 锚点不唯一 → 不改文件
+	got = ef.fn(map[string]any{"path": path, "old_string": "行", "new_string": "X"})
+	if !strings.Contains(got, "不唯一") {
+		t.Fatalf("多出现锚点应报错,得 %s", got)
+	}
+	b, _ = os.ReadFile(filepath.Join(root, path))
+	if string(b) != "行A\n行B\n行C\n" {
+		t.Fatalf("锚点不唯一时不应改文件,得 %q", string(b))
+	}
+	// 4. 截断标记 → 拒绝,不改文件
+	got = ef.fn(map[string]any{"path": path, "old_string": "行C", "new_string": "行C\n行D", "truncated": true})
+	if !strings.Contains(got, "拒绝") {
+		t.Fatalf("截断应拒绝,得 %s", got)
+	}
+	b, _ = os.ReadFile(filepath.Join(root, path))
+	if string(b) != "行A\n行B\n行C\n" {
+		t.Fatalf("截断拒绝时不应改文件,得 %q", string(b))
+	}
+	// 5. 白名单外拒绝(raw/ 不可变)
+	got = ef.fn(map[string]any{"path": "raw/X.md", "old_string": "a", "new_string": "b"})
+	if !strings.Contains(got, "拒绝") {
+		t.Fatalf("raw/ 应拒绝编辑,得 %s", got)
+	}
+	// 6. 文件不存在 → 提示先 write_file
+	got = ef.fn(map[string]any{"path": "wiki/sources/不存在.md", "old_string": "a", "new_string": "b"})
+	if !strings.Contains(got, "不存在") {
+		t.Fatalf("文件不存在应提示先建页,得 %s", got)
+	}
+	// 7. 只传 new_string(弱模型漏字段)→ 形状感知拒绝,给字段顺序
+	got = ef.fn(map[string]any{"new_string": "只有新内容"})
+	if !strings.Contains(got, "只传了 new_string") || !strings.Contains(got, "path → old_string → new_string") {
+		t.Fatalf("漏字段应给顺序指引,得 %s", got)
+	}
+	// 8. 全缺 → 通用必填提示
+	got = ef.fn(map[string]any{})
+	if !strings.Contains(got, "必填") {
+		t.Fatalf("全缺应提示必填,得 %s", got)
 	}
 }

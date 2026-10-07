@@ -145,3 +145,52 @@ func TestIndentedFenceDetected(t *testing.T) {
 		t.Fatalf("应亮出覆盖核验: %s", report)
 	}
 }
+
+// 节标题重复(edit_file 尾部追加失控:M01 整页写两遍)是「每节都在但结构损坏」,
+// 缺节检查抓不到,必须独立闸门——preflight 应列「出现 2 次」为阻断性 issue。
+func TestPreflightDuplicateSections(t *testing.T) {
+	dir := t.TempDir()
+	raw := filepath.Join(dir, "raw.md")
+	src := filepath.Join(dir, "src.md")
+	// 论证链里嵌了第二遍「## 意外发现」骨架(模型在文件尾重写整页的典型形态)
+	mangled := fmt.Sprintf(srcSkeleton, "x\n\n## 意外发现\n又一遍\n\n## 作者立场与定位\n又一遍\n\n## 引用\n又一遍")
+	if err := os.WriteFile(raw, []byte("正文"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(src, []byte(mangled), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, issues, err := Preflight(raw, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(issues, "\n")
+	if !strings.Contains(joined, "意外发现") || !strings.Contains(joined, "出现 2 次") {
+		t.Fatalf("应报重复节: %s", joined)
+	}
+	if !strings.Contains(joined, "作者立场与定位") || !strings.Contains(joined, "引用") {
+		t.Fatalf("应列出全部重复节: %s", joined)
+	}
+
+	// DuplicateSections 独立入口(compile FinishGuard 用)
+	dup, err := DuplicateSections(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dup) != 3 || dup[0] != "意外发现" {
+		t.Fatalf("应返回 3 个重复节(意外发现/作者立场与定位/引用),得 %v", dup)
+	}
+
+	// 正常页(每节一次)→ 不报重复
+	clean := filepath.Join(dir, "clean.md")
+	if err := os.WriteFile(clean, []byte(fmt.Sprintf(srcSkeleton, "x")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dup, err = DuplicateSections(clean)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dup) != 0 {
+		t.Fatalf("正常页不应有重复节,得 %v", dup)
+	}
+}

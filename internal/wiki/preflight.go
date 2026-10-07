@@ -81,7 +81,41 @@ func Preflight(rawPath, sourcePage string) (string, []string, error) {
 			issues = append(issues, "❌ source 缺「"+s+"」节")
 		}
 	}
+	// 节标题重复 = 同一节被写多遍(edit_file 尾部追加失控的典型产物,如 M01 整页写两遍)。
+	// 缺节/硬资产都拦不住它(每节都在、只是重复),「恰好一次」才是 SCHEMA 结构完整的判据。
+	for _, h := range duplicateHeadings(pageText) {
+		issues = append(issues, "❌ source 节「"+h+"」出现 2 次(整节重复,结构损坏)——删除重复整节,内容合并到该节唯一位置")
+	}
 	return b.String(), issues, nil
+}
+
+// duplicateHeadings 返回页中出现 2 次及以上的 ## 节标题。
+func duplicateHeadings(text string) []string {
+	seen := map[string]int{}
+	var order []string
+	for _, m := range preSection.FindAllStringSubmatch(text, -1) {
+		h := strings.TrimSpace(m[1])
+		if seen[h] == 0 {
+			order = append(order, h)
+		}
+		seen[h]++
+	}
+	var dup []string
+	for _, h := range order {
+		if seen[h] > 1 {
+			dup = append(dup, h)
+		}
+	}
+	return dup
+}
+
+// DuplicateSections 供调用方(compile FinishGuard)直接取源页重复节标题。
+func DuplicateSections(sourcePage string) ([]string, error) {
+	b, err := os.ReadFile(sourcePage)
+	if err != nil {
+		return nil, err
+	}
+	return duplicateHeadings(string(b)), nil
 }
 
 type inv struct{ fenced, tables, htmlTables, math, examples, lines int }

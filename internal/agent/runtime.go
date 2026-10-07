@@ -12,6 +12,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
+	"strings"
 	"time"
 	"unicode"
 
@@ -67,7 +69,25 @@ func (r *Runtime) Run(ctx context.Context, input, state string) (string, error) 
 		every = 3
 	}
 	same := map[string]int{}
-	for step := 0; step < r.MaxSteps; step++ {
+	step, budget := 0, r.MaxSteps
+	for {
+		if step >= budget {
+			// 步数用尽:MaxSteps 是预算不是完成标志——中途撞上限时任务可能只完成一半
+			// (源页半成品/未跑核对)。给 FinishGuard 一个判断机会,未达标则注入续跑
+			// 指令并延长预算(最多 MaxFinishPushes 次),而不是带半成品死掉。
+			if r.FinishGuard != nil && r.finishPushes < r.MaxFinishPushes {
+				if cont := r.FinishGuard(provider.Message{}); cont != "" {
+					r.finishPushes++
+					r.emit(Event{Kind: EvFinishGuard, Step: step, Text: trunc(cont, 100)})
+					msgs = append(msgs, provider.Message{Role: "user", Content: cont})
+					budget += r.MaxSteps // 每次续跑再给一整份预算
+					continue
+				}
+			}
+			err := fmt.Errorf("达到最大步数 %d,停止", r.MaxSteps)
+			r.emit(Event{Kind: EvStop, Step: step, Err: err})
+			return "", err
+		}
 		if err := ctx.Err(); err != nil {
 			r.emit(Event{Kind: EvStop, Step: step, Err: err})
 			return "", err
@@ -110,7 +130,14 @@ func (r *Runtime) Run(ctx context.Context, input, state string) (string, error) 
 			r.ToolCalls++ // 真实执行计数器:编译收尾区分幂等跳写与零工作假成功
 			obs := r.execTool(tc)
 			r.emit(Event{Kind: EvToolResult, Step: step, Tool: tc.Name, Result: trunc(obs, 300)})
-			msgs = append(msgs, provider.Message{Role: "assistant", Content: reply.Content, ToolCalls: []provider.ToolCall{tc}})
+			// 历史里 write_file 的 arguments 压缩成占位:整页 content 是上下文最大消费源,
+			// 而分块写页的每轮全文若不压缩会永久留在上下文(compaction 保留所有 write 轮)——
+			// 上下文钉在阈值上、折叠读轮、模型忘 raw、重读、再填满的履带(实测 51 次压缩/文件)。
+			histTC := tc
+			if tc.Name == "write_file" {
+				histTC.Arguments = compactWriteArgs(tc.Arguments)
+			}
+			msgs = append(msgs, provider.Message{Role: "assistant", Content: reply.Content, ToolCalls: []provider.ToolCall{histTC}})
 			msgs = append(msgs, provider.Message{Role: "tool", Content: obs, ToolCallID: tc.ID})
 
 			sig := tc.Name + ":" + tc.Arguments
@@ -125,10 +152,8 @@ func (r *Runtime) Run(ctx context.Context, input, state string) (string, error) 
 		if step%every == every-1 {
 			_ = r.saveCheckpoint(msgs)
 		}
+		step++
 	}
-	err := fmt.Errorf("达到最大步数 %d,停止", r.MaxSteps)
-	r.emit(Event{Kind: EvStop, Step: r.MaxSteps, Err: err})
-	return "", err
 }
 
 // callProvider 调用 LLM:Provider 实现 Streamer 且订阅了流式时走 SSE;
@@ -280,10 +305,246 @@ func (r *Runtime) execTool(tc provider.ToolCall) (out string) {
 	var args map[string]any
 	if tc.Arguments != "" {
 		if err := json.Unmarshal([]byte(tc.Arguments), &args); err != nil {
-			args = map[string]any{}
+			// 容错恢复:weak 模型(deepseek/glm 系)常把大 content 里的引号/换行写成
+			// 非法 JSON,严格解析失败若直接丢参数,write_file 只收到空 path、模型反复
+			// 重试烧光步数(实测 M01 编译 15+ 步全卡在 write_file 拒绝上,最终撞 Deadline)。
+			args = repairToolArgs(tc.Arguments)
+		}
+		if args == nil && tool.Name == "write_file" {
+			// 再兜底:长 content 常被模型输出截断成未闭合字符串(转义修复救不了),
+			// 定向恢复 path(短字段写得好)+ content(整块取到末尾未转义引号)。
+			args = recoverWriteFileArgs(tc.Arguments)
+		}
+		// 截断特征:JSON 对象未以 } 收尾 = 参数被模型输出中途切断。
+		// 此前放在 args!=nil 分支内——但 repair 对「截断到无收尾引号」返回 nil(修复后仍
+		// 未闭合),标记被跳过,工具收到空参数、给出误导性「缺字段」拒绝,弱模型同参重试烧步。
+		// 与解析成败解耦:裸参数不以 } 收尾一律标 truncated,由工具按截断语义拒绝(write_file
+		// 走 recoverWriteFileArgs 的 content_truncated 既有路径;edit_file 必须拒绝——new_string
+		// 只替换一半会静默破坏已有页,比整页覆盖更危险)。
+		if strings.TrimSpace(tc.Arguments) != "" && !strings.HasSuffix(strings.TrimSpace(tc.Arguments), "}") {
+			if args == nil {
+				args = map[string]any{}
+			}
+			args["truncated"] = true
 		}
 	}
+	if args == nil {
+		args = map[string]any{}
+	}
 	return tool.Func(args)
+}
+
+// recoverWriteFileArgs write_file 定向兜底。write_file 只认 path+content 两参:
+//   - path 用严格正则(短字段,模型写得好)
+//   - content 取 "content": 开引号之后到「最后一个未转义引号」的整块(含中途未转义引号;
+//     模型输出截断导致无收尾引号时取到 EOF),再还原 \n / \" / \\。
+func recoverWriteFileArgs(raw string) map[string]any {
+	args := map[string]any{}
+	if m := regexp.MustCompile(`"path"\s*:\s*"([^"]*)"`).FindStringSubmatch(raw); m != nil {
+		args["path"] = m[1]
+	} else {
+		return nil
+	}
+	idx := regexp.MustCompile(`"content"\s*:`).FindStringIndex(raw)
+	if idx == nil {
+		return nil
+	}
+	rest := strings.TrimLeft(raw[idx[1]:], " \t\r\n")
+	if rest == "" || rest[0] != '"' {
+		return nil
+	}
+	start := len(raw) - len(rest) + 1 // 值开引号之后
+	last := -1
+	for i := start; i < len(raw); i++ {
+		if raw[i] == '"' && (i == 0 || raw[i-1] != '\\') {
+			last = i
+		}
+	}
+	end := len(raw)
+	if last > start {
+		end = last
+	} else {
+		// 无收尾未转义引号 = arguments 被模型输出截断(content 一直裸奔到 EOF)。
+		// 标记给 write_file 工具,让它警告模型内容可能不完整、需分块写。
+		args["content_truncated"] = true
+	}
+	args["content"] = unescapeJSONString(raw[start:end])
+	return args
+}
+
+// unescapeJSONString 还原 JSON 字符串转义:\n \t \r \" \\;未知转义取其原字符。
+func unescapeJSONString(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			switch s[i+1] {
+			case 'n':
+				b.WriteByte('\n')
+			case 't':
+				b.WriteByte('\t')
+			case 'r':
+				b.WriteByte('\r')
+			case '"':
+				b.WriteByte('"')
+			case '\\':
+				b.WriteByte('\\')
+			default:
+				b.WriteByte(s[i+1])
+			}
+			i++
+		} else {
+			b.WriteByte(s[i])
+		}
+	}
+	return b.String()
+}
+
+// compactWriteArgs 把 write_file 的 arguments 压成占位再存入历史。write_file 的整页
+// content 是上下文最大消费源,而分块写页的每轮全文若不压缩会永久留在上下文(compaction
+// 保留所有 write 轮)→ 上下文钉在阈值上、折叠读轮、模型忘 raw、重读、再填满的履带。
+// 占位必须明确标注「系统压缩」——否则模型读自己历史以为只写了占位符,会反复重写测试
+// (实测模型把 [省略] 当自己写的内容,step 内连续 read/write 测试循环)。
+func compactWriteArgs(arguments string) string {
+	var args map[string]any
+	if err := json.Unmarshal([]byte(arguments), &args); err == nil {
+		if p, ok := args["path"].(string); ok {
+			if c, ok := args["content"].(string); ok {
+				return fmt.Sprintf(`{"path": %q, "content": "[系统已压缩省略 %d 字符——你实际写入的是完整内容,如需查看请 read_file 读回文件当前状态]"}`, p, len([]rune(c)))
+			}
+			return fmt.Sprintf(`{"path": %q}`, p)
+		}
+	}
+	if m := regexp.MustCompile(`"path"\s*:\s*"([^"]*)"`).FindStringSubmatch(arguments); m != nil {
+		return fmt.Sprintf(`{"path": %q, "content": "[系统已压缩省略]"}`, m[1])
+	}
+	return `{"content": "[系统已压缩省略]"}`
+}
+
+// repairToolArgs 容错解析模型输出的工具参数 JSON。适用形态:扁平对象、短字段在前、
+// 最后一个大字符串字段(如 write_file 的 content)在后。weak 模型常在这类字段里写
+// 未转义的 " 与裸换行,使严格 json.Unmarshal 失败。本函数逐字符扫描修复:
+//   - 字符串内的裸换行/回车/Tab → 转义为 \n \r \t
+//   - 字符串内未转义的 " → 依据后随字符判定「真实终结符 vs 内容引号」:
+//     后随 , } ] 或 EOF 且为「键闭合」语境 → 终结;后随内容字符 → 转义为 \"
+//   - 键语境:短字段(键)的收尾 " 后随 : → 终结(键闭合)
+// 修复后重新解析;仍失败返回 nil(由工具拒绝兜底,错误信息更清晰)。
+func repairToolArgs(raw string) map[string]any {
+	rs := []rune(raw)
+	var b strings.Builder
+	inStr := false
+	keyCtx := false // 下一个字符串是否为对象键(由前一个结构字符决定)
+	for i := 0; i < len(rs); i++ {
+		c := rs[i]
+		if !inStr {
+			b.WriteRune(c)
+			switch c {
+			case '{', ',':
+				keyCtx = true
+			case ':':
+				keyCtx = false
+			case '"':
+				inStr = true
+			}
+			continue
+		}
+		switch c {
+		case '\\': // 已转义:原样保留并跳过后一字符
+			b.WriteRune(c)
+			if i+1 < len(rs) {
+				b.WriteRune(rs[i+1])
+				i++
+			}
+		case '"':
+			j := i + 1
+			for j < len(rs) && isJSONWS(rs[j]) {
+				j++
+			}
+			switch {
+			case j >= len(rs):
+				b.WriteRune('"')
+				inStr = false
+				keyCtx = false
+			case rs[j] == '}' || rs[j] == ']':
+				// 需确认 } 之后就到尾(真正收尾) —— 否则是内容里的内嵌 JSON 结束
+				k := j + 1
+				for k < len(rs) && isJSONWS(rs[k]) {
+					k++
+				}
+				if k >= len(rs) {
+					b.WriteRune('"')
+					inStr = false
+					keyCtx = false
+				} else {
+					b.WriteString(`\"`) // 内容里的 "} (内嵌 JSON)
+				}
+			case rs[j] == ',':
+				if looksLikeNextKey(rs, j) { // 终结后接下一键;而非内容里的 ", "
+					b.WriteRune('"')
+					inStr = false
+					keyCtx = true
+				} else {
+					b.WriteString(`\"`) // 内容引号(如 列表: "A", "B")
+				}
+			case rs[j] == ':':
+				if keyCtx { // 短键收尾
+					b.WriteRune('"')
+					inStr = false
+					keyCtx = false
+				} else { // 长值里的内嵌 JSON("x": ...),视为内容
+					b.WriteString(`\"`)
+				}
+			default:
+				b.WriteString(`\"`)
+			}
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		default:
+			b.WriteRune(c)
+		}
+	}
+	out := strings.TrimSpace(b.String())
+	if !strings.HasSuffix(out, "}") {
+		out += "}" // 模型可能截掉了收尾花括号
+	}
+	var args map[string]any
+	if err := json.Unmarshal([]byte(out), &args); err != nil {
+		return nil
+	}
+	return args
+}
+
+// looksLikeNextKey 判断从逗号之后是否是一个「对象键」起点:即 "short"": 形态。
+// 用于区分 值收尾后接下一键(, "path": ...) 与 内容里的 ", " 序列。
+func looksLikeNextKey(rs []rune, commaIdx int) bool {
+	k := commaIdx + 1
+	for k < len(rs) && isJSONWS(rs[k]) {
+		k++
+	}
+	if k >= len(rs) || rs[k] != '"' {
+		return false
+	}
+	for m := k + 1; m < len(rs) && m-k < 64; m++ {
+		if rs[m] == '\\' {
+			m++
+			continue
+		}
+		if rs[m] == '"' {
+			n := m + 1
+			for n < len(rs) && isJSONWS(rs[n]) {
+				n++
+			}
+			return n < len(rs) && rs[n] == ':'
+		}
+	}
+	return false
+}
+
+func isJSONWS(r rune) bool {
+	return r == ' ' || r == '\t' || r == '\n' || r == '\r'
 }
 
 func toolNames(tools []provider.ToolDef) []string {
