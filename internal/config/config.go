@@ -27,6 +27,7 @@ type Config struct {
 	EmbedAPIKey     string
 	RetrieveK       int // search_wiki / kcp search 返回条数
 	EvalTimeout     int // 评估单次 LLM 调用超时(秒);答题×2+判官×2 各占独立窗口
+	JudgePasses     int // 判官去噪:每种子独立评审轮数,分数取中位数、verdict 取多数票;1 = 关闭
 }
 
 func Load() Config {
@@ -51,6 +52,7 @@ func Load() Config {
 		EmbedAPIKey:     getenv("KCP_EMBED_API_KEY", os.Getenv("KCP_API_KEY")),
 		RetrieveK:       getenvInt("KCP_RETRIEVE_K", 5),
 		EvalTimeout:     getenvInt("KCP_EVAL_TIMEOUT", 90),
+		JudgePasses:     getenvInt("KCP_EVAL_JUDGE_PASSES", 3),
 	}
 }
 

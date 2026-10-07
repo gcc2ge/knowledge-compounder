@@ -57,6 +57,7 @@ const usage = `kcp — 知识编译复利引擎(自研 agent,任意 LLM)
           KCP_EMBED_MODEL(留空=离线字符哈希嵌入;设置后用 OpenAI 兼容 /embeddings 语义检索)
           KCP_EMBED_BASE_URL KCP_EMBED_API_KEY(默认跟随 KCP_BASE_URL/KCP_API_KEY)
           KCP_RETRIEVE_K(默认5)
+          KCP_EVAL_TIMEOUT(评估单次LLM调用超时秒;默认90) KCP_EVAL_JUDGE_PASSES(判官去噪轮数;默认3,0=单判)
 `
 
 // Main 命令分发。返回退出码。
