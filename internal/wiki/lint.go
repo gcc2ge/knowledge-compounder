@@ -10,6 +10,12 @@ import (
 	"unicode"
 )
 
+// CompactionMarker 系统历史压缩占位符的前缀。write_file 的完整 content 被运行时压缩成
+// 「[系统已压缩省略 N 字符——你实际写入的是完整内容…]」占位以省上下文;弱模型会把这个
+// 占位符当真实内容写回文件(实测 6 个概念页被整页覆盖成占位符)。任何 wiki 文件含此前缀
+// = 被污染;write_file/edit_file 工具也用它拒绝把占位符当内容写入。
+const CompactionMarker = "[系统已压缩省略"
+
 // LintResult 一次 lint 报告。
 type LintResult struct {
 	Broken         map[string][]string // 页面 → 指向不存在页面的链接
@@ -21,6 +27,7 @@ type LintResult struct {
 	Uncompiled     []string            // 未编译的 raw 源
 	SurpriseWeak   []string            // 「意外发现」节疑似无私有联想(纯复述原文)——私有 edge 缺失的提示
 	NearDup        []string            // 疑似同义概念页对(高文本相似 + 主题重叠,建页命名漂移的信号)
+	Corrupted      []string            // 被系统压缩占位符污染的页面(内容被覆盖成占位符,必须重建)
 	Counts         struct{ Pages, BrokenLinks int }
 }
 
@@ -50,6 +57,11 @@ func Lint(root string) LintResult {
 			res.NoFrontmatter = append(res.NoFrontmatter, slug)
 		}
 		vals, body := ParseFrontmatter(content)
+		// 压缩占位符污染:内容被系统历史压缩占位符覆盖(弱模型把占位符当真实内容写入)。
+		// 任何页面含此前缀即判损坏——概念页没有 preflight 硬资产闸门,这是唯一能抓住它的扫描。
+		if strings.Contains(content, CompactionMarker) {
+			res.Corrupted = append(res.Corrupted, slug)
+		}
 		// 矛盾标注 → 人工审核项(SCHEMA:只把 CONTRADICTION/矛盾声明列为审核)
 		for _, kw := range []string{"CONTRADICTION", "⚠️ 矛盾", "⚠️ 冲突", "矛盾声明"} {
 			if strings.Contains(content, kw) {
@@ -99,6 +111,7 @@ func Lint(root string) LintResult {
 	sort.Strings(res.ReviewAfter)
 	sort.Strings(res.SurpriseWeak)
 	sort.Strings(res.NearDup)
+	sort.Strings(res.Corrupted)
 	for _, v := range res.Broken {
 		res.Counts.BrokenLinks += len(v)
 	}
@@ -110,10 +123,10 @@ func Lint(root string) LintResult {
 func ReportLint(root string) string {
 	res := Lint(root)
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("lint: %d 页,断链 %d,孤儿 %d,缺 frontmatter %d,格式 %d,矛盾标注 %d,过时 %d,未编译 %d,弱意外发现 %d,疑似同义页 %d\n",
+	b.WriteString(fmt.Sprintf("lint: %d 页,断链 %d,孤儿 %d,缺 frontmatter %d,格式 %d,矛盾标注 %d,过时 %d,未编译 %d,弱意外发现 %d,疑似同义页 %d,被污染 %d\n",
 		res.Counts.Pages, res.Counts.BrokenLinks, len(res.Orphans), len(res.NoFrontmatter),
 		len(res.Format), len(res.Contradictions), len(res.ReviewAfter), len(res.Uncompiled),
-		len(res.SurpriseWeak), len(res.NearDup)))
+		len(res.SurpriseWeak), len(res.NearDup), len(res.Corrupted)))
 	// 健康趋势(P2):与上次 lint 首行对比——复利是时间序列,健康必须有曲线。
 	if prev, prevDate := prevHealth(root); prev != "" {
 		b.WriteString("上次(" + prevDate + "): " + prev + "\n")
@@ -145,11 +158,14 @@ func ReportLint(root string) string {
 	if len(res.NearDup) > 0 {
 		b.WriteString("疑似同义概念页(命名漂移,合并或互链):\n  " + strings.Join(res.NearDup, "\n  ") + "\n")
 	}
+	if len(res.Corrupted) > 0 {
+		b.WriteString("被压缩占位符污染(内容被覆盖成占位符,必须重建):\n  " + strings.Join(res.Corrupted, ", ") + "\n")
+	}
 	if len(res.Uncompiled) > 0 {
 		b.WriteString("未编译 raw:\n  " + strings.Join(res.Uncompiled, ", ") + "\n")
 	}
-	if res.Counts.BrokenLinks == 0 && len(res.Orphans) == 0 && len(res.NoFrontmatter) == 0 && len(res.Format) == 0 && len(res.ReviewAfter) == 0 {
-		b.WriteString("健康:无断链、无孤儿、无格式问题、无过时。\n")
+	if res.Counts.BrokenLinks == 0 && len(res.Orphans) == 0 && len(res.NoFrontmatter) == 0 && len(res.Format) == 0 && len(res.ReviewAfter) == 0 && len(res.Corrupted) == 0 {
+		b.WriteString("健康:无断链、无孤儿、无格式问题、无过时、无污染。\n")
 	}
 	// 落盘健康报告(供历史比较;失败静默)
 	dir := filepath.Join(root, "wiki", "health")

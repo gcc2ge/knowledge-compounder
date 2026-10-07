@@ -255,6 +255,40 @@ func Main(args []string) int {
 		}
 		code, _ := runRole(root, cfg, "query", strings.Join(args[1:], " "), "")
 		return code
+	case "repair-concepts":
+		// 修复被系统压缩占位符污染的概念页:扫描出污染页重建(默认),或显式指定 slug。
+		slugs := args[1:]
+		if len(slugs) == 0 || (len(slugs) == 1 && (slugs[0] == "--all" || slugs[0] == "all")) {
+			slugs = corruptedSlugs(root)
+			if len(slugs) == 0 {
+				fmt.Println("无被压缩占位符污染的概念页,无需修复。")
+				return 0
+			}
+			fmt.Printf("检测到 %d 个被污染的概念页,开始重建…\n", len(slugs))
+		}
+		failed := 0
+		for _, slug := range slugs {
+			slug = strings.TrimSuffix(slug, ".md")
+			conceptPage := filepath.Join("wiki", "concepts", slug+".md")
+			code, _ := runRole(root, cfg, "repair", repairInput(root, slug), conceptPage)
+			if code == 0 {
+				if strings.Contains(wiki.Read(filepath.Join(root, conceptPage)), wiki.CompactionMarker) {
+					fmt.Printf("RESULT_FAIL: %s (占位符仍存在)\n", slug)
+					failed++
+					continue
+				}
+				fmt.Printf("RESULT_OK: %s\n", slug)
+			} else {
+				fmt.Printf("RESULT_FAIL: %s\n", slug)
+				failed++
+			}
+		}
+		if _, err := wiki.WriteIndex(root); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		fmt.Printf("REPAIR_DONE: %d 页失败\n", failed)
+		return 0
 	default:
 		// 兜底:把第一个参数当角色
 		if args[0] == "compiler" || args[0] == "qa" || args[0] == "query" {
@@ -493,6 +527,7 @@ func runRole(root string, cfg config.Config, role, input, rawFile string) (int, 
 	system := map[string]string{
 		"compiler": agents.CompilerPrompt,
 		"relink":   agents.RelinkPrompt,
+		"repair":   agents.RepairPrompt,
 		"query":    agents.QueryPrompt,
 		"qa":       agents.QAPrompt,
 	}[role]
@@ -520,6 +555,9 @@ func runRole(root string, cfg config.Config, role, input, rawFile string) (int, 
 	}
 	if role == "relink" && os.Getenv("KCP_MAX_STEPS") == "" {
 		steps = 30 // 回访不重读 raw 全文,固定预算即可;质量由 FinishGuard 闸门兜底
+	}
+	if role == "repair" && os.Getenv("KCP_MAX_STEPS") == "" {
+		steps = 20 // 概念页重建:读受损页 + 检索来源 + 读 1-2 个 source 页 + 整页重写,比编译轻
 	}
 
 	// describe_image 的视觉回调:type-assert provider 到 VisionProvider;非多模态则提示(Tier 2 vision)。
@@ -556,6 +594,13 @@ func runRole(root string, cfg config.Config, role, input, rawFile string) (int, 
 		dir := filepath.Join(root, ".kcp", "state")
 		_ = os.MkdirAll(dir, 0o755)
 		cfg.StateFile = filepath.Join(dir, "relink-"+slug+".json")
+	}
+	// repair 独立 checkpoint(repair-<slug>.json),不复用任何历史——修复会话是全新的,旧消息会误导。
+	if role == "repair" && rawFile != "" && cfg.StateFile != "" {
+		slug := strings.TrimSuffix(filepath.Base(rawFile), ".md")
+		dir := filepath.Join(root, ".kcp", "state")
+		_ = os.MkdirAll(dir, 0o755)
+		cfg.StateFile = filepath.Join(dir, "repair-"+slug+".json")
 	}
 
 	rt := &agent.Runtime{
@@ -685,6 +730,32 @@ func runRole(root string, cfg config.Config, role, input, rawFile string) (int, 
 		}
 		rt.MaxFinishPushes = 2
 	}
+	// repair 修复角色:目标概念页被压缩占位符污染,闸门 = ①占位符必须消失 ②有正文
+	// ③必备节(定义/关键方面)齐全 ④无重复节。占位符被机器拒绝写入,只能靠真实重建。
+	if role == "repair" && rawFile != "" {
+		slug := strings.TrimSuffix(filepath.Base(rawFile), ".md")
+		targetPage := filepath.Join(root, rawFile)
+		rt.FinishGuard = func(provider.Message) string {
+			text := wiki.Read(targetPage)
+			if text == "" {
+				return fmt.Sprintf("⚠️ 修复未完成:目标 wiki/%s.md 还不存在或不可读。你现在必须 write_file 重建它(frontmatter + 定义 + 关键方面 + 外部观点)。", rawFile)
+			}
+			if strings.Contains(text, wiki.CompactionMarker) {
+				return fmt.Sprintf("⚠️ 修复未完成:wiki/concepts/%s.md 仍含系统压缩占位符。占位符不是内容——write_file 整页重写为真实概念内容(从 source 页提取定义/关键方面/外部观点),禁止把占位符写回。", slug)
+			}
+			_, body := wiki.ParseFrontmatter(text)
+			for _, sec := range []string{"## 定义", "## 关键方面"} {
+				if !strings.Contains(body, sec) {
+					return fmt.Sprintf("⚠️ 修复未完成:wiki/concepts/%s.md 缺「%s」节。概念页 SCHEMA 要求 定义 + 关键方面 + 外部观点。", slug, sec)
+				}
+			}
+			if dup, err := wiki.DuplicateSections(targetPage); err == nil && len(dup) > 0 {
+				return fmt.Sprintf("⚠️ 修复未完成:%s 节标题重复(%s),结构损坏。read_file 读回全文,删除重复整节。", slug, strings.Join(dup, "、"))
+			}
+			return "" // 占位符消失 + 结构完整 = 修复完成
+		}
+		rt.MaxFinishPushes = 2
+	}
 	streamed := false
 	if cfg.Stream {
 		// 结构化事件流渲染:文本打 stdout(流式),工具调用/返回打 stderr(逐步可见)。
@@ -735,6 +806,23 @@ func idempotentRecompile(root, rawRel string, fi os.FileInfo, sourcePage string,
 		return false
 	}
 	return true
+}
+
+// corruptedSlugs 扫描 wiki 全部页,返回含系统压缩占位符(被污染)的 slug 列表。
+// 占位符 = 模型把系统历史压缩占位符当真实内容写入的产物,内容已丢失,必须重建。
+func corruptedSlugs(root string) []string {
+	var out []string
+	for _, p := range wiki.Pages(root) {
+		if strings.Contains(wiki.Read(p), wiki.CompactionMarker) {
+			out = append(out, strings.TrimSuffix(filepath.Base(p), ".md"))
+		}
+	}
+	return out
+}
+
+// repairInput 组装概念页修复任务输入:目标页 + 重建步骤(从已编译 source 页提取内容,不重读 raw)。
+func repairInput(root, slug string) string {
+	return fmt.Sprintf("目标概念页:wiki/concepts/%s.md 被系统压缩占位符污染,真实内容已丢失。重建它:\n1. read_file 读回受损页,保留幸存元数据(frontmatter 的 sources/confidence 等)\n2. search_wiki 找出讨论了该概念的已编译 source 页(概念页建页阈值 ≥2 源;不足则用唯一源、confidence 标 low)\n3. read_file 读相关 source 页对应章节,提取定义/关键方面/外部观点\n4. write_file 整页重建为合法概念页(frontmatter + ## 定义 + ## 关键方面 + ## 外部观点 + ## 例子 + ## 相关)\n绝不写占位符文本;来源引用用 [[wikilink]]。", slug)
 }
 
 // relinkInput 组装回访补强任务输入:目标页 + 任务边界 + 脚本预筛候选链接。

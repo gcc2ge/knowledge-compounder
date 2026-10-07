@@ -77,6 +77,41 @@ func TestHTMLToText(t *testing.T) {
 	}
 }
 
+// 压缩占位符闸门:write_file/edit_file 拒绝含 [系统已压缩省略…] 的内容——
+// 模型把系统历史压缩占位符当真实内容写入是污染源(实测 6 个概念页被整页覆盖),必须被工具拦下。
+func TestPlaceholderGateRejects(t *testing.T) {
+	root := t.TempDir()
+	toolList, _, _, _ := Build(root, nil, nil, retrieval.Options{})
+	var wf, ef func(map[string]any) string
+	for _, td := range toolList {
+		switch td.Name {
+		case "write_file":
+			wf = td.Func
+		case "edit_file":
+			ef = td.Func
+		}
+	}
+	ph := "[系统已压缩省略 2245 字符——你实际写入的是完整内容,如需查看请 read_file 读回文件当前状态]"
+	// write_file 整页写占位符 → 拒绝,且不落盘
+	if got := wf(map[string]any{"path": "wiki/concepts/RRF.md", "content": ph}); !strings.Contains(got, "拒绝") {
+		t.Fatalf("write_file 写占位符应被拒,得 %s", got)
+	}
+	if _, err := os.Stat(filepath.Join(root, "wiki/concepts/RRF.md")); err == nil {
+		t.Fatal("被拒的 write_file 不应创建文件")
+	}
+	// 正常内容不受影响
+	if got := wf(map[string]any{"path": "wiki/concepts/RRF.md", "content": "## 定义\n真实内容。\n"}); !strings.Contains(got, "已写入") {
+		t.Fatalf("正常 write_file 应放行,得 %s", got)
+	}
+	// edit_file 锚点含占位符 / 新内容含占位符 → 拒绝
+	if got := ef(map[string]any{"path": "wiki/concepts/RRF.md", "old_string": "真实内容。", "new_string": "真实内容。\n" + ph}); !strings.Contains(got, "拒绝") {
+		t.Fatalf("edit_file 新内容含占位符应被拒,得 %s", got)
+	}
+	if got := ef(map[string]any{"path": "wiki/concepts/RRF.md", "old_string": ph, "new_string": "X"}); !strings.Contains(got, "拒绝") {
+		t.Fatalf("edit_file 锚点含占位符应被拒,得 %s", got)
+	}
+}
+
 // TestEditFile edit_file 增量补写语义:唯一锚点替换、未找到/不唯一不改、截断拒绝、白名单外拒绝。
 func TestEditFile(t *testing.T) {
 	root := t.TempDir()

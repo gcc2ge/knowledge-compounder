@@ -295,6 +295,12 @@ func Build(root string, ask func(string) string, vision func(string) string, opt
 				if path == "" {
 					return "拒绝:未收到 path 参数(工具参数解析失败)。write_file 必须以 JSON 传 path(如 wiki/sources/xxx.md)与 content;content 内的换行要转义为 \\n、引号要转义为 \\\"。"
 				}
+				// 压缩占位符闸门:模型把系统历史压缩占位符([系统已压缩省略…])当真实内容写入——
+				// 这是「把历史占位符抄回文件」的污染源(实测 6 个概念页被整页覆盖)。占位符
+				// 不是内容,写入前必须 read_file 读回真实内容(或从源页重建)。代码验收,不靠模型自觉。
+				if strings.Contains(content, wiki.CompactionMarker) {
+					return "拒绝:content 是系统历史压缩占位符([系统已压缩省略…]),不是真实页面内容——禁止把占位符当作内容写入。read_file 读回该页真实内容(若已损坏,从对应 raw/源页重建),再基于真实内容 write_file / edit_file。"
+				}
 				fp, ok := safeJoin(root, path, "wiki", "examples")
 				if !ok {
 					return fmt.Sprintf("拒绝:只允许写 wiki/ examples/(raw/ 不可变,禁止写入),收到 %s", path)
@@ -337,6 +343,11 @@ func Build(root string, ask func(string) string, vision func(string) string, opt
 						return "拒绝:你这次只传了 new_string,丢了 path 与 old_string——无法定位要替换的位置。edit_file 三参必填,JSON 键顺序固定为 path → old_string → new_string(new_string 是新增内容,放最后);对象必须以 } 收尾。请按此顺序重发。"
 					}
 					return "拒绝:path 与 old_string 必填。old_string 必须是当前文件里的唯一原文锚点(先 read_file 读回确认),new_string 为替换内容。"
+				}
+				// 压缩占位符闸门:锚点或新内容含系统压缩占位符 = 模型把历史占位符当真实内容
+				// (或拿占位符当锚点定位)。占位符不是内容,先 read_file 读回真实内容再编辑。
+				if strings.Contains(old, wiki.CompactionMarker) || strings.Contains(new, wiki.CompactionMarker) {
+					return "拒绝:old_string/new_string 含系统历史压缩占位符([系统已压缩省略…]),不是真实页面内容——禁止编辑占位符文本。read_file 读回该页真实内容(若已损坏,从对应 raw/源页重建)后,再基于真实内容编辑。"
 				}
 				fp, ok := safeJoin(root, path, "wiki", "examples")
 				if !ok {

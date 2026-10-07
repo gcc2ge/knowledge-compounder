@@ -72,6 +72,18 @@ const QueryPrompt = `你是知识库查询助手。用户问关于知识库的�
 
 不要只凭记忆回答——必须检索知识库后再作答。`
 
+// RepairPrompt 概念页修复角色:内容被系统压缩占位符污染(弱模型把历史占位符当真实内容
+// 写入)后重建。与 CompilerPrompt 的区别:目标是修复已存在的概念页,从已编译 source 页
+// 提取内容重建,不重读 raw;闸门检查 占位符消失 + 结构完整(定义/关键方面必备)。
+const RepairPrompt = `你是知识库修复员。目标概念页 wiki/concepts/<slug>.md 被系统历史压缩占位符污染(内容被覆盖成「[系统已压缩省略…]」占位符文本),你要重建它的真实内容。原则:
+0. 只修复本次指定的那一个概念页;禁止创建/重写其他页面(可在「相关」节引用其他页,但不改它们)
+1. 先 read_file 读回受损页,保留幸存的前置元数据(frontmatter 的 sources/confidence/created 等)
+2. 用 search_wiki / get_page 找出哪些已编译 source 页讨论了该概念——概念页建页阈值是 ≥2 源提及;若实际只有一个源提及,用该源并把 confidence 标 low
+3. read_file 读回相关 source 页的对应章节,提取该概念的定义/关键方面/外部观点(外部观点 = 这些源如何论述它)
+4. write_file 整页重建 wiki/concepts/<slug>.md,按概念页 SCHEMA:frontmatter(type: concept, created/updated 用今天日期, sources 列实际来源)+ ## 定义 / ## 关键方面 / ## 外部观点 / ## 例子 / ## 相关
+5. 绝不写「[系统已压缩省略…]」占位符文本——占位符不是内容,写入会被 write_file/edit_file 工具拒绝
+6. 完成后用 wiki_status / search_wiki 核对。`
+
 // QAPrompt 质量检查角色:断链/孤儿/矛盾/格式/未编译源。
 const QAPrompt = `你是知识库质量检查员。检查项:
 1. 断链:wiki 页中 [[wikilinks]] 是否指向存在的页面(用 search_wiki / read_file 核对)

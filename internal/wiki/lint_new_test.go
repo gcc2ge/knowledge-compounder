@@ -1,10 +1,46 @@
 package wiki
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+// 压缩占位符污染检测:页面内容被系统历史压缩占位符覆盖 → Corrupted 标出。
+func TestLintDetectsPlaceholderCorruption(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "wiki", "concepts")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// 被污染页:整页只有占位符
+	os.WriteFile(filepath.Join(dir, "RRF.md"),
+		[]byte("[系统已压缩省略 2245 字符——你实际写入的是完整内容,如需查看请 read_file 读回文件当前状态]"), 0o644)
+	// 干净页:正常内容
+	os.WriteFile(filepath.Join(dir, "好页.md"),
+		[]byte("---\ntype: concept\n---\n# 好页\n## 定义\n正常内容。"), 0o644)
+
+	res := Lint(root)
+	if len(res.Corrupted) != 1 || res.Corrupted[0] != "RRF.md" {
+		t.Fatalf("应标出 RRF.md 被污染,得 %v", res.Corrupted)
+	}
+}
+
+// 正常页面(无占位符)不误报。
+func TestLintNoPlaceholderFalsePositive(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "wiki", "sources")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(dir, "M.md"),
+		[]byte("---\norigin: external\ntype: source\n---\n# M\n## 一句话结论\n正常。\n## 疑点\n无。"), 0o644)
+	if res := Lint(root); len(res.Corrupted) != 0 {
+		t.Fatalf("正常页不应标污染,得 %v", res.Corrupted)
+	}
+}
+
 
 // 意外发现节只有原文复述、无联想信号 → 标弱(私有 edge 缺失的提示)。
 func TestSurpriseWeak_FiresOnRestatement(t *testing.T) {
