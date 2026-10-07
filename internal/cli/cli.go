@@ -736,9 +736,9 @@ func relinkInput(root, slug string, cands []wiki.Candidate) string {
 	linkLine := ""
 	if len(cands) > 0 {
 		var b strings.Builder
-		b.WriteString("\n【脚本预筛的候选链接(确定性第一拍,仅供参考)——逐一判断是否相关:相关的补进「连接」节并写关联意义,不相关的忽略;页内已链的不用重复】\n")
+		b.WriteString("\n【脚本预筛的候选链接(确定性第一拍,附摘要首句)——逐一判断是否相关:相关的补进「连接」节并写关联意义,不相关的忽略;页内已链的不用重复。摘要足以判断关联性,不必对每个候选 get_page 核实】\n")
 		for i, c := range cands {
-			b.WriteString(fmt.Sprintf("  %d. [[%s]] — %s (%s, score=%d)\n", i+1, c.Slug, c.Title, c.Type, c.Score))
+			b.WriteString(fmt.Sprintf("  %d. [[%s]] — %s (%s, score=%d)\n     摘要: %s\n", i+1, c.Slug, c.Title, c.Type, c.Score, c.Summary))
 		}
 		linkLine = b.String()
 	}

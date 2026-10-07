@@ -116,3 +116,30 @@ func TestRepeatNilDetector(t *testing.T) {
 		}
 	}
 }
+
+// panic 回归:offset 落在文件最后 repeatWindow-1 行内(行窗不足,lastStart < offset)时,
+// compact 的 make([]bool, 负数) 会 makeslice panic——小文件/逼近文件尾的读必炸。
+func TestRepeatCompactNoPanicNearEnd(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "raw", "tiny.md")
+	os.MkdirAll(filepath.Dir(p), 0o755)
+	// 仅 5 行的小文件:offset=4(倒数第 2 行)时 end-offset+1=2 < repeatWindow=4
+	os.WriteFile(p, []byte("第1行\n第2行\n第3行\n第4行\n第5行\n"), 0o644)
+	rep := &RepeatDetector{}
+	got := readPaged(dir, "raw/tiny.md", 4, 5, rep) // 曾 panic: makeslice: len out of range
+	if !strings.Contains(got, "第4行") || !strings.Contains(got, "第5行") {
+		t.Fatalf("末尾行应原样返回,得:\n%s", got)
+	}
+}
+
+// panic 回归二:小文件(行数 < repeatWindow)任意 offset 读——限行窗口永远不足。
+func TestRepeatCompactNoPanicTinyFile(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "raw", "two.md")
+	os.MkdirAll(filepath.Dir(p), 0o755)
+	os.WriteFile(p, []byte("只有两行\n第二行\n"), 0o644)
+	rep := &RepeatDetector{}
+	if got := readPaged(dir, "raw/two.md", 1, 10, rep); !strings.Contains(got, "第二行") {
+		t.Fatalf("小文件整读应原样返回,得:\n%s", got)
+	}
+}

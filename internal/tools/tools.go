@@ -585,8 +585,11 @@ func readPaged(root, path string, offset, limit int, rep *RepeatDetector) string
 	}
 
 	// 重复段检测(切片 B):把 [offset,end] 切成输出段,重复段用标记省略。
+	// 行窗不足 repeatWindow(重复检测要求至少 4 行构成窗口)时跳过检测——
+	// 否则 compact 里 lastStart = end-4+1 < offset 会让 make([]bool, 负数) panic
+	// (makeslice: len out of range),小文件/offset 靠近文件尾时必炸。
 	segs := []outSeg{{offset, end, 0}}
-	if rep != nil {
+	if rep != nil && end-offset+1 >= repeatWindow {
 		segs = rep.compact(path, lines, offset, end)
 	}
 

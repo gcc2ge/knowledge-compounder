@@ -21,11 +21,14 @@ type PageInfo struct {
 }
 
 // Candidate 候选链接(score 降序,score 高 = 更可能是本页该链的页)。
+// Summary 带内容摘要首句——注入 relink 输入后,模型不必逐个 get_page 核实候选,
+// 直接判断关联性(每候选省 1-2 个 LLM 往返)。
 type Candidate struct {
-	Slug  string
-	Title string
-	Type  string
-	Score int
+	Slug    string
+	Title   string
+	Type    string
+	Score   int
+	Summary string
 }
 
 var (
@@ -109,7 +112,15 @@ func SuggestLinks(text, selfSlug string, reg []PageInfo, maxN int) []Candidate {
 			}
 		}
 		if score > 0 {
-			cands = append(cands, Candidate{Slug: page.Slug, Title: page.Title, Type: page.Type, Score: score})
+			c := Candidate{Slug: page.Slug, Title: page.Title, Type: page.Type, Score: score}
+			if s := page.Summary; s != "" {
+				if r := []rune(s); len(r) > 90 {
+					c.Summary = string(r[:90]) + "…"
+				} else {
+					c.Summary = s
+				}
+			}
+			cands = append(cands, c)
 		}
 	}
 	sort.Slice(cands, func(i, j int) bool {

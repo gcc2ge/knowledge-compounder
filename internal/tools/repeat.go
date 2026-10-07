@@ -47,7 +47,11 @@ func (d *RepeatDetector) compact(path string, lines []string, offset, end int) [
 	}
 
 	// 第一遍:登记 + 标记命中的窗口(首次出现早于当前行 = 与已读内容重复)。
+	// 防御:end 行数不足以构成 repeatWindow 窗口时,无窗口可检测,原样返回整段。
 	lastStart := end - repeatWindow + 1
+	if lastStart < offset {
+		return []outSeg{{offset, end, 0}}
+	}
 	matched := make([]bool, lastStart-offset+1)
 	for i := offset; i <= lastStart; i++ {
 		h := windowHash(lines, i)
