@@ -176,6 +176,55 @@ type judgeScores struct {
 	Rationale string                    `json:"rationale"`
 }
 
+// dimAliases 判官输出维度键的别名归一。实测判官中英混用(connection_value /
+// synthesis_density / comprehensive_density 等英文变体与规范中文并存),而跨轮
+// 复利 Δ 按精确 key 匹配——键漂移会让 beforeTotal 少算、Δ 被系统性高估。
+// 统一映射回规范维度后,基线快照和 Δ 才跨轮可比。
+var dimAliases = map[string]string{
+	"connection_value":      "连接价值",
+	"connection":            "连接价值",
+	"connections":           "连接价值",
+	"synthesis_density":     "综合密度",
+	"comprehensive_density": "综合密度",
+	"comprehensiveness":     "综合密度",
+	"synthesis":             "综合密度",
+	"argument_completeness": "论证完整性",
+	"argumentation":         "论证完整性",
+	"argument":              "论证完整性",
+	"argumentation_quality": "论证完整性",
+	"completeness":          "论证完整性",
+	"contradiction_marking": "矛盾标注",
+	"contradiction":         "矛盾标注",
+	"contradictions":        "矛盾标注",
+	"contradiction_detection": "矛盾标注",
+	"transferability":       "可迁移性",
+	"migratability":         "可迁移性",
+	"generalizability":      "可迁移性",
+	"portability":           "可迁移性",
+	"retrieval_relevance":   "检索相关度",
+	"evidence_coverage":     "证据覆盖",
+	"evidence_fidelity":     "证据忠实",
+}
+
+// normalizeDimKeys 把所有维度键归一到规范名(小写查别名;未收录的键原样保留,不吞数据)。
+func normalizeDimKeys(scores map[string]map[string]int) map[string]map[string]int {
+	if scores == nil {
+		return scores
+	}
+	for mode, dims := range scores {
+		norm := make(map[string]int, len(dims))
+		for k, v := range dims {
+			canon := dimAliases[strings.ToLower(k)]
+			if canon == "" {
+				canon = k
+			}
+			norm[canon] = v
+		}
+		scores[mode] = norm
+	}
+	return scores
+}
+
 // rubricDesc 维度 → 打分说明(seed 自定义维度无说明时用通用描述)。
 var rubricDesc = map[string]string{
 	"论证完整性": "证据链是否完整、每步有依据",
@@ -208,7 +257,7 @@ func buildJudgePrompt(rubric []string) string {
 方案B(编译复利)答案:
 %%s
 
-只输出 JSON(不要 markdown 围栏,不要其他文字):
+只输出 JSON(不要 markdown 围栏,不要其他文字),且 scores 的维度键必须原样使用上面列出的名称(不要翻译成英文或改写):
 {"scores":{"rag":{...},"wiki":{...}},"verdict":"B更优|A更优|持平","rationale":"一句话理由"}`,
 		len(rubric), dims.String())
 }
@@ -238,6 +287,7 @@ func Judge(ctx context.Context, p provider.Provider, seed Seed, ragAns, wikiAns 
 	if err := json.Unmarshal([]byte(text), &out); err != nil {
 		return judgeScores{}, fmt.Errorf("评审 JSON 解析失败: %v\n原文: %.200s", err, msg.Content)
 	}
+	out.Scores = normalizeDimKeys(out.Scores)
 	return out, nil
 }
 
@@ -313,6 +363,7 @@ func parseTrajJSON(text string) (trajScores, error) {
 	if err := json.Unmarshal([]byte(text), &out); err != nil {
 		return trajScores{}, fmt.Errorf("轨迹评审 JSON 解析失败: %v\n原文: %.200s", err, text)
 	}
+	out.Scores = normalizeDimKeys(out.Scores)
 	return out, nil
 }
 
@@ -388,23 +439,32 @@ func RunCompare(root string, cfg config.Config, seeds []Seed, rebaseline bool) (
 
 	var cases []CaseResult
 	for _, s := range seeds {
-		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		// 逐调用超时:慢 provider 下 4 次 LLM 调用(答题×2+判官×2)挤不进单种子硬窗口
+		// (实测首轮 gc2 在第 4 次调用跑爆 90s deadline)。每次调用独立 ctx,
+		// 超时用 cfg.EvalTimeout(默认 90s/次),单次慢调用不拖累整个种子。
+		newCtx := func() (context.Context, context.CancelFunc) {
+			return context.WithTimeout(context.Background(), time.Duration(cfg.EvalTimeout)*time.Second)
+		}
+		ctx, cancel := newCtx()
 		ragAns, ragTrace, err := Answer(ctx, p, rawDocs, s.Question, opts, cfg.RetrieveK)
+		cancel()
 		if err != nil {
-			cancel()
 			return "", fmt.Errorf("RAG 答题失败 [%s]: %w", s.ID, err)
 		}
+		ctx, cancel = newCtx()
 		wikiAns, wikiTrace, err := Answer(ctx, p, wikiDocs, s.Question, opts, cfg.RetrieveK)
+		cancel()
 		if err != nil {
-			cancel()
 			return "", fmt.Errorf("WIKI 答题失败 [%s]: %w", s.ID, err)
 		}
+		ctx, cancel = newCtx()
 		j, err := Judge(ctx, p, s, ragAns, wikiAns)
+		cancel()
 		if err != nil {
-			cancel()
 			return "", fmt.Errorf("评审失败 [%s]: %w", s.ID, err)
 		}
 		// M10 轨迹判官:评价检索过程质量,捕捉「对的答案、错的过程」。
+		ctx, cancel = newCtx()
 		tj, err := JudgeTrajectory(ctx, p, s, ragTrace, wikiTrace, ragAns, wikiAns)
 		cancel()
 		if err != nil {

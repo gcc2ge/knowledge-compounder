@@ -26,6 +26,7 @@ type Config struct {
 	EmbedBaseURL    string
 	EmbedAPIKey     string
 	RetrieveK       int // search_wiki / kcp search 返回条数
+	EvalTimeout     int // 评估单次 LLM 调用超时(秒);答题×2+判官×2 各占独立窗口
 }
 
 func Load() Config {
@@ -49,6 +50,7 @@ func Load() Config {
 		EmbedBaseURL:    getenv("KCP_EMBED_BASE_URL", os.Getenv("KCP_BASE_URL")),
 		EmbedAPIKey:     getenv("KCP_EMBED_API_KEY", os.Getenv("KCP_API_KEY")),
 		RetrieveK:       getenvInt("KCP_RETRIEVE_K", 5),
+		EvalTimeout:     getenvInt("KCP_EVAL_TIMEOUT", 90),
 	}
 }
 
