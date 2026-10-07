@@ -34,6 +34,13 @@ type Runtime struct {
 	Compaction      CompactionPolicy // 上下文治理(M09);零值 = 关闭
 	CheckpointEvery int              // 写 checkpoint 的步频;0 = 默认每 3 步
 
+	// NoResume:true 时忽略磁盘 checkpoint,从空白历史开始且不再写 checkpoint。
+	// 用于 relink/repair 这类「幂等、有界」的补强/修复会话——旧 checkpoint 里装着上次
+	// 撞循环/卡死的对话,续跑会把模型重新拖进同一循环(get_page/read_file 大源页截断
+	// →同参重试→原地打转,实测)。会话重启的收益 < 毒化历史的风险,干脆无状态。
+	// compile 保留续跑(长任务、单轮可能撞预算,断点续跑收益大)。
+	NoResume bool
+
 	// FinishGuard:可选。模型给出最终答复(无工具调用)时,若返回非空消息,视为任务未完成,
 	// 注入该消息强制续跑(compiler 落盘兜底:防弱模型「读而不写」直接退出,glm 实测连读 13 页零落盘)。
 	// MaxFinishPushes 限制续跑次数(0 = 关闭)。
@@ -56,8 +63,13 @@ type Runtime struct {
 // Run 执行一次 agent 任务:LLM 决策 → 执行工具 → 观察回填 → 再决策,直到无工具调用或达到停止条件。
 // StateFile 存在时从中恢复消息(断点续跑);否则从 system+input 初始化。
 func (r *Runtime) Run(ctx context.Context, input, state string) (string, error) {
-	// 断点续跑:恢复消息与累计 usage(MaxTokens 预算不归零)
-	msgs, savedUsage := r.loadCheckpoint()
+	// 断点续跑:恢复消息与累计 usage(MaxTokens 预算不归零)。
+	// NoResume 角色(relink/repair)不续跑——旧 checkpoint 是毒化历史,从空白开始。
+	var msgs []provider.Message
+	var savedUsage *provider.Usage
+	if !r.NoResume {
+		msgs, savedUsage = r.loadCheckpoint()
+	}
 	r.usage = savedUsage
 	if len(msgs) == 0 {
 		r.usage = nil
@@ -241,8 +253,8 @@ type checkpoint struct {
 
 // saveCheckpoint 持久化当前消息序列与累计消耗(可审计/可恢复)。
 func (r *Runtime) saveCheckpoint(msgs []provider.Message) error {
-	if r.StateFile == "" {
-		return nil
+	if r.StateFile == "" || r.NoResume {
+		return nil // NoResume 角色:不写 checkpoint,避免残留文件误导后续会话
 	}
 	b, err := json.Marshal(checkpoint{Messages: msgs, Usage: r.usage})
 	if err != nil {
@@ -449,6 +461,7 @@ func compactWriteArgs(arguments string) string {
 //   - 字符串内未转义的 " → 依据后随字符判定「真实终结符 vs 内容引号」:
 //     后随 , } ] 或 EOF 且为「键闭合」语境 → 终结;后随内容字符 → 转义为 \"
 //   - 键语境:短字段(键)的收尾 " 后随 : → 终结(键闭合)
+//
 // 修复后重新解析;仍失败返回 nil(由工具拒绝兜底,错误信息更清晰)。
 func repairToolArgs(raw string) map[string]any {
 	rs := []rune(raw)

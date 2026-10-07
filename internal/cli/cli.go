@@ -618,6 +618,9 @@ func runRole(root string, cfg config.Config, role, input, rawFile string) (int, 
 			MaxTokens:  cfg.CompactTokens,
 			KeepRounds: cfg.KeepRounds,
 		},
+		// relink/repair 是幂等有界会话:不续跑旧 checkpoint(毒化历史会把模型拖回上次的循环),
+		// 也不写新 checkpoint(无状态,避免残留误导)。compile 保留续跑。
+		NoResume: role == "relink" || role == "repair",
 	}
 	// 落盘兜底(切片 B):compiler 给出最终答复但目标源页未落盘时,强制注入续跑要求 write_file。
 	// 实测 glm-4.5-air 对长源反复「读 2-3 页→输出总结→放弃工具循环」,事后报告不够,要堵在退出前。

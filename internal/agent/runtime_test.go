@@ -2,6 +2,9 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -208,9 +211,9 @@ func TestExecToolSetsTruncatedFlag(t *testing.T) {
 	}}
 	var sawTruncated bool
 	rt := &Runtime{
-		Provider:     fp,
-		SystemPrompt: "你是编译器",
-		MaxSteps:     10,
+		Provider:      fp,
+		SystemPrompt:  "你是编译器",
+		MaxSteps:      10,
 		MaxSameAction: 100,
 		Tools: []provider.ToolDef{{
 			Name: "edit_file",
@@ -239,9 +242,9 @@ func TestExecToolNoFalseTruncatedFlag(t *testing.T) {
 	}}
 	var sawTruncated bool
 	rt := &Runtime{
-		Provider:     fp,
-		SystemPrompt: "你是编译器",
-		MaxSteps:     10,
+		Provider:      fp,
+		SystemPrompt:  "你是编译器",
+		MaxSteps:      10,
 		MaxSameAction: 100,
 		Tools: []provider.ToolDef{{
 			Name: "edit_file",
@@ -269,9 +272,9 @@ func TestExecToolTruncatedEvenWhenRepairFails(t *testing.T) {
 	}}
 	var sawTruncated bool
 	rt := &Runtime{
-		Provider:     fp,
-		SystemPrompt: "你是编译器",
-		MaxSteps:     10,
+		Provider:      fp,
+		SystemPrompt:  "你是编译器",
+		MaxSteps:      10,
 		MaxSameAction: 100,
 		Tools: []provider.ToolDef{{
 			Name: "edit_file",
@@ -383,5 +386,79 @@ func TestSameActionDetectsWriteFileLoop(t *testing.T) {
 	}
 	if fp.i != 3 {
 		t.Fatalf("应在第 4 次 write_file 停止(同 path 计数=4>3),得调用 %d 次", fp.i+1)
+	}
+}
+
+// ---- 断点续跑控制(NoResume)----
+
+// NoResume=true:忽略磁盘 checkpoint(旧会话残留可能是撞循环的毒化历史),从新输入开始;
+// 且不改写 checkpoint 文件。
+func TestNoResumeIgnoresCheckpoint(t *testing.T) {
+	fp := &scriptedProvider{replies: []provider.Message{
+		{Role: "assistant", Content: "完成"},
+	}}
+	state := filepath.Join(t.TempDir(), "cp.json")
+	old := checkpoint{Messages: []provider.Message{
+		{Role: "system", Content: "旧系统提示"},
+		{Role: "user", Content: "旧会话残留(可能含循环轨迹)"},
+	}}
+	b, _ := json.Marshal(old)
+	os.WriteFile(state, b, 0o644)
+
+	rt := &Runtime{
+		Provider:     fp,
+		SystemPrompt: "新系统提示",
+		MaxSteps:     5,
+		StateFile:    state,
+		NoResume:     true,
+	}
+	if _, err := rt.Run(context.Background(), "新任务", ""); err != nil {
+		t.Fatal(err)
+	}
+	got := ""
+	for _, m := range fp.lastMsgs {
+		got += m.Role + ":" + m.Content + "\n"
+	}
+	if strings.Contains(got, "旧会话残留") {
+		t.Fatalf("NoResume 不应加载旧 checkpoint,得:\n%s", got)
+	}
+	if !strings.Contains(got, "新任务") {
+		t.Fatalf("应从新输入开始,得:\n%s", got)
+	}
+	// 不写 checkpoint:预置文件保持原样(未覆盖成新会话)
+	b2, err := os.ReadFile(state)
+	if err != nil || !strings.Contains(string(b2), "旧会话残留") {
+		t.Fatalf("NoResume 不应改写 checkpoint 文件")
+	}
+}
+
+// 对照:NoResume=false(默认)→ 正常续跑,旧 checkpoint 被加载。
+func TestResumeLoadsCheckpointByDefault(t *testing.T) {
+	fp := &scriptedProvider{replies: []provider.Message{
+		{Role: "assistant", Content: "完成"},
+	}}
+	state := filepath.Join(t.TempDir(), "cp.json")
+	old := checkpoint{Messages: []provider.Message{
+		{Role: "system", Content: "旧系统提示"},
+		{Role: "user", Content: "旧会话残留"},
+	}}
+	b, _ := json.Marshal(old)
+	os.WriteFile(state, b, 0o644)
+
+	rt := &Runtime{
+		Provider:     fp,
+		SystemPrompt: "新系统提示",
+		MaxSteps:     5,
+		StateFile:    state,
+	}
+	if _, err := rt.Run(context.Background(), "新任务", ""); err != nil {
+		t.Fatal(err)
+	}
+	got := ""
+	for _, m := range fp.lastMsgs {
+		got += m.Role + ":" + m.Content + "\n"
+	}
+	if !strings.Contains(got, "旧会话残留") {
+		t.Fatalf("默认应续跑旧 checkpoint,得:\n%s", got)
 	}
 }
