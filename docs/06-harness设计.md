@@ -1,6 +1,8 @@
 # Harness 设计:全 Go 自研 agent,任意 LLM 可跑
 
 > 目标:knowledge-compounder **不再通过 Claude Code 执行**——整个项目用 Go 实现自研 agent 运行时,同一套方法论(SCHEMA)在 OpenAI 兼容 / Anthropic 等任意模型下跑。方法论(SCHEMA.md)不变,执行层完全自持。
+>
+> 本文是自研 agent 架构的完整详述;它在整个系统里的位置(支柱 A 的 compiler)见 `02-运行原理.md`。
 
 ## 为什么自研(全 Go)
 
