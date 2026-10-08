@@ -170,7 +170,7 @@ KCP 编译之后,不只是把代码存起来,而是形成**一个可以直接被
 
 技术说明:KCP 的检索层本身使用 **BM25 + Vector 混合检索**——但这里有一个关键区别:**RAG 是检索层,知识编译才是 KCP 的核心价值。**
 
-> 📊 值不值得,用数据说话。`kcp eval` 提供可复现的对照实验(实测编译复利 vs 原文 RAG:**+1.1 均分**,综合/迁移类问题差距最大)。等测试集更完整、可复现后,这里会放一份独立的 benchmark 章节。详见 `docs/03-与RAG的区别.md`。
+> 📊 值不值得,用数据说话。`kcp eval` 提供可复现的对照实验(最新跑分:deepseek-v4-flash / 9 seeds)——编译复利 vs 原文 RAG:**可迁移性 +1.2、均分 +0.3**;综合密度与连接价值目前持平,增益集中在「把结论迁移到新问题」上。等测试集更完整、可复现后,这里会放一份独立的 benchmark 章节。详见 `docs/03-与RAG的区别.md`。
 
 ## 给 AI 一个「长期员工」:通过 MCP 接入
 
@@ -178,17 +178,19 @@ KCP 可以通过 MCP 接入其他 Agent:
 
 ```mermaid
 graph LR
-    KCP["Knowledge Compounder"] --> MCP["MCP Server<br/>search_wiki · get_page · synthesize_for"]
+    KCP["Knowledge Compounder"] --> MCP["MCP Server<br/>核心:search_wiki · get_page · synthesize_for"]
     MCP --> CC["Claude Code"] --> W1["写代码"]
     MCP --> CX["Codex"] --> W2["写代码"]
     MCP --> CA["Custom Agent"] --> W3["做研究"]
 ```
 
-Agent 不需要知道你的整个知识库。它只需要三个工具:
+Agent 不需要知道你的整个知识库。对大多数场景,掌握这三个核心工具就够了:
 
 - `search_wiki` —— 混合检索(词法 + 语义),返回标题 + 私有度徽标 + 命中分 + 摘要
 - `get_page` —— 深读一个知识页
 - `synthesize_for` —— 检索 + LLM 综合成带引用的答案
+
+MCP server 还注册了 `wiki_mentions` / `backlinks` / `get_related` / `list_recent` / `capture_note`(共 8 个工具),需要时按名调用。
 
 然后就可以获得:**过去的架构决策、私有工程规范、历史踩坑、研究结论、交易复盘、项目背景、已验证方案、不应该再尝试的方案。**
 
@@ -283,7 +285,7 @@ clone 之后立刻就能看到真实输出(知识库状态、检索结果、相�
 
 ```bash
 $ KCP_RETRIEVE_K=1 ./kcp search "go channel 泄漏"
-检索「go channel 泄漏」: 1 条(索引=on(1 页))
+检索「go channel 泄漏」: 1 条(嵌入=已启用, 缓存=…/.kcp-embed-cache.json, 索引=on(1 页))
 - [[go-channel-三铁律]] [C]私有 融合0.72 词法1.00 语义0.37: Go channel 的 goroutine 泄漏源于"发送阻塞而接收方已退出";三铁律——谁创建谁关闭、发送时监听取消、错误与结果同通道——配合 `defer close`,系统性地消除泄漏。
 ```
 
