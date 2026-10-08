@@ -182,7 +182,7 @@ func (s *Server) wikiMentions(a map[string]any) string {
 }
 
 func (s *Server) backlinks(a map[string]any) string {
-	slug, text, _, ok := s.pageArg(a)
+	slug := strings.TrimSuffix(strArg(a, "page"), ".md")
 	if slug == "" {
 		return "参数 page 必填。"
 	}
@@ -210,6 +210,8 @@ func (s *Server) backlinks(a map[string]any) string {
 		}
 		return b.String()
 	}
+	// 页面内容仅在降级(无索引)路径需要;索引路径已按 slug 返回,无需查盘。
+	_, text, _, ok := s.pageArg(a)
 	if !ok {
 		return fmt.Sprintf("页面 [[%s]] 不存在。", slug)
 	}
