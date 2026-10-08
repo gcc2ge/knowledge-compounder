@@ -47,7 +47,7 @@ const usage = `kcp — 知识编译复利引擎(自研 agent,任意 LLM)
   kcp check-sources                   检查概念/实体页 sources 是否被错误替换(git)
   kcp search "<查询>"                混合检索诊断(词法+向量,零 LLM,带私有度徽标)
   kcp eval [--seeds <文件>] [--k <n>] [--rebaseline] RAG-vs-编译复利对照实验(Agent-as-a-Judge 打分;--rebaseline 与上次基线比「wiki 复利 Δ」)
-  kcp mcp                      MCP stdio server(支柱 B:wiki 暴露为 5 个工具,喂 coding/trading agents)
+  kcp mcp                      MCP stdio server(支柱 B:wiki 暴露为 8 个工具,喂 coding/trading agents)
   kcp <role> "<输入>"           直接跑一个角色(compiler/qa/query)
   kcp list                      列出角色
 

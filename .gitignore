@@ -4,6 +4,8 @@ raw/*
 !raw/.gitkeep
 wiki/*
 !wiki/.gitkeep
+# .wiki 同为本机私有知识目录,不进开源仓库
+.wiki/
 wiki/health/*
 !wiki/health/.gitkeep
 
