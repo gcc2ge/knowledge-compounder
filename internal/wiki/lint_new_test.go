@@ -41,7 +41,6 @@ func TestLintNoPlaceholderFalsePositive(t *testing.T) {
 	}
 }
 
-
 // 意外发现节只有原文复述、无联想信号 → 标弱(私有 edge 缺失的提示)。
 func TestSurpriseWeak_FiresOnRestatement(t *testing.T) {
 	root := t.TempDir()

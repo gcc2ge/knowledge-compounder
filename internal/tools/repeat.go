@@ -7,10 +7,7 @@
 // 短重复(< minRepeatRun 行)视为正常内容原样返回,防误杀惯用代码块/惯用短语。
 package tools
 
-import (
-	"hash/fnv"
-	"path/filepath"
-)
+import "hash/fnv"
 
 const (
 	repeatWindow  = 4 // 行窗口宽度(哈希粒度)
@@ -109,9 +106,4 @@ func windowHash(lines []string, line int) uint64 {
 		h.Write([]byte{0})
 	}
 	return h.Sum64()
-}
-
-// clean 清理一次性路径的台账(测试/小文件不需要;留空则由 GC 兜底)。
-func (d *RepeatDetector) forget(path string) {
-	delete(d.files, filepath.Clean(path))
 }

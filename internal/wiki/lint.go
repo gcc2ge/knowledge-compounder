@@ -31,6 +31,16 @@ type LintResult struct {
 	Counts         struct{ Pages, BrokenLinks int }
 }
 
+// contradictionMarkers 矛盾标注的信号词:页面含任一即列入工审核(SCHEMA:只把 CONTRADICTION/矛盾声明列为审核)。
+// update.ApplyEvidence 落冲突标注时也用同一组词判断「证据打架」。
+var contradictionMarkers = []string{"CONTRADICTION", "⚠️ 矛盾", "⚠️ 冲突", "矛盾声明"}
+
+// conceptBody 概念页正文(lint 主循环解析一次后供疑似同义检测复用,避免重复读盘)。
+type conceptBody struct {
+	slug string
+	body string
+}
+
 // Lint 健康检查:断链 + 孤儿 + 缺 frontmatter + source 格式 + 矛盾标注 + 过时 + 未编译覆盖。
 func Lint(root string) LintResult {
 	res := LintResult{Broken: map[string][]string{}}
@@ -47,10 +57,7 @@ func Lint(root string) LintResult {
 		}
 	}
 
-	var conceptBodies []struct {
-		slug string
-		body string
-	}
+	var conceptBodies []conceptBody
 	for _, p := range pages {
 		slug := filepath.Base(p)
 		content := Read(p)
@@ -63,10 +70,7 @@ func Lint(root string) LintResult {
 		vals, body := ParseFrontmatter(content)
 		// 疑似同义概念页检测复用的正文:主循环已读,不必 nearDuplicateConcepts 再读盘
 		if filepath.Base(filepath.Dir(p)) == "concepts" {
-			conceptBodies = append(conceptBodies, struct {
-				slug string
-				body string
-			}{strings.TrimSuffix(slug, ".md"), body})
+			conceptBodies = append(conceptBodies, conceptBody{strings.TrimSuffix(slug, ".md"), body})
 		}
 		// 压缩占位符污染:内容被系统历史压缩占位符覆盖(弱模型把占位符当真实内容写入)。
 		// 任何页面含此前缀即判损坏——概念页没有 preflight 硬资产闸门,这是唯一能抓住它的扫描。
@@ -74,7 +78,7 @@ func Lint(root string) LintResult {
 			res.Corrupted = append(res.Corrupted, slug)
 		}
 		// 矛盾标注 → 人工审核项(SCHEMA:只把 CONTRADICTION/矛盾声明列为审核)
-		for _, kw := range []string{"CONTRADICTION", "⚠️ 矛盾", "⚠️ 冲突", "矛盾声明"} {
+		for _, kw := range contradictionMarkers {
 			if strings.Contains(content, kw) {
 				res.Contradictions = append(res.Contradictions, slug)
 				break
@@ -201,7 +205,7 @@ func sectionText(body, section string) string {
 
 // insightSignals 私有联想的信号词(SCHEMA 规则 10:原文说什么 + 这让我想到什么/在你场景意味着什么)。
 // 纯复述原文(只转述事实)通常不含这些词——启发式提示,不是裁决。
-var insightSignals = []string{"意味着", "联想到", "启示", "类比", "这说明", "对用户", "场景", "含义", "验证了", "提示了", "这说明", "所以", "由此", "值得", "想到"}
+var insightSignals = []string{"意味着", "联想到", "启示", "类比", "这说明", "对用户", "场景", "含义", "验证了", "提示了", "所以", "由此", "值得", "想到"}
 
 func containsInsightSignal(sec string) bool {
 	for _, s := range insightSignals {
@@ -216,10 +220,7 @@ func containsInsightSignal(sec string) bool {
 // 相似度 ≥ 阈值报对。命名漂移(中英别称/近似名)会让同一概念裂成两页——这是图碎片化的确定性信号。
 // O(n²) 仅对 concepts/ 子集;字符 bigram 对中文鲁棒(词切分不依赖词表)。
 // 接收 Lint 主循环已解析的正文,避免重复读盘。
-func nearDuplicateConcepts(concepts []struct {
-	slug string
-	body string
-}) []string {
+func nearDuplicateConcepts(concepts []conceptBody) []string {
 	const threshold = 0.5
 	type grams struct {
 		slug  string

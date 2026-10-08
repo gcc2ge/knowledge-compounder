@@ -20,6 +20,19 @@ import (
 	"github.com/gcc2ge/knowledge-compounder/internal/wiki"
 )
 
+// toolEnv 一次 Build 的共享闭包状态,由各工具方法捕获。
+type toolEnv struct {
+	root            string
+	idx             *index.Index
+	opts            retrieval.Options
+	ask             func(string) string
+	vision          func(string) string
+	readsSinceWrite map[string]int    // 同文件连续分页读计数:落盘纪律的机械执行(见 read_file)
+	cov             *Coverage         // 读覆盖台账:gap 检测的确定性依据
+	rep             *RepeatDetector   // 重复段台账:模板化长源选择性深读的确定性依据(切片 B)
+	cLog            *ContradictionLog // 矛盾核对台账:收尾是否回头对照 wiki 的确定性记录
+}
+
 // Build 构造工具列表。root 为项目根;ask 为策展决策回调(向用户提问等裁决),nil 则 ask_user 返回非交互提示;
 // opts 为检索选项(embedder/缓存/条数),空则 search_wiki 退回词法检索。
 // 返回工具列表、内存索引(KCP_INDEX=off 时索引为 nil,工具降级走全扫旧路径)与读覆盖台账
@@ -27,10 +40,17 @@ import (
 // 调用方在进程退出前调 idx.Save(root) 把增量留给下次。
 func Build(root string, ask func(string) string, vision func(string) string, opts retrieval.Options) ([]provider.ToolDef, *index.Index, *Coverage, *ContradictionLog) {
 	idx := index.Load(root)
-	readsSinceWrite := map[string]int{} // 同文件连续分页读计数:落盘纪律的机械执行(见 read_file)
-	cov := &Coverage{}                  // 读覆盖台账:gap 检测的确定性依据
-	rep := &RepeatDetector{}            // 重复段台账:模板化长源选择性深读的确定性依据(切片 B)
-	cLog := &ContradictionLog{}         // 矛盾核对台账:收尾是否回头对照 wiki 的确定性记录
+	e := &toolEnv{
+		root:            root,
+		idx:             idx,
+		opts:            opts,
+		ask:             ask,
+		vision:          vision,
+		readsSinceWrite: map[string]int{},
+		cov:             &Coverage{},
+		rep:             &RepeatDetector{},
+		cLog:            &ContradictionLog{},
+	}
 	return []provider.ToolDef{
 		{
 			Name: "wiki_status", Description: "查看知识库状态:页面计数 + 未编译 raw",
@@ -40,49 +60,12 @@ func Build(root string, ask func(string) string, vision func(string) string, opt
 		{
 			Name: "search_wiki", Description: "在知识库中检索相关页面(混合检索:词法 + 可选语义向量;结果带私有度徽标 [A]公开/[B]精选综合/[C]私有)",
 			Parameters: obj(map[string]any{"query": strProp, "k": intProp}),
-			Func: func(args map[string]any) string {
-				query := str(args, "query")
-				k := intArg(args, "k", 0)
-				// 副本隔离:k 只影响本次检索,不污染闭包共享的 opts(旧实现直接改 opts.Top,
-				// 一次 k=8 后所有后续检索残留 Top=8,条数被静默放大)。
-				o := opts
-				if k > 0 {
-					o.Top = k
-				}
-				var results []retrieval.Result
-				if idx != nil {
-					results = idx.Rank(query, o)
-				} else {
-					results = wiki.Retrieve(root, query, o)
-				}
-				if len(results) == 0 {
-					return "知识库中未找到相关页面。"
-				}
-				var b strings.Builder
-				for _, r := range results {
-					badge := wiki.EvidenceBadge(root, r.Path)
-					fmt.Fprintf(&b, "- [[%s]] %s 命中%.2f: %s\n", r.Label, badge, r.Score, r.Summary)
-				}
-				return b.String()
-			},
+			Func:       e.searchWiki,
 		},
 		{
 			Name: "get_page", Description: "读取知识库中的一个 wiki 页面(slug 或文件名)",
 			Parameters: obj(map[string]any{"page": strProp}),
-			Func: func(args map[string]any) string {
-				page := str(args, "page")
-				var text, dir string
-				var ok bool
-				if idx != nil {
-					text, dir, ok = idx.GetPage(page)
-				} else {
-					text, dir, ok = wiki.GetPage(root, page)
-				}
-				if !ok {
-					return fmt.Sprintf("[[%s]] 不存在。", strings.TrimSuffix(page, ".md"))
-				}
-				return fmt.Sprintf("## %s (%s/)\n\n%s", strings.TrimSuffix(page, ".md"), dir, text)
-			},
+			Func:       e.getPage,
 		},
 		{
 			Name: "wiki_mentions", Description: "统计术语被几个已编译源页提及——「2+ 源提及才建概念/实体页」纪律的确定性判据。支持批量:terms 传数组一次查多个候选(推荐);单数 term 也兼容。每项返回提及计数与建页结论",
@@ -90,177 +73,30 @@ func Build(root string, ask func(string) string, vision func(string) string, opt
 				"term":  strProp,
 				"terms": map[string]any{"type": "array", "items": strProp},
 			}),
-			Func: func(args map[string]any) string {
-				var terms []string
-				if arr, ok := args["terms"].([]any); ok {
-					for _, v := range arr {
-						if s, ok := v.(string); ok && s != "" {
-							terms = append(terms, s)
-						}
-					}
-				}
-				if t := str(args, "term"); t != "" {
-					terms = append(terms, t)
-				}
-				if len(terms) == 0 {
-					return "term/terms 至少提供一个。"
-				}
-				if idx != nil {
-					return idx.FormatMentions(idx.Mentions(terms)) // 三档话术 + 子串/短词护栏(带页名判据)
-				}
-				// 降级:逐 term 全扫 source 页
-				files, _ := filepath.Glob(filepath.Join(root, "wiki", "sources", "*.md"))
-				var texts []struct{ slug, low string }
-				for _, f := range files {
-					if b, err := os.ReadFile(f); err == nil {
-						texts = append(texts, struct{ slug, low string }{strings.TrimSuffix(filepath.Base(f), ".md"), strings.ToLower(string(b))})
-					}
-				}
-				var results []index.MentionResult
-				for _, t := range terms {
-					var hits []string
-					for _, te := range texts {
-						if strings.Contains(te.low, strings.ToLower(t)) {
-							hits = append(hits, te.slug)
-						}
-					}
-					results = append(results, index.MentionResult{Term: t, Hits: hits})
-				}
-				return (&index.Index{}).FormatMentions(results) // 无索引:仅跳过页名子串检查
-			},
+			Func: e.wikiMentions,
 		},
 		{
 			Name: "backlinks", Description: "查一个页面的双向链接:谁链向它(入站)/它链向谁(出站,断链单独标出)。知识网络的结构化导航",
 			Parameters: obj(map[string]any{"page": strProp}),
-			Func: func(args map[string]any) string {
-				slug := strings.TrimSuffix(str(args, "page"), ".md")
-				if slug == "" {
-					return "page 必填。"
-				}
-				if idx != nil {
-					in, out := idx.Backlinks(slug)
-					var b strings.Builder
-					fmt.Fprintf(&b, "[[%s]] 入站 %d 条:", slug, len(in))
-					if len(in) == 0 {
-						b.WriteString(" 无(孤儿页)")
-					} else {
-						b.WriteString(" " + strings.Join(in, "、"))
-					}
-					var okLinks, broken []string
-					for _, o := range out {
-						if idx.HasSlug(o) {
-							okLinks = append(okLinks, o)
-						} else {
-							broken = append(broken, o)
-						}
-					}
-					fmt.Fprintf(&b, "\n出站 %d 条: %s", len(out), strings.Join(okLinks, "、"))
-					if len(broken) > 0 {
-						fmt.Fprintf(&b, "\n断链: %s", strings.Join(broken, "、"))
-					}
-					return b.String()
-				}
-				// 降级:读文件解析
-				text, _, ok := wiki.GetPage(root, slug)
-				if !ok {
-					return fmt.Sprintf("页面 [[%s]] 不存在。", slug)
-				}
-				links := wiki.ParseWikilinks(text)
-				return fmt.Sprintf("[[%s]] 出站 %d 条: %s\n(入站查询需索引;当前为降级模式)", slug, len(links), strings.Join(links, "、"))
-			},
+			Func:       e.backlinks,
 		},
 		{
 			Name: "read_file", Description: "读取项目内文件(相对项目根)。支持分页:offset(起始行,从 1 起)/limit(行数)返回带行号片段与总行数提示;不传参数读全文,超过 80KB 的大文件返回头部并要求分页——编译长源时逐页读完,禁止只凭开头",
 			Parameters: obj(map[string]any{"path": strProp, "offset": intProp, "limit": intProp}),
-			Func: func(args map[string]any) string {
-				path := str(args, "path")
-				// 图片文件:不能按文本读,给确定性指引走 describe_image(Tier 2 vision)
-				if p, ok := safeJoin(root, path, "raw"); ok && isImageExt(p) {
-					if fi, err := os.Stat(p); err == nil {
-						return fmt.Sprintf("图片文件 %s(%d KB)。不能按文本读取;请用 describe_image 工具让视觉模型描述其内容,再把描述编译进页面。", path, fi.Size()>>10)
-					}
-				}
-				offset, limit := intArg(args, "offset", 0), intArg(args, "limit", 0)
-				out, lo, hi, total := readPagedDetail(root, path, offset, limit, rep)
-				markRead(cov, path, lo, hi, total) // 读覆盖台账:gap 检测依据(记实际返回区间,字节截断时不超记)
-				// 落盘纪律的机械执行:同文件连续分页读 ≥3 页未写任何文件时,
-				// 在返回文本里插入强制提醒——实测便宜模型会连读 13 页,上下文压缩
-				// 把早期内容折叠掉,读完已无料可写。纪律进工具返回,不靠 prompt 自觉。
-				if offset > 0 || limit > 0 {
-					readsSinceWrite[path]++
-					if readsSinceWrite[path] >= 3 {
-						out += fmt.Sprintf("\n\n⚠️ 你已连续读 %d 页未落盘。先停下:把已读段落的要点 write_file 进源页草稿,再继续读后面的页——否则上下文压缩会吃掉早期内容。", readsSinceWrite[path])
-					}
-				}
-				return out
-			},
+			Func:       e.readFile,
 		},
 		{
 			Name:        "check_contradictions",
 			Description: "编译收尾必做核对:读取你刚编译的源页(source=源页 slug,去 .md),把它的关键声明(一句话结论+论证链)与整个 wiki 已有页面比对,返回相关页——逐个判断 冲突/佐证/无涉:冲突用 lint 可识别的标注(⚠️ 冲突:/⚠️ 矛盾:/<!-- CONTRADICTION -->)显式落盘,并把冲突写进相关概念页「张力与缺口」;佐证/相关链进「连接」并写关联意义。直接收尾不跑本工具会被 FinishGuard 强制补做",
 			Parameters:  obj(map[string]any{"source": strProp, "k": intProp}),
-			Func: func(args map[string]any) string {
-				slug := strings.TrimSuffix(str(args, "source"), ".md")
-				if slug == "" {
-					return "source 必填(你刚编译的源页 slug,去 .md)。"
-				}
-				fp := filepath.Join(root, "wiki", "sources", slug+".md")
-				b, err := os.ReadFile(fp)
-				if err != nil {
-					return fmt.Sprintf("源页 wiki/sources/%s.md 还不存在——先用 write_file 落盘源页(至少 frontmatter+一句话结论+论证链),再调用本工具核对。", slug)
-				}
-				hits := ScanContradictions(root, slug, string(b), intArg(args, "k", 0))
-				cLog.Mark(slug, pageLabels(hits))
-				cLog.MarkConcepts(slug, conceptLabels(hits)) // evidenceLog:扫出的概念页需回流裁决
-				var sb strings.Builder
-				fmt.Fprintf(&sb, "## 矛盾核对:源页 × 已有 wiki 页(%d 个相关)\n\n", len(hits))
-				if len(hits) == 0 {
-					sb.WriteString("未找到与本源明显相关的已有页面——这是合法结果,可省略矛盾标注;概念/实体的建页纪律照旧(wiki_mentions 核对)。\n")
-				} else {
-					sb.WriteString("逐个判断 冲突/佐证/无涉,并按下面落盘要求写进「连接」:\n\n")
-					for i, h := range hits {
-						badge := wiki.EvidenceBadge(root, h.Result.Path)
-						fmt.Fprintf(&sb, "%d. [[%s]] %s 相关%.2f\n   相关声明: %s\n   摘要: %s\n",
-							i+1, h.Result.Label, badge, h.Result.Score,
-							truncate(h.Claim, 90), truncate(h.Result.Summary, 140))
-					}
-					sb.WriteString("\n落盘要求(标注格式固定,改动会被 postCompileQA 报警):\n")
-					sb.WriteString("- 冲突(论点直接对立:同一概念两种分类 / 结论相反 / 口径不一致):两边都保留。本源页「连接」写 `- ⚠️ 冲突: [[相关页]] — 冲突原因`;同时把冲突写进相关概念页「张力与缺口」一条 `- ⚠️ 冲突: 本源 [[本源页]] — 冲突原因`。冲突不消除,只标注。\n")
-					sb.WriteString("- 佐证/相关:本源页「连接」写 `- → [[相关页]] — 佐证:关联意义`,并写清这页关联对用户意味着什么。\n")
-					sb.WriteString("- 无涉:不用链,建页纪律照旧。\n")
-					sb.WriteString("冲突≠佐证:仅在论点层面直接对立才算冲突(如两种 taxonomy 并存、同一断言两个版本);单纯语义/细节互补是佐证。\n")
-				}
-				return sb.String()
-			},
+			Func:        e.checkContradictions,
 		},
 		{
 			Name: "update_evidence", Description: "编译收尾的确定性回流:把本次编译结论写回既有概念页——正向复利(既有页必须被物理强化,不能只在新源页「连接」写一行)。slug=概念页,action=corroborate(佐证:追加源+机器重算 confidence+「外部观点」加佐证行)|contradict(冲突:「张力与缺口」落 ⚠️ 冲突 标注)|skip(无涉:仅登记已裁决,不写文件),source=源页 slug,claim=一句话原因/佐证内容。仅限 wiki/concepts/ 页面;compiler 在 check_contradictions 之后对每个相关概念页逐一调用——FinishGuard 会校验每个相关概念页都被裁决(corroborate/contradict/skip),漏掉会强制续跑",
 			Parameters: obj(map[string]any{
 				"slug": strProp, "action": strProp, "source": strProp, "claim": strProp,
 			}),
-			Func: func(args map[string]any) string {
-				slug := strings.TrimSuffix(str(args, "slug"), ".md")
-				source := strings.TrimSuffix(str(args, "source"), ".md")
-				action, claim := str(args, "action"), str(args, "claim")
-				if slug == "" || action == "" {
-					return "slug 与 action(corroborate|contradict|skip)必填。"
-				}
-				if action == "skip" {
-					cLog.Applied(source, slug) // 无涉裁决:只登记,不写文件
-					return "已记录: 概念页 [[" + slug + "]] 判定无涉,不回流。"
-				}
-				msg, err := wiki.ApplyEvidence(root, slug, action, source, claim)
-				if err != nil {
-					return "失败: " + err.Error()
-				}
-				cLog.Applied(source, slug) // evidenceLog:该概念页已回流裁决
-				if idx != nil {
-					if p, ok := wiki.ResolveSlug(root, slug); ok {
-						idx.UpdateFile(p) // 写即索引:同会话后续检索立即可见
-					}
-				}
-				return msg
-			},
+			Func: e.updateEvidence,
 		},
 		{
 			Name: "web_fetch", Description: "抓取 http(s) URL 并转为纯文本(去 HTML 标签,截 8KB)——验证外部主张、查作者/工具背景用;非文本或不可达时返回错误说明",
@@ -275,108 +111,17 @@ func Build(root string, ask func(string) string, vision func(string) string, opt
 		{
 			Name: "describe_image", Description: "让视觉模型描述 raw/ 里的一张图片(架构图/截图/抓图,传相对路径)。返回的描述文本可直接编译进页面;模型无视觉能力时返回错误说明",
 			Parameters: obj(map[string]any{"path": strProp}),
-			Func: func(args map[string]any) string {
-				path := str(args, "path")
-				if vision == nil {
-					return "[非交互] 未配置视觉描述能力。按 SCHEMA 图片源无法自动编译:在 source 页注明「含图片 N 张,待人工补充描述」,或换多模态模型后重跑。"
-				}
-				fp, ok := safeJoin(root, path, "raw") // 只允许描述 raw/ 下图片(raw 不可变,不可写)
-				if !ok {
-					return "拒绝:describe_image 只允许描述 raw/ 下的图片,收到 " + path
-				}
-				if !isImageExt(fp) {
-					return "不是图片文件(png/jpg/jpeg/gif/webp/bmp): " + path
-				}
-				return vision(fp)
-			},
+			Func:       e.describeImage,
 		},
 		{
 			Name: "write_file", Description: "写入 wiki/ examples 内的文件(编译写页面用)。⚠️ 覆盖语义:整页替换,不是追加——写新页/整页重写时用,重写前必须先 read_file 读回当前内容;增量补写/追加一律用 edit_file。raw/ 不可变,禁止写入",
 			Parameters: obj(map[string]any{"path": strProp, "content": strProp}),
-			Func: func(args map[string]any) string {
-				path, content := str(args, "path"), str(args, "content")
-				if path == "" {
-					return "拒绝:未收到 path 参数(工具参数解析失败)。write_file 必须以 JSON 传 path(如 wiki/sources/xxx.md)与 content;content 内的换行要转义为 \\n、引号要转义为 \\\"。"
-				}
-				// 压缩占位符闸门:模型把系统历史压缩占位符([系统已压缩省略…])当真实内容写入——
-				// 这是「把历史占位符抄回文件」的污染源(实测 6 个概念页被整页覆盖)。占位符
-				// 不是内容,写入前必须 read_file 读回真实内容(或从源页重建)。代码验收,不靠模型自觉。
-				if strings.Contains(content, wiki.CompactionMarker) {
-					return "拒绝:content 是系统历史压缩占位符([系统已压缩省略…]),不是真实页面内容——禁止把占位符当作内容写入。read_file 读回该页真实内容(若已损坏,从对应 raw/源页重建),再基于真实内容 write_file / edit_file。"
-				}
-				fp, ok := safeJoin(root, path, "wiki", "examples")
-				if !ok {
-					return fmt.Sprintf("拒绝:只允许写 wiki/ examples/(raw/ 不可变,禁止写入),收到 %s", path)
-				}
-				if err := os.MkdirAll(filepath.Dir(fp), 0o755); err != nil {
-					return fmt.Sprintf("写入失败: %v", err)
-				}
-				if err := os.WriteFile(fp, []byte(content), 0o644); err != nil {
-					return fmt.Sprintf("写入失败: %v", err)
-				}
-				delete(readsSinceWrite, path) // 落盘即解除落盘提醒
-				if idx != nil {
-					idx.UpdateFile(fp) // 写入即索引:同会话后续检索立即可见
-				}
-				if tr, _ := args["content_truncated"].(bool); tr {
-					// 参数被模型输出截断(无完整收尾):写下的内容必然不全。必须明说,
-					// 否则模型以为整页已落盘,靠 FinishGuard 的 preflight 兜底才发现缺节、
-					// 反复读-write 测试。且截断时模型多尝试「整页覆盖重试」→ 必然再次截断。
-					// 正确路径是 read_file 读回 + edit_file 逐块补写,不靠整页重写。
-					return fmt.Sprintf("已写入 %s ⚠️ 注意:本次 content 参数疑似被模型输出截断(未闭合),只写入了前 %d 行,页面不完整。不要再整页 write_file 覆盖(会再次截断);请 read_file 读回当前内容,再用 edit_file 逐块补写,每块 <3KB。", rel(root, fp), strings.Count(content, "\n")+1)
-				}
-				return fmt.Sprintf("已写入 %s", rel(root, fp))
-			},
+			Func:       e.writeFile,
 		},
 		{
 			Name: "edit_file", Description: "修改 wiki/ examples 内文件的内容(增量补写用;write_file 是整页覆盖,不用于追加)。old_string=当前文件里的唯一原文锚点(必须与 read_file 读回的原文逐字一致,含缩进/换行),new_string=替换后的内容。精确替换一次:old_string 找不到或出现多次时不改并返回说明。**写长页面纪律(防输出截断)**:先 write_file 写第一块骨架,再 read_file 读回确认,然后 edit_file 逐块填充——old_string 取**要补写的那一节当前结尾**的唯一原文锚点(不是无脑文件尾),new_string=锚点原文+新增块,每块 <3KB;**已存在的节标题(## 意外发现 等)绝不重复输出,每节只写一次**;绝不要整页 write_file 覆盖重试,超长 content 会被模型输出截断、只写一半。raw/ 不可变,禁止编辑",
 			Parameters: obj(map[string]any{"path": strProp, "old_string": strProp, "new_string": strProp}),
-			Func: func(args map[string]any) string {
-				path, old, new := str(args, "path"), str(args, "old_string"), str(args, "new_string")
-				// 截断判断放最前:repair 失败(截断到无收尾引号)会解析出空参数,此时缺字段
-				// 是截断的果不是因——先报截断,模型才知道要分块,而不是对着假缺字段空转。
-				if tr, _ := args["truncated"].(bool); tr {
-					return "拒绝:本次 edit_file 参数疑似被模型输出截断(对象未以 } 收尾),未做任何修改。new_string 请保持 <3KB,分块编辑(每块一个 edit_file 调用)。"
-				}
-				if path == "" || old == "" {
-					// 形状感知的拒绝:区分「只传了新内容」vs「全缺」,给可执行的字段顺序。
-					// 弱模型偶尔把 new_string 放最前、或干脆只发 new_string——此时 path/old_string
-					// 必然拿不到(短字段在长内容之后或根本没发),无法定位替换位置。
-					if str(args, "new_string") != "" {
-						return "拒绝:你这次只传了 new_string,丢了 path 与 old_string——无法定位要替换的位置。edit_file 三参必填,JSON 键顺序固定为 path → old_string → new_string(new_string 是新增内容,放最后);对象必须以 } 收尾。请按此顺序重发。"
-					}
-					return "拒绝:path 与 old_string 必填。old_string 必须是当前文件里的唯一原文锚点(先 read_file 读回确认),new_string 为替换内容。"
-				}
-				// 压缩占位符闸门:锚点或新内容含系统压缩占位符 = 模型把历史占位符当真实内容
-				// (或拿占位符当锚点定位)。占位符不是内容,先 read_file 读回真实内容再编辑。
-				if strings.Contains(old, wiki.CompactionMarker) || strings.Contains(new, wiki.CompactionMarker) {
-					return "拒绝:old_string/new_string 含系统历史压缩占位符([系统已压缩省略…]),不是真实页面内容——禁止编辑占位符文本。read_file 读回该页真实内容(若已损坏,从对应 raw/源页重建)后,再基于真实内容编辑。"
-				}
-				fp, ok := safeJoin(root, path, "wiki", "examples")
-				if !ok {
-					return fmt.Sprintf("拒绝:只允许编辑 wiki/ examples/(raw/ 不可变,禁止写入),收到 %s", path)
-				}
-				b, err := os.ReadFile(fp)
-				if err != nil {
-					return fmt.Sprintf("编辑失败:%s 不存在——先 write_file 建页(首块),再 edit_file 补写。", rel(root, fp))
-				}
-				text := string(b)
-				switch n := strings.Count(text, old); {
-				case n == 0:
-					return fmt.Sprintf("编辑失败:old_string 在 %s 中未找到。锚点必须与文件当前内容逐字一致(含缩进/换行)——先 read_file 读回确认再编辑。", rel(root, fp))
-				case n > 1:
-					return fmt.Sprintf("编辑失败:old_string 在 %s 中出现 %d 次,锚点不唯一。请用更长/更靠文件尾的锚点,或包含上文数行使之一一唯一。", rel(root, fp), n)
-				}
-				text = strings.Replace(text, old, new, 1)
-				if err := os.WriteFile(fp, []byte(text), 0o644); err != nil {
-					return fmt.Sprintf("编辑失败: %v", err)
-				}
-				delete(readsSinceWrite, path)
-				if idx != nil {
-					idx.UpdateFile(fp) // 写即索引:同会话后续检索立即可见
-				}
-				return fmt.Sprintf("已编辑 %s:替换 1 处(%d 字符→%d 字符)。若继续补写:read_file 读回目标节,用该节当前结尾的唯一原文作锚点插入(已存在的节标题绝不重复输出)。", rel(root, fp), len(old), len(new))
-			},
+			Func:       e.editFile,
 		},
 		{
 			Name: "run_lint", Description: "运行 lint 健康检查(断链/孤儿)",
@@ -395,15 +140,321 @@ func Build(root string, ask func(string) string, vision func(string) string, opt
 		{
 			Name: "ask_user", Description: "策展决策点向用户提问并等待裁决(如:是否值得建概念页/是否 filed back)。人策展>自动,拿不准就调用。",
 			Parameters: obj(map[string]any{"question": strProp}),
-			Func: func(args map[string]any) string {
-				q := str(args, "question")
-				if ask == nil {
-					return "[非交互] 无用户可问。按 SCHEMA 纪律自行决策:单次提及不建页、2+ 源才建概念/实体页。"
-				}
-				return ask(q)
-			},
+			Func:       e.askUser,
 		},
-	}, idx, cov, cLog
+	}, idx, e.cov, e.cLog
+}
+
+// searchWiki 混合检索 wiki 页(词法 + 可选语义向量),返回标题/徽标/命中分/摘要。
+func (e *toolEnv) searchWiki(args map[string]any) string {
+	query := str(args, "query")
+	k := intArg(args, "k", 0)
+	// 副本隔离:k 只影响本次检索,不污染闭包共享的 opts(旧实现直接改 opts.Top,
+	// 一次 k=8 后所有后续检索残留 Top=8,条数被静默放大)。
+	o := e.opts
+	if k > 0 {
+		o.Top = k
+	}
+	var results []retrieval.Result
+	if e.idx != nil {
+		results = e.idx.Rank(query, o)
+	} else {
+		results = wiki.Retrieve(e.root, query, o)
+	}
+	if len(results) == 0 {
+		return "知识库中未找到相关页面。"
+	}
+	var b strings.Builder
+	for _, r := range results {
+		badge := wiki.EvidenceBadge(e.root, r.Path)
+		fmt.Fprintf(&b, "- [[%s]] %s 命中%.2f: %s\n", r.Label, badge, r.Score, r.Summary)
+	}
+	return b.String()
+}
+
+func (e *toolEnv) getPage(args map[string]any) string {
+	page := str(args, "page")
+	var text, dir string
+	var ok bool
+	if e.idx != nil {
+		text, dir, ok = e.idx.GetPage(page)
+	} else {
+		text, dir, ok = wiki.GetPage(e.root, page)
+	}
+	name := strings.TrimSuffix(page, ".md")
+	if !ok {
+		return fmt.Sprintf("[[%s]] 不存在。", name)
+	}
+	return fmt.Sprintf("## %s (%s/)\n\n%s", name, dir, text)
+}
+
+func (e *toolEnv) wikiMentions(args map[string]any) string {
+	var terms []string
+	if arr, ok := args["terms"].([]any); ok {
+		for _, v := range arr {
+			if s, ok := v.(string); ok && s != "" {
+				terms = append(terms, s)
+			}
+		}
+	}
+	if t := str(args, "term"); t != "" {
+		terms = append(terms, t)
+	}
+	if len(terms) == 0 {
+		return "term/terms 至少提供一个。"
+	}
+	if e.idx != nil {
+		return e.idx.FormatMentions(e.idx.Mentions(terms)) // 三档话术 + 子串/短词护栏(带页名判据)
+	}
+	// 降级:逐 term 全扫 source 页
+	files, _ := filepath.Glob(filepath.Join(e.root, "wiki", "sources", "*.md"))
+	var texts []struct{ slug, low string }
+	for _, f := range files {
+		if b, err := os.ReadFile(f); err == nil {
+			texts = append(texts, struct{ slug, low string }{strings.TrimSuffix(filepath.Base(f), ".md"), strings.ToLower(string(b))})
+		}
+	}
+	var results []index.MentionResult
+	for _, t := range terms {
+		var hits []string
+		for _, te := range texts {
+			if strings.Contains(te.low, strings.ToLower(t)) {
+				hits = append(hits, te.slug)
+			}
+		}
+		results = append(results, index.MentionResult{Term: t, Hits: hits})
+	}
+	return (&index.Index{}).FormatMentions(results) // 无索引:仅跳过页名子串检查
+}
+
+// backlinks 查一个页面的入站/出站链接(索引或文件降级)。
+func (e *toolEnv) backlinks(args map[string]any) string {
+	slug := strings.TrimSuffix(str(args, "page"), ".md")
+	if slug == "" {
+		return "page 必填。"
+	}
+	if e.idx != nil {
+		in, out := e.idx.Backlinks(slug)
+		var b strings.Builder
+		fmt.Fprintf(&b, "[[%s]] 入站 %d 条:", slug, len(in))
+		if len(in) == 0 {
+			b.WriteString(" 无(孤儿页)")
+		} else {
+			b.WriteString(" " + strings.Join(in, "、"))
+		}
+		var okLinks, broken []string
+		for _, o := range out {
+			if e.idx.HasSlug(o) {
+				okLinks = append(okLinks, o)
+			} else {
+				broken = append(broken, o)
+			}
+		}
+		fmt.Fprintf(&b, "\n出站 %d 条: %s", len(out), strings.Join(okLinks, "、"))
+		if len(broken) > 0 {
+			fmt.Fprintf(&b, "\n断链: %s", strings.Join(broken, "、"))
+		}
+		return b.String()
+	}
+	// 降级:读文件解析
+	text, _, ok := wiki.GetPage(e.root, slug)
+	if !ok {
+		return fmt.Sprintf("页面 [[%s]] 不存在。", slug)
+	}
+	links := wiki.ParseWikilinks(text)
+	return fmt.Sprintf("[[%s]] 出站 %d 条: %s\n(入站查询需索引;当前为降级模式)", slug, len(links), strings.Join(links, "、"))
+}
+
+// readFile 读取项目内文件(相对项目根);分页时返回带行号片段并记录读覆盖。
+func (e *toolEnv) readFile(args map[string]any) string {
+	path := str(args, "path")
+	// 图片文件:不能按文本读,给确定性指引走 describe_image(Tier 2 vision)
+	if p, ok := safeJoin(e.root, path, "raw"); ok && isImageExt(p) {
+		if fi, err := os.Stat(p); err == nil {
+			return fmt.Sprintf("图片文件 %s(%d KB)。不能按文本读取;请用 describe_image 工具让视觉模型描述其内容,再把描述编译进页面。", path, fi.Size()>>10)
+		}
+	}
+	offset, limit := intArg(args, "offset", 0), intArg(args, "limit", 0)
+	out, lo, hi, total := readPagedDetail(e.root, path, offset, limit, e.rep)
+	markRead(e.cov, path, lo, hi, total) // 读覆盖台账:gap 检测依据(记实际返回区间,字节截断时不超记)
+	// 落盘纪律的机械执行:同文件连续分页读 ≥3 页未写任何文件时,
+	// 在返回文本里插入强制提醒——实测便宜模型会连读 13 页,上下文压缩
+	// 把早期内容折叠掉,读完已无料可写。纪律进工具返回,不靠 prompt 自觉。
+	if offset > 0 || limit > 0 {
+		e.readsSinceWrite[path]++
+		if e.readsSinceWrite[path] >= 3 {
+			out += fmt.Sprintf("\n\n⚠️ 你已连续读 %d 页未落盘。先停下:把已读段落的要点 write_file 进源页草稿,再继续读后面的页——否则上下文压缩会吃掉早期内容。", e.readsSinceWrite[path])
+		}
+	}
+	return out
+}
+
+// checkContradictions 把源页关键声明与整个 wiki 比对,返回相关页并登记核对台账。
+func (e *toolEnv) checkContradictions(args map[string]any) string {
+	slug := strings.TrimSuffix(str(args, "source"), ".md")
+	if slug == "" {
+		return "source 必填(你刚编译的源页 slug,去 .md)。"
+	}
+	fp := filepath.Join(e.root, "wiki", "sources", slug+".md")
+	b, err := os.ReadFile(fp)
+	if err != nil {
+		return fmt.Sprintf("源页 wiki/sources/%s.md 还不存在——先用 write_file 落盘源页(至少 frontmatter+一句话结论+论证链),再调用本工具核对。", slug)
+	}
+	hits := ScanContradictions(e.root, slug, string(b), intArg(args, "k", 0))
+	e.cLog.Mark(slug, pageLabels(hits))
+	e.cLog.MarkConcepts(slug, conceptLabels(hits)) // evidenceLog:扫出的概念页需回流裁决
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "## 矛盾核对:源页 × 已有 wiki 页(%d 个相关)\n\n", len(hits))
+	if len(hits) == 0 {
+		sb.WriteString("未找到与本源明显相关的已有页面——这是合法结果,可省略矛盾标注;概念/实体的建页纪律照旧(wiki_mentions 核对)。\n")
+	} else {
+		sb.WriteString("逐个判断 冲突/佐证/无涉,并按下面落盘要求写进「连接」:\n\n")
+		for i, h := range hits {
+			badge := wiki.EvidenceBadge(e.root, h.Result.Path)
+			fmt.Fprintf(&sb, "%d. [[%s]] %s 相关%.2f\n   相关声明: %s\n   摘要: %s\n",
+				i+1, h.Result.Label, badge, h.Result.Score,
+				truncate(h.Claim, 90), truncate(h.Result.Summary, 140))
+		}
+		sb.WriteString("\n落盘要求(标注格式固定,改动会被 postCompileQA 报警):\n")
+		sb.WriteString("- 冲突(论点直接对立:同一概念两种分类 / 结论相反 / 口径不一致):两边都保留。本源页「连接」写 `- ⚠️ 冲突: [[相关页]] — 冲突原因`;同时把冲突写进相关概念页「张力与缺口」一条 `- ⚠️ 冲突: 本源 [[本源页]] — 冲突原因`。冲突不消除,只标注。\n")
+		sb.WriteString("- 佐证/相关:本源页「连接」写 `- → [[相关页]] — 佐证:关联意义`,并写清这页关联对用户意味着什么。\n")
+		sb.WriteString("- 无涉:不用链,建页纪律照旧。\n")
+		sb.WriteString("冲突≠佐证:仅在论点层面直接对立才算冲突(如两种 taxonomy 并存、同一断言两个版本);单纯语义/细节互补是佐证。\n")
+	}
+	return sb.String()
+}
+
+// updateEvidence 把编译结论回写既有概念页(佐证/冲突/无涉三态裁决)。
+func (e *toolEnv) updateEvidence(args map[string]any) string {
+	slug := strings.TrimSuffix(str(args, "slug"), ".md")
+	source := strings.TrimSuffix(str(args, "source"), ".md")
+	action, claim := str(args, "action"), str(args, "claim")
+	if slug == "" || action == "" {
+		return "slug 与 action(corroborate|contradict|skip)必填。"
+	}
+	if action == "skip" {
+		e.cLog.Applied(source, slug) // 无涉裁决:只登记,不写文件
+		return "已记录: 概念页 [[" + slug + "]] 判定无涉,不回流。"
+	}
+	msg, err := wiki.ApplyEvidence(e.root, slug, action, source, claim)
+	if err != nil {
+		return "失败: " + err.Error()
+	}
+	e.cLog.Applied(source, slug) // evidenceLog:该概念页已回流裁决
+	if e.idx != nil {
+		if p, ok := wiki.ResolveSlug(e.root, slug); ok {
+			e.idx.UpdateFile(p) // 写即索引:同会话后续检索立即可见
+		}
+	}
+	return msg
+}
+
+func (e *toolEnv) describeImage(args map[string]any) string {
+	path := str(args, "path")
+	if e.vision == nil {
+		return "[非交互] 未配置视觉描述能力。按 SCHEMA 图片源无法自动编译:在 source 页注明「含图片 N 张,待人工补充描述」,或换多模态模型后重跑。"
+	}
+	fp, ok := safeJoin(e.root, path, "raw") // 只允许描述 raw/ 下图片(raw 不可变,不可写)
+	if !ok {
+		return "拒绝:describe_image 只允许描述 raw/ 下的图片,收到 " + path
+	}
+	if !isImageExt(fp) {
+		return "不是图片文件(png/jpg/jpeg/gif/webp/bmp): " + path
+	}
+	return e.vision(fp)
+}
+
+// writeFile 写入 wiki/ examples 内的文件(整页覆盖语义)。
+func (e *toolEnv) writeFile(args map[string]any) string {
+	path, content := str(args, "path"), str(args, "content")
+	if path == "" {
+		return "拒绝:未收到 path 参数(工具参数解析失败)。write_file 必须以 JSON 传 path(如 wiki/sources/xxx.md)与 content;content 内的换行要转义为 \\n、引号要转义为 \\\"。"
+	}
+	// 压缩占位符闸门:模型把系统历史压缩占位符([系统已压缩省略…])当真实内容写入——
+	// 这是「把历史占位符抄回文件」的污染源(实测 6 个概念页被整页覆盖)。占位符
+	// 不是内容,写入前必须 read_file 读回真实内容(或从源页重建)。代码验收,不靠模型自觉。
+	if strings.Contains(content, wiki.CompactionMarker) {
+		return "拒绝:content 是系统历史压缩占位符([系统已压缩省略…]),不是真实页面内容——禁止把占位符当作内容写入。read_file 读回该页真实内容(若已损坏,从对应 raw/源页重建),再基于真实内容 write_file / edit_file。"
+	}
+	fp, ok := safeJoin(e.root, path, "wiki", "examples")
+	if !ok {
+		return fmt.Sprintf("拒绝:只允许写 wiki/ examples/(raw/ 不可变,禁止写入),收到 %s", path)
+	}
+	if err := os.MkdirAll(filepath.Dir(fp), 0o755); err != nil {
+		return fmt.Sprintf("写入失败: %v", err)
+	}
+	if err := os.WriteFile(fp, []byte(content), 0o644); err != nil {
+		return fmt.Sprintf("写入失败: %v", err)
+	}
+	delete(e.readsSinceWrite, path) // 落盘即解除落盘提醒
+	if e.idx != nil {
+		e.idx.UpdateFile(fp) // 写入即索引:同会话后续检索立即可见
+	}
+	if tr, _ := args["content_truncated"].(bool); tr {
+		// 参数被模型输出截断(无完整收尾):写下的内容必然不全。必须明说,
+		// 否则模型以为整页已落盘,靠 FinishGuard 的 preflight 兜底才发现缺节、
+		// 反复读-write 测试。且截断时模型多尝试「整页覆盖重试」→ 必然再次截断。
+		// 正确路径是 read_file 读回 + edit_file 逐块补写,不靠整页重写。
+		return fmt.Sprintf("已写入 %s ⚠️ 注意:本次 content 参数疑似被模型输出截断(未闭合),只写入了前 %d 行,页面不完整。不要再整页 write_file 覆盖(会再次截断);请 read_file 读回当前内容,再用 edit_file 逐块补写,每块 <3KB。", rel(e.root, fp), strings.Count(content, "\n")+1)
+	}
+	return fmt.Sprintf("已写入 %s", rel(e.root, fp))
+}
+
+// editFile 修改 wiki/ examples 内文件的内容(唯一锚点精确替换)。
+func (e *toolEnv) editFile(args map[string]any) string {
+	path, old, new := str(args, "path"), str(args, "old_string"), str(args, "new_string")
+	// 截断判断放最前:repair 失败(截断到无收尾引号)会解析出空参数,此时缺字段
+	// 是截断的果不是因——先报截断,模型才知道要分块,而不是对着假缺字段空转。
+	if tr, _ := args["truncated"].(bool); tr {
+		return "拒绝:本次 edit_file 参数疑似被模型输出截断(对象未以 } 收尾),未做任何修改。new_string 请保持 <3KB,分块编辑(每块一个 edit_file 调用)。"
+	}
+	if path == "" || old == "" {
+		// 形状感知的拒绝:区分「只传了新内容」vs「全缺」,给可执行的字段顺序。
+		// 弱模型偶尔把 new_string 放最前、或干脆只发 new_string——此时 path/old_string
+		// 必然拿不到(短字段在长内容之后或根本没发),无法定位替换位置。
+		if str(args, "new_string") != "" {
+			return "拒绝:你这次只传了 new_string,丢了 path 与 old_string——无法定位要替换的位置。edit_file 三参必填,JSON 键顺序固定为 path → old_string → new_string(new_string 是新增内容,放最后);对象必须以 } 收尾。请按此顺序重发。"
+		}
+		return "拒绝:path 与 old_string 必填。old_string 必须是当前文件里的唯一原文锚点(先 read_file 读回确认),new_string 为替换内容。"
+	}
+	// 压缩占位符闸门:锚点或新内容含系统压缩占位符 = 模型把历史占位符当真实内容
+	// (或拿占位符当锚点定位)。占位符不是内容,先 read_file 读回真实内容再编辑。
+	if strings.Contains(old, wiki.CompactionMarker) || strings.Contains(new, wiki.CompactionMarker) {
+		return "拒绝:old_string/new_string 含系统历史压缩占位符([系统已压缩省略…]),不是真实页面内容——禁止编辑占位符文本。read_file 读回该页真实内容(若已损坏,从对应 raw/源页重建)后,再基于真实内容编辑。"
+	}
+	fp, ok := safeJoin(e.root, path, "wiki", "examples")
+	if !ok {
+		return fmt.Sprintf("拒绝:只允许编辑 wiki/ examples/(raw/ 不可变,禁止写入),收到 %s", path)
+	}
+	b, err := os.ReadFile(fp)
+	if err != nil {
+		return fmt.Sprintf("编辑失败:%s 不存在——先 write_file 建页(首块),再 edit_file 补写。", rel(e.root, fp))
+	}
+	text := string(b)
+	switch n := strings.Count(text, old); {
+	case n == 0:
+		return fmt.Sprintf("编辑失败:old_string 在 %s 中未找到。锚点必须与文件当前内容逐字一致(含缩进/换行)——先 read_file 读回确认再编辑。", rel(e.root, fp))
+	case n > 1:
+		return fmt.Sprintf("编辑失败:old_string 在 %s 中出现 %d 次,锚点不唯一。请用更长/更靠文件尾的锚点,或包含上文数行使之一一唯一。", rel(e.root, fp), n)
+	}
+	text = strings.Replace(text, old, new, 1)
+	if err := os.WriteFile(fp, []byte(text), 0o644); err != nil {
+		return fmt.Sprintf("编辑失败: %v", err)
+	}
+	delete(e.readsSinceWrite, path)
+	if e.idx != nil {
+		e.idx.UpdateFile(fp) // 写即索引:同会话后续检索立即可见
+	}
+	return fmt.Sprintf("已编辑 %s:替换 1 处(%d 字符→%d 字符)。若继续补写:read_file 读回目标节,用该节当前结尾的唯一原文作锚点插入(已存在的节标题绝不重复输出)。", rel(e.root, fp), len(old), len(new))
+}
+
+// askUser 向用户提问并等待策展裁决(非交互时返回纪律提示)。
+func (e *toolEnv) askUser(args map[string]any) string {
+	q := str(args, "question")
+	if e.ask == nil {
+		return "[非交互] 无用户可问。按 SCHEMA 纪律自行决策:单次提及不建页、2+ 源才建概念/实体页。"
+	}
+	return e.ask(q)
 }
 
 // markRead 把一次 read_file 的覆盖区间记入台账(与 readPagedDetail 同判据)。
@@ -473,10 +524,6 @@ func filedBack(root string, args map[string]any, idx *index.Index) string {
 	return "已 filed back → wiki/synthesis/" + title + ".md(query-as-contribution 落盘成功)"
 }
 
-// ---- 工具辅助 ----
-
-var linkRe = regexp.MustCompile(`\[\[([^\]|]+)(?:\|[^\]]+)?\]\]`)
-
 func obj(props map[string]any) map[string]any {
 	return map[string]any{"type": "object", "properties": props}
 }
@@ -524,18 +571,6 @@ func safeJoin(root, path string, allowed ...string) (string, bool) {
 		}
 	}
 	return "", false
-}
-
-func readSafe(root, path string) string {
-	fp, ok := safeJoin(root, path, "wiki", "raw", "examples", "SCHEMA.md", "templates", "docs")
-	if !ok {
-		return "拒绝:路径超出项目根或不在白名单目录。"
-	}
-	b, err := os.ReadFile(fp)
-	if err != nil {
-		return fmt.Sprintf("读取失败: %v", err)
-	}
-	return string(b)
 }
 
 const (
@@ -774,9 +809,11 @@ func decodeDDGURL(href string) string {
 
 // isImageExt 图片扩展名判据(read_file 指引走 describe_image 用)。
 func isImageExt(path string) bool {
-	switch strings.ToLower(filepathExt(path)) {
-	case ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp":
-		return true
+	if i := strings.LastIndexByte(path, '.'); i >= 0 {
+		switch strings.ToLower(path[i:]) {
+		case ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp":
+			return true
+		}
 	}
 	return false
 }
@@ -784,12 +821,4 @@ func isImageExt(path string) bool {
 // collapseWS 折叠连续空白为单空格(HTML 高亮 <b> 剥掉后残留双空格)。
 func collapseWS(s string) string {
 	return strings.Join(strings.Fields(s), " ")
-}
-
-// filepathExt 取小写扩展名(含点)。
-func filepathExt(path string) string {
-	if i := strings.LastIndexByte(path, '.'); i >= 0 {
-		return path[i:]
-	}
-	return ""
 }

@@ -9,12 +9,10 @@ import (
 	"time"
 )
 
-var pageDirs = []string{"sources", "concepts", "entities", "synthesis", "notes"}
-
 // ResolveSlug 按 slug 在 wiki 子目录中定位页面文件。
 func ResolveSlug(root, slug string) (string, bool) {
 	slug = strings.TrimSuffix(slug, ".md")
-	for _, sub := range pageDirs {
+	for _, sub := range Subdirs {
 		p := filepath.Join(root, "wiki", sub, slug+".md")
 		if _, err := os.Stat(p); err == nil {
 			return p, true
@@ -31,63 +29,48 @@ func ResolveSlug(root, slug string) (string, bool) {
 // AddSource 给页面 frontmatter sources 追加一个源,并更新 updated 日期。
 // 幂等:已存在则不重复追加。保留原正文。
 func AddSource(root, slug, source string) (string, error) {
-	vals, body, fp, err := readPageBodyForEdit(root, slug)
-	if err != nil {
-		return "", err
-	}
-	sources := FrontmatterList(vals, "sources")
-	if !contains(sources, source) {
-		sources = append(sources, source)
-	}
-	vals["sources"] = sources
-	vals["updated"] = today()
-	if err := writePage(fp, vals, body); err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("已更新 %s: 追加 source '%s'", slug, source), nil
+	return editPage(root, slug, func(vals map[string]any, body string) (string, bool) {
+		sources := FrontmatterList(vals, "sources")
+		if !contains(sources, source) {
+			sources = append(sources, source)
+		}
+		vals["sources"] = sources
+		vals["updated"] = today()
+		return fmt.Sprintf("已更新 %s: 追加 source '%s'", slug, source), true
+	})
 }
 
 // Touch 更新页面 updated 日期为今天。保留原正文。
 func Touch(root, slug string) (string, error) {
-	vals, body, fp, err := readPageBodyForEdit(root, slug)
-	if err != nil {
-		return "", err
-	}
-	vals["updated"] = today()
-	if err := writePage(fp, vals, body); err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("已 touch %s → %s", slug, today()), nil
+	return editPage(root, slug, func(vals map[string]any, body string) (string, bool) {
+		vals["updated"] = today()
+		return fmt.Sprintf("已 touch %s → %s", slug, today()), true
+	})
 }
 
 // AddLink 往「相关」节追加一条 wikilink(幂等:已存在则跳过)。
 func AddLink(root, slug, target string) (string, error) {
-	vals, body, fp, err := readPageBodyForEdit(root, slug)
-	if err != nil {
-		return "", err
-	}
 	link := "[[" + strings.TrimSuffix(target, ".md") + "]]"
-	if strings.Contains(body, link) {
-		return fmt.Sprintf("%s 已有链接 %s,跳过", slug, link), nil
-	}
-	idx := strings.Index(body, "## 相关")
-	if idx >= 0 {
-		// 在「相关」节末尾插入(下一个 ## 前 / 文末)
-		end := strings.Index(body[idx+len("## 相关"):], "\n## ")
-		if end < 0 {
-			body = body + "\n- " + link + "\n"
-		} else {
-			at := idx + len("## 相关") + end
-			body = body[:at] + "\n- " + link + "\n" + body[at:]
+	return editPage(root, slug, func(vals map[string]any, body string) (string, bool) {
+		if strings.Contains(body, link) {
+			return fmt.Sprintf("%s 已有链接 %s,跳过", slug, link), false
 		}
-	} else {
-		body = strings.TrimRight(body, "\n") + "\n\n## 相关\n- " + link + "\n"
-	}
-	vals["updated"] = today()
-	if err := writePage(fp, vals, body); err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("已加链接 %s → %s", slug, link), nil
+		idx := strings.Index(body, "## 相关")
+		if idx >= 0 {
+			// 在「相关」节末尾插入(下一个 ## 前 / 文末)
+			end := strings.Index(body[idx+len("## 相关"):], "\n## ")
+			if end < 0 {
+				body = body + "\n- " + link + "\n"
+			} else {
+				at := idx + len("## 相关") + end
+				body = body[:at] + "\n- " + link + "\n" + body[at:]
+			}
+		} else {
+			body = strings.TrimRight(body, "\n") + "\n\n## 相关\n- " + link + "\n"
+		}
+		vals["updated"] = today()
+		return fmt.Sprintf("已加链接 %s → %s", slug, link), true
+	})
 }
 
 // Evidence 佐证/冲突回流(update_evidence 工具底座):给既有概念页追加证据。
@@ -96,19 +79,15 @@ func AddLink(root, slug, target string) (string, error) {
 // confidence 规则:独立源数 <2=low,2-3=medium,≥4=high;页面已有冲突标注时封顶 medium
 // (证据打架的页面不该标 high,但也不降级——冲突另在「张力与缺口」显式呈现)。
 func ApplyEvidence(root, slug, action, source, claim string) (string, error) {
-	fp, ok := ResolveSlug(root, slug)
-	if !ok {
-		return "", fmt.Errorf("页面不存在: %s", slug)
+	vals, body, fp, err := readPageBodyForEdit(root, slug)
+	if err != nil {
+		return "", err
 	}
 	if filepath.Base(filepath.Dir(fp)) != "concepts" {
 		return "", fmt.Errorf("update_evidence 只作用于概念页(wiki/concepts/),%s 位于 %s 目录", slug, filepath.Base(filepath.Dir(fp)))
 	}
-	b, err := os.ReadFile(fp)
-	if err != nil {
-		return "", err
-	}
-	vals, body := ParseFrontmatter(string(b))
 	sources := FrontmatterList(vals, "sources")
+	var ok bool // appendToSection 的「节存在」结果
 	switch action {
 	case "corroborate":
 		if source != "" && !contains(sources, source) {
@@ -122,7 +101,7 @@ func ApplyEvidence(root, slug, action, source, claim string) (string, error) {
 		if n >= 4 {
 			conf = "high"
 		}
-		if containsAny(body, "⚠️ 冲突", "⚠️ 矛盾", "矛盾声明", "CONTRADICTION") && conf == "high" {
+		if containsAny(body, contradictionMarkers...) && conf == "high" {
 			conf = "medium"
 		}
 		vals["sources"] = sources
@@ -177,6 +156,23 @@ func containsAny(s string, kws ...string) bool {
 		}
 	}
 	return false
+}
+
+// editPage 解析页面 → 交给 edit 就地改 frontmatter/正文 → 按需写回。
+// edit 返回 (消息, 是否写盘):幂等跳过类操作返回 write=false 则不动文件。
+func editPage(root, slug string, edit func(vals map[string]any, body string) (string, bool)) (string, error) {
+	vals, body, fp, err := readPageBodyForEdit(root, slug)
+	if err != nil {
+		return "", err
+	}
+	msg, write := edit(vals, body)
+	if !write {
+		return msg, nil
+	}
+	if err := writePage(fp, vals, body); err != nil {
+		return "", err
+	}
+	return msg, nil
 }
 
 // readPageBodyForEdit 解析页面 frontmatter + 正文,返回 (vals, body, fp, err)。

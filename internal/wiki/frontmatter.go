@@ -46,12 +46,9 @@ func ParseFrontmatter(text string) (map[string]any, string) {
 		switch {
 		case trim == "":
 			continue
-		case strings.HasPrefix(trim, "  - ") || strings.HasPrefix(trim, "- "):
+		case strings.HasPrefix(trim, "- "):
 			if cur != "" {
-				item := strings.TrimSpace(trim)
-				item = strings.TrimPrefix(item, "  - ")
-				item = strings.TrimPrefix(item, "- ")
-				list = append(list, strings.TrimSpace(item))
+				list = append(list, strings.TrimSpace(strings.TrimPrefix(trim, "- ")))
 			}
 		default:
 			flush()

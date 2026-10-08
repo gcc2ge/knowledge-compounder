@@ -88,6 +88,16 @@ func fullSourcePage(slug string) string {
 		"## 引用\nok\n"
 }
 
+// statSrc 读取源页文件信息;读取失败直接终止测试。
+func statSrc(t *testing.T, srcP string) os.FileInfo {
+	t.Helper()
+	fi, err := os.Stat(srcP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fi
+}
+
 // 基础 fixture:纯文本 raw(无硬资产,preflight 天然零问题)+ 已存在的完整源页。
 // 默认时间:raw 比源页旧 2 小时(页面不陈旧),模拟"上一轮已编译、本轮重编译"。
 func idempotentFixture(t *testing.T) (dir, rawRel, srcP string) {
@@ -110,10 +120,7 @@ func idempotentFixture(t *testing.T) (dir, rawRel, srcP string) {
 // 源页已最新 + 模型有真实参与(≥1 工具调用)→ 合法幂等重编译,放行。
 func TestIdempotentRecompile_AllowsFreshPage(t *testing.T) {
 	dir, rawRel, srcP := idempotentFixture(t)
-	fi, err := os.Stat(srcP)
-	if err != nil {
-		t.Fatal(err)
-	}
+	fi := statSrc(t, srcP)
 	if !idempotentRecompile(dir, rawRel, fi, srcP, 5) {
 		t.Fatal("源页最新 + 模型有参与应判幂等成功")
 	}
@@ -122,10 +129,7 @@ func TestIdempotentRecompile_AllowsFreshPage(t *testing.T) {
 // 零工具调用(真偷懒/假成功)→ 不放行,仍判失败。
 func TestIdempotentRecompile_RejectsZeroWork(t *testing.T) {
 	dir, rawRel, srcP := idempotentFixture(t)
-	fi, err := os.Stat(srcP)
-	if err != nil {
-		t.Fatal(err)
-	}
+	fi := statSrc(t, srcP)
 	if idempotentRecompile(dir, rawRel, fi, srcP, 0) {
 		t.Fatal("零工具调用(假成功)不应判幂等")
 	}
@@ -142,10 +146,7 @@ func TestIdempotentRecompile_RejectsStalePage(t *testing.T) {
 	if err := os.Chtimes(srcP, now.Add(-3*time.Hour), now.Add(-3*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	fi, err := os.Stat(srcP)
-	if err != nil {
-		t.Fatal(err)
-	}
+	fi := statSrc(t, srcP)
 	if idempotentRecompile(dir, rawRel, fi, srcP, 5) {
 		t.Fatal("源页陈旧(比 raw 旧)不应判幂等")
 	}
@@ -169,10 +170,7 @@ func TestIdempotentRecompile_RejectsMissingHardAssets(t *testing.T) {
 	os.Chtimes(filepath.Join(dir, rawRel), now.Add(-2*time.Hour), now.Add(-2*time.Hour))
 	srcP := filepath.Join(dir, "wiki", "sources", "x.md")
 	os.Chtimes(srcP, now.Add(-1*time.Hour), now.Add(-1*time.Hour))
-	fi, err := os.Stat(srcP)
-	if err != nil {
-		t.Fatal(err)
-	}
+	fi := statSrc(t, srcP)
 	if idempotentRecompile(dir, rawRel, fi, srcP, 5) {
 		t.Fatal("源页硬资产缺失(preflight 阻断)不应判幂等")
 	}

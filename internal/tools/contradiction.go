@@ -116,13 +116,9 @@ func ExtractClaims(text string) []string {
 		}
 		switch section {
 		case "## 一句话结论":
-			if len(conclusion) < 200 {
-				conclusion = collapseWS(conclusion + " " + t)
-			}
+			conclusion = appendClaim(conclusion, t, 200)
 		case "## 论证链":
-			if len(argument) < 300 {
-				argument = collapseWS(argument + " " + t)
-			}
+			argument = appendClaim(argument, t, 300)
 		}
 	}
 	var out []string
@@ -133,6 +129,14 @@ func ExtractClaims(text string) []string {
 		out = append(out, argument)
 	}
 	return out
+}
+
+// appendClaim 追加一行到声明文本;累计达到 cap 字后忽略后续行。
+func appendClaim(buf, line string, cap int) string {
+	if len(buf) >= cap {
+		return buf
+	}
+	return collapseWS(buf + " " + line)
 }
 
 // ScanContradictions 把源页关键声明与整个 wiki 页比对,返回最相近的去重相关页(排除本源自身)。
@@ -190,11 +194,12 @@ func ScanContradictions(root, slug, text string, k int) []ContradictionHit {
 	}
 
 	// 逐声明打分,页面取跨声明最高分。
-	type bestT struct {
+	type ranked struct {
+		i     int
 		score float64
 		claim string
 	}
-	best := map[int]bestT{}
+	best := map[int]ranked{}
 	for _, c := range claims {
 		feats := distinctiveBigrams(bigramsOf(c), df, high)
 		if len(feats) == 0 {
@@ -212,7 +217,7 @@ func ScanContradictions(root, slug, text string, k int) []ContradictionHit {
 				continue
 			}
 			if cur, ok := best[i]; !ok || score > cur.score {
-				best[i] = bestT{score, c}
+				best[i] = ranked{i, score, c}
 			}
 		}
 	}
@@ -220,14 +225,9 @@ func ScanContradictions(root, slug, text string, k int) []ContradictionHit {
 		return nil
 	}
 
-	type ranked struct {
-		i     int
-		score float64
-		claim string
-	}
 	var rs []ranked
-	for i, v := range best {
-		rs = append(rs, ranked{i, v.score, v.claim})
+	for _, v := range best {
+		rs = append(rs, v)
 	}
 	sort.Slice(rs, func(a, b int) bool {
 		if rs[a].score != rs[b].score {

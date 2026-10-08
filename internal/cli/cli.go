@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -70,8 +71,7 @@ func Main(args []string) int {
 	}
 	root, err := wiki.Root()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
+		return fail(err)
 	}
 	cfg := config.Load()
 
@@ -87,8 +87,7 @@ func Main(args []string) int {
 		return 0
 	case "observe":
 		if err := observe(root, args[1:]); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 1
+			return fail(err)
 		}
 		fmt.Println("观察已捕获到 raw/observations/")
 		return 0
@@ -97,53 +96,16 @@ func Main(args []string) int {
 	case "index":
 		fp, err := wiki.WriteIndex(root)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 1
+			return fail(err)
 		}
 		fmt.Println("已重建 " + fp)
 		return 0
 	case "skeleton":
 		return runSkeleton(root, args[1:])
 	case "preflight":
-		if len(args) < 2 {
-			fmt.Fprintln(os.Stderr, "用法: kcp preflight <raw> [--source-page <页>]")
-			return 1
-		}
-		sourcePage := ""
-		for i := 2; i < len(args); i++ {
-			if args[i] == "--source-page" && i+1 < len(args) {
-				sourcePage = filepath.Join(root, args[i+1])
-				i++
-			}
-		}
-		report, issues, err := wiki.Preflight(filepath.Join(root, args[1]), sourcePage)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 1
-		}
-		fmt.Print(report)
-		for _, it := range issues {
-			fmt.Println("  " + it)
-		}
-		if len(issues) > 0 {
-			return 1
-		}
-		return 0
+		return runPreflight(root, args[1:])
 	case "check-sources":
-		problems, err := wiki.CheckSourcesShrink(root)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 1
-		}
-		if len(problems) == 0 {
-			fmt.Println("check-sources: 无缩水,sources 完整。")
-			return 0
-		}
-		fmt.Println("⚠️ 概念/实体页 sources 缩水(compiler 重写 frontmatter 常见 bug):")
-		for _, p := range problems {
-			fmt.Println("  " + p)
-		}
-		return 1
+		return runCheckSources(root)
 	case "search":
 		if len(args) < 2 {
 			fmt.Fprintln(os.Stderr, "用法: kcp search \"<查询>\"")
@@ -151,37 +113,7 @@ func Main(args []string) int {
 		}
 		return runSearch(root, cfg, strings.Join(args[1:], " "))
 	case "eval":
-		seeds, k := "", 0
-		rebaseline := false
-		for i := 1; i < len(args); i++ {
-			switch args[i] {
-			case "--seeds":
-				if i+1 < len(args) {
-					seeds = args[i+1]
-					i++
-				}
-			case "--k":
-				if i+1 < len(args) {
-					fmt.Sscanf(args[i+1], "%d", &k)
-					i++
-				}
-			case "--rebaseline":
-				rebaseline = true
-			}
-		}
-		if k > 0 {
-			cfg.RetrieveK = k
-		}
-		seedList, err := eval.LoadSeeds(root, seeds)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 1
-		}
-		if _, err := eval.RunCompare(root, cfg, seedList, rebaseline); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 1
-		}
-		return 0
+		return runEval(root, cfg, args[1:])
 	case "mcp":
 		srv := mcp.New(root, eval.RetrievalOpts(root, cfg))
 		if err := srv.Serve(os.Stdin, os.Stdout); err != nil {
@@ -194,36 +126,7 @@ func Main(args []string) int {
 			fmt.Fprintln(os.Stderr, "用法: kcp compile <raw文件>")
 			return 1
 		}
-		start := time.Now() // 本轮是否产出源页的判据起点
-		_, toolCalls := runRole(root, cfg, "compiler", compileInput(root, args[1]), args[1])
-		// 收尾以确定性闸门为准,而非进程退出码:
-		// 预算边界完成(step 撞满但 FinishGuard 全过)→ runRole 仍可能返回错误,但页面已达标;
-		// 反之 API 失败/超时也可能留下完整页。postCompileQA 无条件跑——
-		// 「写了但严重残缺」必须 RESULT_FAIL(M11 只填 31/101 代码块仍 RESULT_OK 的教训),
-		// 「完成于边界却被误杀」同样不允许。三态:
-		//  ①源页本轮已落盘且闸门全过 → 成功;
-		//  ②落盘但 preflight 有阻断性缺失 → 失败;
-		//  ③本轮未落盘 → 幂等判定(模型真实参与 + raw 未变 + 页面达标)才成功。
-		slug := strings.TrimSuffix(filepath.Base(args[1]), ".md")
-		sourcePage := filepath.Join(root, "wiki", "sources", slug+".md")
-		fi, statErr := os.Stat(sourcePage)
-		writtenThisRound := statErr == nil && fi.ModTime().After(start)
-
-		blocking := postCompileQA(root, args[1], cfg) // Stop hook 语义:编译完自动核对;返回阻断性缺失数
-		if writtenThisRound {
-			if blocking > 0 {
-				fmt.Fprintf(os.Stderr, "  ⚠️ 源页 %s.md 本轮已写入但 preflight 仍有 %d 项阻断性缺失,返回失败码(详情见上方自动质检)。\n", slug, blocking)
-				return 1
-			}
-			fmt.Fprintf(os.Stderr, "  ✅ 源页 %s.md 本轮已写入且闸门全过。\n", slug)
-			return 0
-		}
-		if idempotentRecompile(root, args[1], fi, sourcePage, toolCalls) {
-			fmt.Fprintf(os.Stderr, "  ℹ️ 源页 %s.md 本轮未重写:raw 未变、页面已最新且模型有真实参与,判定为幂等重编译(成功)。\n", slug)
-			return 0
-		}
-		fmt.Fprintf(os.Stderr, "  ⚠️ compile 未产出源页 wiki/sources/%s.md,返回失败码。\n", slug)
-		return 1
+		return runCompile(root, cfg, args[1])
 	case "relink-all":
 		// 独立命令形态(usage/批量脚本用 `kcp relink-all`);等价于 `kcp relink all`。
 		force := len(args) >= 2 && (args[1] == "--force" || args[1] == "-f")
@@ -256,39 +159,7 @@ func Main(args []string) int {
 		code, _ := runRole(root, cfg, "query", strings.Join(args[1:], " "), "")
 		return code
 	case "repair-concepts":
-		// 修复被系统压缩占位符污染的概念页:扫描出污染页重建(默认),或显式指定 slug。
-		slugs := args[1:]
-		if len(slugs) == 0 || (len(slugs) == 1 && (slugs[0] == "--all" || slugs[0] == "all")) {
-			slugs = corruptedSlugs(root)
-			if len(slugs) == 0 {
-				fmt.Println("无被压缩占位符污染的概念页,无需修复。")
-				return 0
-			}
-			fmt.Printf("检测到 %d 个被污染的概念页,开始重建…\n", len(slugs))
-		}
-		failed := 0
-		for _, slug := range slugs {
-			slug = strings.TrimSuffix(slug, ".md")
-			conceptPage := filepath.Join("wiki", "concepts", slug+".md")
-			code, _ := runRole(root, cfg, "repair", repairInput(root, slug), conceptPage)
-			if code == 0 {
-				if strings.Contains(wiki.Read(filepath.Join(root, conceptPage)), wiki.CompactionMarker) {
-					fmt.Printf("RESULT_FAIL: %s (占位符仍存在)\n", slug)
-					failed++
-					continue
-				}
-				fmt.Printf("RESULT_OK: %s\n", slug)
-			} else {
-				fmt.Printf("RESULT_FAIL: %s\n", slug)
-				failed++
-			}
-		}
-		if _, err := wiki.WriteIndex(root); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 1
-		}
-		fmt.Printf("REPAIR_DONE: %d 页失败\n", failed)
-		return 0
+		return runRepairConcepts(root, cfg, args[1:])
 	default:
 		// 兜底:把第一个参数当角色
 		if args[0] == "compiler" || args[0] == "qa" || args[0] == "query" {
@@ -302,6 +173,175 @@ func Main(args []string) int {
 		fmt.Fprintf(os.Stderr, "未知命令: %s\n%s", args[0], usage)
 		return 1
 	}
+}
+
+// fail 打印错误到 stderr 并返回退出码 1(命令失败统一出口)。
+func fail(err error) int {
+	fmt.Fprintln(os.Stderr, err)
+	return 1
+}
+
+// flagValue 读取 args[i] 后紧跟的标志取值;越界时返回 ok=false 且不前移游标。
+// 约定:调用前已确认 args[i] 是需要取值的标志。
+func flagValue(args []string, i *int) (v string, ok bool) {
+	if *i+1 < len(args) {
+		*i++
+		return args[*i], true
+	}
+	return "", false
+}
+
+// issuesBrief 取首个问题,多条时附总数(单行提示用)。
+func issuesBrief(issues []string) string {
+	brief := issues[0]
+	if len(issues) > 1 {
+		brief += fmt.Sprintf("(…共 %d 项)", len(issues))
+	}
+	return brief
+}
+
+// runCompile 执行单源编译,收尾以确定性闸门为准而非进程退出码:
+// 预算边界完成(step 撞满但 FinishGuard 全过)→ runRole 仍可能返回错误,但页面已达标;
+// 反之 API 失败/超时也可能留下完整页。postCompileQA 无条件跑——
+// 「写了但严重残缺」必须 RESULT_FAIL(M11 只填 31/101 代码块仍 RESULT_OK 的教训),
+// 「完成于边界却被误杀」同样不允许。三态:
+//
+//	①源页本轮已落盘且闸门全过 → 成功;
+//	②落盘但 preflight 有阻断性缺失 → 失败;
+//	③本轮未落盘 → 幂等判定(模型真实参与 + raw 未变 + 页面达标)才成功。
+func runCompile(root string, cfg config.Config, rawFile string) int {
+	start := time.Now() // 本轮是否产出源页的判据起点
+	_, toolCalls := runRole(root, cfg, "compiler", compileInput(root, rawFile), rawFile)
+	slug := strings.TrimSuffix(filepath.Base(rawFile), ".md")
+	sourcePage := filepath.Join(root, "wiki", "sources", slug+".md")
+	fi, statErr := os.Stat(sourcePage)
+	writtenThisRound := statErr == nil && fi.ModTime().After(start)
+
+	blocking := postCompileQA(root, rawFile, cfg) // Stop hook 语义:编译完自动核对;返回阻断性缺失数
+	if writtenThisRound {
+		if blocking > 0 {
+			fmt.Fprintf(os.Stderr, "  ⚠️ 源页 %s.md 本轮已写入但 preflight 仍有 %d 项阻断性缺失,返回失败码(详情见上方自动质检)。\n", slug, blocking)
+			return 1
+		}
+		fmt.Fprintf(os.Stderr, "  ✅ 源页 %s.md 本轮已写入且闸门全过。\n", slug)
+		return 0
+	}
+	if idempotentRecompile(root, rawFile, fi, sourcePage, toolCalls) {
+		fmt.Fprintf(os.Stderr, "  ℹ️ 源页 %s.md 本轮未重写:raw 未变、页面已最新且模型有真实参与,判定为幂等重编译(成功)。\n", slug)
+		return 0
+	}
+	fmt.Fprintf(os.Stderr, "  ⚠️ compile 未产出源页 wiki/sources/%s.md,返回失败码。\n", slug)
+	return 1
+}
+
+// runEval 解析 --seeds/--k/--rebaseline 后跑 RAG-vs-编译复利对照实验。
+func runEval(root string, cfg config.Config, args []string) int {
+	seeds, k := "", 0
+	rebaseline := false
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--seeds":
+			if v, ok := flagValue(args, &i); ok {
+				seeds = v
+			}
+		case "--k":
+			if v, ok := flagValue(args, &i); ok {
+				fmt.Sscanf(v, "%d", &k)
+			}
+		case "--rebaseline":
+			rebaseline = true
+		}
+	}
+	if k > 0 {
+		cfg.RetrieveK = k
+	}
+	seedList, err := eval.LoadSeeds(root, seeds)
+	if err != nil {
+		return fail(err)
+	}
+	if _, err := eval.RunCompare(root, cfg, seedList, rebaseline); err != nil {
+		return fail(err)
+	}
+	return 0
+}
+
+// runPreflight 硬资产完整性核验(代码块/表/示例不丢)。
+func runPreflight(root string, args []string) int {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "用法: kcp preflight <raw> [--source-page <页>]")
+		return 1
+	}
+	sourcePage := ""
+	for i := 1; i < len(args); i++ {
+		if args[i] == "--source-page" {
+			if v, ok := flagValue(args, &i); ok {
+				sourcePage = filepath.Join(root, v)
+			}
+		}
+	}
+	report, issues, err := wiki.Preflight(filepath.Join(root, args[0]), sourcePage)
+	if err != nil {
+		return fail(err)
+	}
+	fmt.Print(report)
+	for _, it := range issues {
+		fmt.Println("  " + it)
+	}
+	if len(issues) > 0 {
+		return 1
+	}
+	return 0
+}
+
+// runCheckSources 检查概念/实体页 sources 是否被错误替换(git)。
+func runCheckSources(root string) int {
+	problems, err := wiki.CheckSourcesShrink(root)
+	if err != nil {
+		return fail(err)
+	}
+	if len(problems) == 0 {
+		fmt.Println("check-sources: 无缩水,sources 完整。")
+		return 0
+	}
+	fmt.Println("⚠️ 概念/实体页 sources 缩水(compiler 重写 frontmatter 常见 bug):")
+	for _, p := range problems {
+		fmt.Println("  " + p)
+	}
+	return 1
+}
+
+// runRepairConcepts 修复被系统压缩占位符污染的概念页:扫描出污染页重建(默认),或显式指定 slug。
+func runRepairConcepts(root string, cfg config.Config, slugs []string) int {
+	if len(slugs) == 0 || (len(slugs) == 1 && (slugs[0] == "--all" || slugs[0] == "all")) {
+		slugs = corruptedSlugs(root)
+		if len(slugs) == 0 {
+			fmt.Println("无被压缩占位符污染的概念页,无需修复。")
+			return 0
+		}
+		fmt.Printf("检测到 %d 个被污染的概念页,开始重建…\n", len(slugs))
+	}
+	failed := 0
+	for _, slug := range slugs {
+		slug = strings.TrimSuffix(slug, ".md")
+		conceptPage := filepath.Join("wiki", "concepts", slug+".md")
+		code, _ := runRole(root, cfg, "repair", repairInput(root, slug), conceptPage)
+		if code == 0 {
+			if strings.Contains(wiki.Read(filepath.Join(root, conceptPage)), wiki.CompactionMarker) {
+				fmt.Printf("RESULT_FAIL: %s (占位符仍存在)\n", slug)
+				failed++
+				continue
+			}
+			fmt.Printf("RESULT_OK: %s\n", slug)
+		} else {
+			fmt.Printf("RESULT_FAIL: %s\n", slug)
+			failed++
+		}
+	}
+	if _, err := wiki.WriteIndex(root); err != nil {
+		return fail(err)
+	}
+	fmt.Printf("REPAIR_DONE: %d 页失败\n", failed)
+	return 0
 }
 
 // compileInput 组装 compiler 的任务输入:路径 + 短预览 + 分页读取指示。
@@ -390,7 +430,7 @@ func postCompileQA(root, rawFile string, cfg config.Config) int {
 			}
 			conflictLabels := conflictMarkedLabels(text)
 			for _, h := range hits {
-				if !hasStdMarker || !contains(conflictLabels, h.Result.Label) || !strings.Contains(h.Result.Path, "concepts") {
+				if !hasStdMarker || !slices.Contains(conflictLabels, h.Result.Label) || !strings.Contains(h.Result.Path, "concepts") {
 					continue
 				}
 				if cb, err := os.ReadFile(filepath.Join(root, h.Result.Path)); err == nil {
@@ -443,16 +483,6 @@ func conceptWeakMarkerProblems(root string, hits []tools.ContradictionHit) []str
 		}
 	}
 	return out
-}
-
-// contains 字符串切片包含判断(小工具,避免引入外部依赖)。
-func contains(xs []string, s string) bool {
-	for _, x := range xs {
-		if x == s {
-			return true
-		}
-	}
-	return false
 }
 
 // containsAny 任一关键字命中。
@@ -535,29 +565,31 @@ func runRole(root string, cfg config.Config, role, input, rawFile string) (int, 
 	system += fmt.Sprintf("\n\n今天日期:%s。frontmatter 的 compiled/created/updated 一律用它,不要自己猜。",
 		time.Now().Format("2006-01-02"))
 
-	// 编译一个源:读全文(长源分页)+ 逐块写页(10-20 次 edit_file)+ 矛盾核对/建概念页 + 状态核对。
-	// 用户显式设 KCP_MAX_STEPS 时不覆盖;实测 M01(45KB)在 25 步内没跑完就死在写页中途,按 raw 大小分档给足预算。
+	// 用户显式设 KCP_MAX_STEPS 时不覆盖;其余按角色分档给足预算:
+	// compiler 读全文(长源分页)+ 逐块写页(10-20 次 edit_file)+ 矛盾核对/建概念页 + 状态核对,
+	// 实测 M01(45KB)在 25 步内没跑完就死在写页中途,按 raw 大小分档。
 	steps := cfg.MaxSteps
-	if role == "compiler" && os.Getenv("KCP_MAX_STEPS") == "" {
-		steps = 30
-		if rawFile != "" {
-			if fi, err := os.Stat(filepath.Join(root, rawFile)); err == nil {
-				switch {
-				case fi.Size() > 160<<10:
-					steps = 80
-				case fi.Size() > 80<<10:
-					steps = 60
-				case fi.Size() > 40<<10:
-					steps = 45
+	if os.Getenv("KCP_MAX_STEPS") == "" {
+		switch role {
+		case "compiler":
+			steps = 30
+			if rawFile != "" {
+				if fi, err := os.Stat(filepath.Join(root, rawFile)); err == nil {
+					switch {
+					case fi.Size() > 160<<10:
+						steps = 80
+					case fi.Size() > 80<<10:
+						steps = 60
+					case fi.Size() > 40<<10:
+						steps = 45
+					}
 				}
 			}
+		case "relink":
+			steps = 30 // 回访不重读 raw 全文,固定预算即可;质量由 FinishGuard 闸门兜底
+		case "repair":
+			steps = 20 // 概念页重建:读受损页 + 检索来源 + 读 1-2 个 source 页 + 整页重写,比编译轻
 		}
-	}
-	if role == "relink" && os.Getenv("KCP_MAX_STEPS") == "" {
-		steps = 30 // 回访不重读 raw 全文,固定预算即可;质量由 FinishGuard 闸门兜底
-	}
-	if role == "repair" && os.Getenv("KCP_MAX_STEPS") == "" {
-		steps = 20 // 概念页重建:读受损页 + 检索来源 + 读 1-2 个 source 页 + 整页重写,比编译轻
 	}
 
 	// describe_image 的视觉回调:type-assert provider 到 VisionProvider;非多模态则提示(Tier 2 vision)。
@@ -579,28 +611,21 @@ func runRole(root string, cfg config.Config, role, input, rawFile string) (int, 
 		defer idx.Save(root) // 进程退出前把索引增量留给下次(原子写)
 	}
 
-	// StateFile 按 raw slug 隔离(compile 场景):连续编译多个源若共用同一个 KCP_STATE_FILE,
-	// runtime 会无条件 loadCheckpoint() 把上一次的消息历史带进这一次——模型可能误以为该源已编译
-	// 或被困在旧任务。隔离后每个源有自己的 checkpoint,互不污染(P5)。
-	if role == "compiler" && rawFile != "" && cfg.StateFile != "" {
+	// StateFile 按 raw slug + 角色隔离(P5):compile 复用同一 KCP_STATE_FILE 时,
+	// runtime 会无条件 loadCheckpoint() 把上一次的消息历史带进这一次,模型可能误以为该源已编译
+	// 或被困在旧任务;relink/repair 用独立前缀,不复用任何历史,避免旧消息误导。
+	if rawFile != "" && cfg.StateFile != "" {
 		slug := strings.TrimSuffix(filepath.Base(rawFile), ".md")
 		dir := filepath.Join(root, ".kcp", "state")
 		_ = os.MkdirAll(dir, 0o755)
-		cfg.StateFile = filepath.Join(dir, slug+".json")
-	}
-	// relink 独立 checkpoint(relink-<slug>.json),不复用 compile 历史——compile 消息会误导模型以为补强已完成(P5)。
-	if role == "relink" && rawFile != "" && cfg.StateFile != "" {
-		slug := strings.TrimSuffix(filepath.Base(rawFile), ".md")
-		dir := filepath.Join(root, ".kcp", "state")
-		_ = os.MkdirAll(dir, 0o755)
-		cfg.StateFile = filepath.Join(dir, "relink-"+slug+".json")
-	}
-	// repair 独立 checkpoint(repair-<slug>.json),不复用任何历史——修复会话是全新的,旧消息会误导。
-	if role == "repair" && rawFile != "" && cfg.StateFile != "" {
-		slug := strings.TrimSuffix(filepath.Base(rawFile), ".md")
-		dir := filepath.Join(root, ".kcp", "state")
-		_ = os.MkdirAll(dir, 0o755)
-		cfg.StateFile = filepath.Join(dir, "repair-"+slug+".json")
+		prefix := ""
+		switch role {
+		case "relink":
+			prefix = "relink-"
+		case "repair":
+			prefix = "repair-"
+		}
+		cfg.StateFile = filepath.Join(dir, prefix+slug+".json")
 	}
 
 	rt := &agent.Runtime{
@@ -635,11 +660,7 @@ func runRole(root string, cfg config.Config, role, input, rawFile string) (int, 
 				return fmt.Sprintf("⚠️ 编译未完成:目标 wiki/sources/%s.md 还不存在。你现在必须调用 write_file 落盘源页草稿(至少 frontmatter + 一句话结论 + 论证链骨架),然后可继续完善;只输出总结文本不算完成。", slug)
 			}
 			if _, issues, err := wiki.Preflight(filepath.Join(root, rawFile), sourcePage); err == nil && len(issues) > 0 {
-				brief := issues[0]
-				if len(issues) > 1 {
-					brief += fmt.Sprintf("(…共 %d 项)", len(issues))
-				}
-				return fmt.Sprintf("⚠️ 源页 preflight 未通过:%s。继续完善 wiki/sources/%s.md——按 SCHEMA 补齐缺失硬资产与节,全部通过后再收尾。", brief, slug)
+				return fmt.Sprintf("⚠️ 源页 preflight 未通过:%s。继续完善 wiki/sources/%s.md——按 SCHEMA 补齐缺失硬资产与节,全部通过后再收尾。", issuesBrief(issues), slug)
 			}
 			// ③ 节标题重复 = 结构损坏(edit_file 尾部追加失控的产物,如 M01 整页写两遍)。
 			// 源页存在 + preflight 硬资产不缺也拦不住——「每节恰好一次」才是 SCHEMA 结构完整判据。
@@ -694,11 +715,7 @@ func runRole(root string, cfg config.Config, role, input, rawFile string) (int, 
 			if _, issues, perr := wiki.Preflight(filepath.Join(root, rawFile), sourcePage); perr == nil && len(issues) >= 2 {
 				midLastStep = step
 				midInjected++
-				brief := issues[0]
-				if len(issues) > 1 {
-					brief += fmt.Sprintf("(…共 %d 项)", len(issues))
-				}
-				return fmt.Sprintf("⚠️ 源页 %s.md 当前缺失 %d 项硬资产(%s)。read_file 读回 raw 对应段落,把这些代码块/表/示例**逐字**补进源页对应节再继续推进——不要先写完整页再回头补,预算会被烧光。", slug, len(issues), brief)
+				return fmt.Sprintf("⚠️ 源页 %s.md 当前缺失 %d 项硬资产(%s)。read_file 读回 raw 对应段落,把这些代码块/表/示例**逐字**补进源页对应节再继续推进——不要先写完整页再回头补,预算会被烧光。", slug, len(issues), issuesBrief(issues))
 			}
 			midLastStep = step
 			return ""
@@ -717,11 +734,7 @@ func runRole(root string, cfg config.Config, role, input, rawFile string) (int, 
 				return fmt.Sprintf("⚠️ 源页 %s.md 结构损坏:节标题重复(%s)。删除重复整节、内容合并到该节唯一位置(已存在的节标题绝不重写)。", slug, strings.Join(dup, "、"))
 			}
 			if _, issues, err := wiki.Preflight(filepath.Join(root, rawFile), sourcePage); err == nil && len(issues) > 0 {
-				brief := issues[0]
-				if len(issues) > 1 {
-					brief += fmt.Sprintf("(…共 %d 项)", len(issues))
-				}
-				return fmt.Sprintf("⚠️ 源页 preflight 未通过:%s。补强改动破坏了硬资产——修复 wiki/sources/%s.md 使其通过。", brief, slug)
+				return fmt.Sprintf("⚠️ 源页 preflight 未通过:%s。补强改动破坏了硬资产——修复 wiki/sources/%s.md 使其通过。", issuesBrief(issues), slug)
 			}
 			if !contradictionLog.Scanned(slug) {
 				return fmt.Sprintf("⚠️ 你还没运行 check_contradictions(source=\"%s\")。现在 wiki 已完整,必须重新对照,把相关页的 冲突/佐证/无涉 结论写进「连接」。", slug)
@@ -851,8 +864,7 @@ func relinkInput(root, slug string, cands []wiki.Candidate) string {
 func relinkAll(root string, cfg config.Config, force bool) int {
 	pages, err := filepath.Glob(filepath.Join(root, "wiki", "sources", "*.md"))
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
+		return fail(err)
 	}
 	if len(pages) == 0 {
 		fmt.Println("wiki/sources/ 无已编译页,无需 relink。")
@@ -900,8 +912,7 @@ func relinkAll(root string, cfg config.Config, force bool) int {
 		}
 	}
 	if _, err := wiki.WriteIndex(root); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
+		return fail(err)
 	}
 	fmt.Printf("RELINK_DONE: %d 页失败, %d 页跳过\n", failed, skipped)
 	return 0
@@ -944,8 +955,7 @@ func runUpdate(root string, args []string) int {
 		err = fmt.Errorf("未知 update 操作: %s(支持 add-source/touch/add-link)", args[0])
 	}
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
+		return fail(err)
 	}
 	fmt.Println(msg)
 	return 0
@@ -963,14 +973,12 @@ func runSkeleton(root string, args []string) int {
 	for i := 1; i < len(args); i++ {
 		switch args[i] {
 		case "--tags":
-			if i+1 < len(args) {
-				tags = args[i+1]
-				i++
+			if v, ok := flagValue(args, &i); ok {
+				tags = v
 			}
 		case "--origin":
-			if i+1 < len(args) {
-				origin = args[i+1]
-				i++
+			if v, ok := flagValue(args, &i); ok {
+				origin = v
 			}
 		case "--write":
 			write = true
@@ -978,8 +986,7 @@ func runSkeleton(root string, args []string) int {
 	}
 	body, err := wiki.Skeleton(root, rawPath, tags, origin)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
+		return fail(err)
 	}
 	if !write {
 		fmt.Println(body)
@@ -988,8 +995,7 @@ func runSkeleton(root string, args []string) int {
 	slug := strings.TrimSuffix(filepath.Base(rawPath), filepath.Ext(rawPath))
 	fp := filepath.Join(root, "wiki", "sources", slug+".md")
 	if err := os.WriteFile(fp, []byte(body), 0o644); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
+		return fail(err)
 	}
 	rel, _ := filepath.Rel(root, fp)
 	fmt.Println("已写入 " + rel)
@@ -1038,19 +1044,16 @@ func observe(root string, args []string) error {
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "-s":
-			if i+1 < len(args) {
-				strategy = args[i+1]
-				i++
+			if v, ok := flagValue(args, &i); ok {
+				strategy = v
 			}
 		case "-T":
-			if i+1 < len(args) {
-				title = args[i+1]
-				i++
+			if v, ok := flagValue(args, &i); ok {
+				title = v
 			}
 		case "-c":
-			if i+1 < len(args) {
-				content = args[i+1]
-				i++
+			if v, ok := flagValue(args, &i); ok {
+				content = v
 			}
 		}
 	}

@@ -10,8 +10,8 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -23,9 +23,7 @@ type OpenAICompatible struct {
 	MaxTokens int // 0 = 模型默认上限;>0 透传 max_tokens 限制单次输出长度
 	Client    *http.Client
 
-	// 工具定义序列化缓存:一次运行的工具集固定(工具名唯一),避免每步 Chat 重建 map。
-	toolCacheKey  string
-	toolCacheDefs []map[string]any
+	tools toolDefsCache // 工具定义序列化缓存
 }
 
 func NewOpenAICompatible(model, apiKey, baseURL string) *OpenAICompatible {
@@ -58,32 +56,9 @@ func buildOpenAITools(tools []ToolDef) []map[string]any {
 	return defs
 }
 
-// openAITools 缓存版 buildOpenAITools:一次运行的工具集固定,按工具名列表签名缓存,
-// 避免每步 Chat/Stream 重建 map。签名含 name+参数个数,足以区分不同工具集。
+// openAITools 缓存版 buildOpenAITools:一次运行的工具集固定,按签名复用。
 func (p *OpenAICompatible) openAITools(tools []ToolDef) []map[string]any {
-	if len(tools) == 0 {
-		return nil
-	}
-	key := toolsSignature(tools)
-	if key == p.toolCacheKey {
-		return p.toolCacheDefs
-	}
-	defs := buildOpenAITools(tools)
-	p.toolCacheKey, p.toolCacheDefs = key, defs
-	return defs
-}
-
-// toolsSignature 工具集指纹:name+参数个数。一次运行内工具名唯一且参数绑定 name,
-// 此签名足以区分不同工具集;O(len(tools)) 免哈希。
-func toolsSignature(tools []ToolDef) string {
-	var b strings.Builder
-	for _, t := range tools {
-		b.WriteString(t.Name)
-		b.WriteByte(':')
-		b.WriteString(strconv.Itoa(len(t.Parameters)))
-		b.WriteByte('\n')
-	}
-	return b.String()
+	return p.tools.get(tools, buildOpenAITools)
 }
 
 // messagesToAPI 把统一 Message 转成 OpenAI chat 格式(tool_calls / tool 角色)。
@@ -113,8 +88,14 @@ func messagesToAPI(msgs []Message) []map[string]any {
 	return out
 }
 
-func (p *OpenAICompatible) Chat(ctx context.Context, msgs []Message, tools []ToolDef, stop []string) (Message, error) {
+// chatPayload 构建 chat/completions 请求体;stream 时带 include_usage 末帧 usage。
+func (p *OpenAICompatible) chatPayload(msgs []Message, tools []ToolDef, stop []string, stream bool) map[string]any {
 	payload := map[string]any{"model": p.Model, "messages": messagesToAPI(msgs)}
+	if stream {
+		payload["stream"] = true
+		// stream_options.include_usage 让流式末帧携带 usage(真实 token 消耗,供 MaxTokens 闸门)
+		payload["stream_options"] = map[string]any{"include_usage": true}
+	}
 	if p.MaxTokens > 0 {
 		payload["max_tokens"] = p.MaxTokens
 	}
@@ -124,30 +105,39 @@ func (p *OpenAICompatible) Chat(ctx context.Context, msgs []Message, tools []Too
 	if len(stop) > 0 {
 		payload["stop"] = stop
 	}
+	return payload
+}
 
+// post 发送 chat/completions 请求;非 200 时归一为带错误体的错误。
+func (p *OpenAICompatible) post(ctx context.Context, payload any, errLabel string) (*http.Response, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return Message{}, err
+		return nil, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.BaseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
-		return Message{}, err
+		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if p.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+p.APIKey)
 	}
-
 	resp, err := p.Client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, decodeAPIError(resp, errLabel)
+	}
+	return resp, nil
+}
+
+func (p *OpenAICompatible) Chat(ctx context.Context, msgs []Message, tools []ToolDef, stop []string) (Message, error) {
+	resp, err := p.post(ctx, p.chatPayload(msgs, tools, stop, false), "LLM API")
 	if err != nil {
 		return Message{}, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		var e struct{ Error map[string]any }
-		_ = json.NewDecoder(resp.Body).Decode(&e)
-		return Message{}, fmt.Errorf("LLM API %d: %v", resp.StatusCode, e.Error)
-	}
 	var data struct {
 		Choices []struct {
 			Message struct {
@@ -184,40 +174,11 @@ func (p *OpenAICompatible) Chat(ctx context.Context, msgs []Message, tools []Too
 
 // Stream SSE 流式版 Chat:delta.content → onDelta;tool_calls 增量按 index 归并。
 func (p *OpenAICompatible) Stream(ctx context.Context, msgs []Message, tools []ToolDef, stop []string, onDelta func(string)) (Message, error) {
-	payload := map[string]any{"model": p.Model, "messages": messagesToAPI(msgs), "stream": true}
-	if p.MaxTokens > 0 {
-		payload["max_tokens"] = p.MaxTokens
-	}
-	if defs := p.openAITools(tools); len(defs) > 0 {
-		payload["tools"] = defs
-	}
-	// stream_options.include_usage 让流式末帧携带 usage(真实 token 消耗,供 MaxTokens 闸门)
-	payload["stream_options"] = map[string]any{"include_usage": true}
-	if len(stop) > 0 {
-		payload["stop"] = stop
-	}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return Message{}, err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.BaseURL+"/chat/completions", bytes.NewReader(body))
-	if err != nil {
-		return Message{}, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if p.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+p.APIKey)
-	}
-	resp, err := p.Client.Do(req)
+	resp, err := p.post(ctx, p.chatPayload(msgs, tools, stop, true), "LLM API")
 	if err != nil {
 		return Message{}, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		var e struct{ Error map[string]any }
-		_ = json.NewDecoder(resp.Body).Decode(&e)
-		return Message{}, fmt.Errorf("LLM API %d: %v", resp.StatusCode, e.Error)
-	}
 
 	out := Message{Role: "assistant"}
 	toolByIndex := map[int]*ToolCall{}
@@ -321,28 +282,11 @@ func (p *OpenAICompatible) Vision(ctx context.Context, imagePath, prompt string)
 			},
 		}},
 	}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return "", err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.BaseURL+"/chat/completions", bytes.NewReader(body))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if p.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+p.APIKey)
-	}
-	resp, err := p.Client.Do(req)
+	resp, err := p.post(ctx, payload, "视觉 API")
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		var e struct{ Error map[string]any }
-		_ = json.NewDecoder(resp.Body).Decode(&e)
-		return "", fmt.Errorf("视觉 API %d: %v", resp.StatusCode, e.Error)
-	}
 	var data struct {
 		Choices []struct {
 			Message struct {
@@ -361,7 +305,7 @@ func (p *OpenAICompatible) Vision(ctx context.Context, imagePath, prompt string)
 
 // imageMIME 按扩展名给 MIME;不认识返回空(调用方报错)。
 func imageMIME(path string) string {
-	switch strings.ToLower(filepathExt(path)) {
+	switch strings.ToLower(filepath.Ext(path)) {
 	case ".png":
 		return "image/png"
 	case ".jpg", ".jpeg":
@@ -372,13 +316,6 @@ func imageMIME(path string) string {
 		return "image/webp"
 	case ".bmp":
 		return "image/bmp"
-	}
-	return ""
-}
-
-func filepathExt(path string) string {
-	if i := strings.LastIndexByte(path, '.'); i >= 0 {
-		return path[i:]
 	}
 	return ""
 }

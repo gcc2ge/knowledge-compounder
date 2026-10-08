@@ -61,31 +61,7 @@ func (s *Server) register() {
 	s.tools["search_wiki"] = toolDef{
 		name: "search_wiki", desc: "混合检索 wiki 页面(词法+语义向量),返回标题+私有度徽标+命中分+摘要",
 		params: obj(map[string]any{"query": strProp, "k": intProp}),
-		call: func(a map[string]any) string {
-			q := strArg(a, "query")
-			if q == "" {
-				return "参数 query 必填。"
-			}
-			opts := s.opts
-			if k := intArg(a, "k", 5); k > 0 {
-				opts.Top = k
-			}
-			s.sync()
-			var res []retrieval.Result
-			if s.idx != nil {
-				res = s.idx.Rank(q, opts)
-			} else {
-				res = wiki.Retrieve(s.root, q, opts)
-			}
-			if len(res) == 0 {
-				return "知识库中未找到与查询匹配的页面。"
-			}
-			var b strings.Builder
-			for _, r := range res {
-				fmt.Fprintf(&b, "- [[%s]] %s 命中%.2f: %s\n", r.Label, wiki.EvidenceBadge(s.root, r.Path), r.Score, r.Summary)
-			}
-			return b.String()
-		},
+		call:   s.searchWiki,
 	}
 	s.tools["wiki_mentions"] = toolDef{
 		name: "wiki_mentions", desc: "统计术语被几个源页提及(建页纪律判据);terms 支持批量",
@@ -93,179 +69,235 @@ func (s *Server) register() {
 			"term":  strProp,
 			"terms": map[string]any{"type": "array", "items": strProp},
 		}),
-		call: func(a map[string]any) string {
-			var terms []string
-			if arr, ok := a["terms"].([]any); ok {
-				for _, v := range arr {
-					if s, ok := v.(string); ok && s != "" {
-						terms = append(terms, s)
-					}
-				}
-			}
-			if t := strArg(a, "term"); t != "" {
-				terms = append(terms, t)
-			}
-			if len(terms) == 0 {
-				return "term/terms 至少提供一个。"
-			}
-			s.sync()
-			if s.idx != nil {
-				return s.idx.FormatMentions(s.idx.Mentions(terms)) // 三档话术 + 子串/短词护栏
-			}
-			// 降级:全扫
-			files, _ := filepath.Glob(filepath.Join(s.root, "wiki", "sources", "*.md"))
-			var b strings.Builder
-			for _, t := range terms {
-				n := 0
-				var hits []string
-				for _, f := range files {
-					if c, err := os.ReadFile(f); err == nil && strings.Contains(strings.ToLower(string(c)), strings.ToLower(t)) {
-						n++
-						hits = append(hits, strings.TrimSuffix(filepath.Base(f), ".md"))
-					}
-				}
-				if n == 0 {
-					fmt.Fprintf(&b, "「%s」未被任何源页提及。\n", t)
-				} else if n == 1 {
-					fmt.Fprintf(&b, "「%s」仅 1 个源提及(%s)——单次提及,不建页。\n", t, hits[0])
-				} else {
-					fmt.Fprintf(&b, "「%s」被 %d 个源提及(%s)——≥2,满足建页纪律。\n", t, n, strings.Join(hits, "、"))
-				}
-			}
-			return strings.TrimSuffix(b.String(), "\n")
-		},
+		call: s.wikiMentions,
 	}
 	s.tools["backlinks"] = toolDef{
 		name: "backlinks", desc: "查页面双向链接:入站(谁链它)/出站(它链谁,断链单独标出)",
 		params: obj(map[string]any{"page": strProp}),
-		call: func(a map[string]any) string {
-			slug := strings.TrimSuffix(strArg(a, "page"), ".md")
-			if slug == "" {
-				return "参数 page 必填。"
-			}
-			s.sync()
-			if s.idx != nil {
-				in, out := s.idx.Backlinks(slug)
-				var b strings.Builder
-				fmt.Fprintf(&b, "[[%s]] 入站 %d 条:", slug, len(in))
-				if len(in) == 0 {
-					b.WriteString(" 无(孤儿页)")
-				} else {
-					b.WriteString(" " + strings.Join(in, "、"))
-				}
-				var okLinks, broken []string
-				for _, o := range out {
-					if s.idx.HasSlug(o) {
-						okLinks = append(okLinks, o)
-					} else {
-						broken = append(broken, o)
-					}
-				}
-				fmt.Fprintf(&b, "\n出站 %d 条: %s", len(out), strings.Join(okLinks, "、"))
-				if len(broken) > 0 {
-					fmt.Fprintf(&b, "\n断链: %s", strings.Join(broken, "、"))
-				}
-				return b.String()
-			}
-			text, _, ok := wiki.GetPage(s.root, slug)
-			if !ok {
-				return fmt.Sprintf("页面 [[%s]] 不存在。", slug)
-			}
-			links := wiki.ParseWikilinks(text)
-			return fmt.Sprintf("[[%s]] 出站 %d 条: %s\n(入站查询需索引;当前为降级模式)", slug, len(links), strings.Join(links, "、"))
-		},
+		call:   s.backlinks,
 	}
 	s.tools["get_page"] = toolDef{
 		name: "get_page", desc: "读取一个 wiki 页面(slug 或文件名,如 `Agent核心架构` 或 `Agent核心架构.md`)",
 		params: obj(map[string]any{"page": strProp}),
-		call: func(a map[string]any) string {
-			slug := strings.TrimSuffix(strArg(a, "page"), ".md")
-			text, dir, ok := wiki.GetPage(s.root, slug)
-			if !ok {
-				return fmt.Sprintf("页面 [[%s]] 不存在。", slug)
-			}
-			return fmt.Sprintf("## %s (来源 %s/)\n\n%s", slug, dir, text)
-		},
+		call:   s.getPage,
 	}
 	s.tools["get_related"] = toolDef{
 		name: "get_related", desc: "解析一个页面的 [[wikilinks]],返回它关联了哪些知识节点及其去向(断链单独列出)",
 		params: obj(map[string]any{"page": strProp}),
-		call: func(a map[string]any) string {
-			slug := strings.TrimSuffix(strArg(a, "page"), ".md")
-			text, _, ok := wiki.GetPage(s.root, slug)
-			if !ok {
-				return fmt.Sprintf("页面 [[%s]] 不存在。", slug)
-			}
-			links := wiki.ParseWikilinks(text)
-			var resolved, broken []string
-			for _, l := range links {
-				if wiki.ResolveLink(s.root, l) {
-					resolved = append(resolved, l)
-				} else {
-					broken = append(broken, l)
-				}
-			}
-			return fmt.Sprintf("[[%s]] 出站链接 %d 条:\n- 可解析: %s\n- 断链: %s",
-				slug, len(links), resolved, orNone(broken))
-		},
+		call:   s.getRelated,
 	}
 	s.tools["list_recent"] = toolDef{
 		name: "list_recent", desc: "列出最近修改的 wiki 页面(按 mtime 倒序)",
 		params: obj(map[string]any{"n": intProp}),
-		call: func(a map[string]any) string {
-			n := intArg(a, "n", 5)
-			type mod struct {
-				path string
-				t    time.Time
-			}
-			var ms []mod
-			for _, p := range wiki.Pages(s.root) {
-				fi, err := os.Stat(p)
-				if err != nil {
-					continue
-				}
-				ms = append(ms, mod{path: p, t: fi.ModTime()})
-			}
-			sort.Slice(ms, func(i, j int) bool { return ms[i].t.After(ms[j].t) })
-			var b strings.Builder
-			for i := 0; i < len(ms) && i < n; i++ {
-				fmt.Fprintf(&b, "- [[%s]]\n", strings.TrimSuffix(filepath.Base(ms[i].path), ".md"))
-			}
-			if b.Len() == 0 {
-				return "暂无页面。"
-			}
-			return strings.TrimSuffix(b.String(), "\n")
-		},
+		call:   s.listRecent,
 	}
 	s.tools["synthesize_for"] = toolDef{
 		name: "synthesize_for", desc: "Agentic RAG 综合回答:检索相关页面(带私有度徽标)并用 LLM 综合成带引用的答案",
 		params: obj(map[string]any{"question": strProp}),
-		call: func(a map[string]any) string {
-			return s.synthesize(strArg(a, "question"))
-		},
+		call:   s.synthesizeFor,
 	}
 	s.tools["capture_note"] = toolDef{
 		name: "capture_note", desc: "把消费 wiki 时产生的新发现/观察回灌知识库(双向复利):写 raw/observations/<时间戳>-<标题>.md,作为新的 observation 源(不改动既有 raw,只新增)。title 必填,content/tags 可选",
 		params: obj(map[string]any{"title": strProp, "content": strProp, "tags": strProp}),
-		call: func(a map[string]any) string {
-			title := strings.TrimSpace(strArg(a, "title"))
-			if title == "" {
-				return "参数 title 必填。"
-			}
-			dir := filepath.Join(s.root, "raw", "observations")
-			if err := os.MkdirAll(dir, 0o755); err != nil {
-				return "写入失败: " + err.Error()
-			}
-			ts := time.Now().Format("2006-01-02-150405")
-			name := fmt.Sprintf("%s-%s.md", ts, title)
-			md := fmt.Sprintf("---\n类型: observation\n标题: %s\n时间: %s\n标签: %s\n---\n\n%s\n",
-				title, time.Now().Format(time.RFC3339), strArg(a, "tags"), strArg(a, "content"))
-			if err := os.WriteFile(filepath.Join(dir, name), []byte(md), 0o644); err != nil {
-				return "写入失败: " + err.Error()
-			}
-			return "已回灌观察 → raw/observations/" + name + "(origin: self,编译时回灌「我的实践」)"
-		},
+		call:   s.captureNote,
 	}
+}
+
+// ---- 工具处理 ----
+
+// pageArg 解析工具参数 page(slug 或文件名),返回裁剪 .md 后的 slug 与页面内容。
+func (s *Server) pageArg(a map[string]any) (slug, text, dir string, ok bool) {
+	slug = strings.TrimSuffix(strArg(a, "page"), ".md")
+	text, dir, ok = wiki.GetPage(s.root, slug)
+	return
+}
+
+func (s *Server) searchWiki(a map[string]any) string {
+	q := strArg(a, "query")
+	if q == "" {
+		return "参数 query 必填。"
+	}
+	opts := s.opts
+	// k 缺省不覆盖配置:省略时沿用 opts.Top(cfg.RetrieveK),显式 k>0 才覆盖本次检索。
+	if k := intArg(a, "k", 0); k > 0 {
+		opts.Top = k
+	}
+	s.sync()
+	var res []retrieval.Result
+	if s.idx != nil {
+		res = s.idx.Rank(q, opts)
+	} else {
+		res = wiki.Retrieve(s.root, q, opts)
+	}
+	if len(res) == 0 {
+		return "知识库中未找到与查询匹配的页面。"
+	}
+	var b strings.Builder
+	for _, r := range res {
+		fmt.Fprintf(&b, "- [[%s]] %s 命中%.2f: %s\n", r.Label, wiki.EvidenceBadge(s.root, r.Path), r.Score, r.Summary)
+	}
+	return b.String()
+}
+
+func (s *Server) wikiMentions(a map[string]any) string {
+	var terms []string
+	if arr, ok := a["terms"].([]any); ok {
+		for _, v := range arr {
+			if t, ok := v.(string); ok && t != "" {
+				terms = append(terms, t)
+			}
+		}
+	}
+	if t := strArg(a, "term"); t != "" {
+		terms = append(terms, t)
+	}
+	if len(terms) == 0 {
+		return "term/terms 至少提供一个。"
+	}
+	s.sync()
+	if s.idx != nil {
+		return s.idx.FormatMentions(s.idx.Mentions(terms)) // 三档话术 + 子串/短词护栏
+	}
+	// 降级:全扫
+	files, _ := filepath.Glob(filepath.Join(s.root, "wiki", "sources", "*.md"))
+	var b strings.Builder
+	for _, t := range terms {
+		n := 0
+		var hits []string
+		for _, f := range files {
+			if c, err := os.ReadFile(f); err == nil && strings.Contains(strings.ToLower(string(c)), strings.ToLower(t)) {
+				n++
+				hits = append(hits, strings.TrimSuffix(filepath.Base(f), ".md"))
+			}
+		}
+		if n == 0 {
+			fmt.Fprintf(&b, "「%s」未被任何源页提及。\n", t)
+		} else if n == 1 {
+			fmt.Fprintf(&b, "「%s」仅 1 个源提及(%s)——单次提及,不建页。\n", t, hits[0])
+		} else {
+			fmt.Fprintf(&b, "「%s」被 %d 个源提及(%s)——≥2,满足建页纪律。\n", t, n, strings.Join(hits, "、"))
+		}
+	}
+	return strings.TrimSuffix(b.String(), "\n")
+}
+
+func (s *Server) backlinks(a map[string]any) string {
+	slug, text, _, ok := s.pageArg(a)
+	if slug == "" {
+		return "参数 page 必填。"
+	}
+	s.sync()
+	if s.idx != nil {
+		in, out := s.idx.Backlinks(slug)
+		var b strings.Builder
+		fmt.Fprintf(&b, "[[%s]] 入站 %d 条:", slug, len(in))
+		if len(in) == 0 {
+			b.WriteString(" 无(孤儿页)")
+		} else {
+			b.WriteString(" " + strings.Join(in, "、"))
+		}
+		var okLinks, broken []string
+		for _, o := range out {
+			if s.idx.HasSlug(o) {
+				okLinks = append(okLinks, o)
+			} else {
+				broken = append(broken, o)
+			}
+		}
+		fmt.Fprintf(&b, "\n出站 %d 条: %s", len(out), strings.Join(okLinks, "、"))
+		if len(broken) > 0 {
+			fmt.Fprintf(&b, "\n断链: %s", strings.Join(broken, "、"))
+		}
+		return b.String()
+	}
+	if !ok {
+		return fmt.Sprintf("页面 [[%s]] 不存在。", slug)
+	}
+	links := wiki.ParseWikilinks(text)
+	return fmt.Sprintf("[[%s]] 出站 %d 条: %s\n(入站查询需索引;当前为降级模式)", slug, len(links), strings.Join(links, "、"))
+}
+
+func (s *Server) getPage(a map[string]any) string {
+	slug, text, dir, ok := s.pageArg(a)
+	if !ok {
+		return fmt.Sprintf("页面 [[%s]] 不存在。", slug)
+	}
+	return fmt.Sprintf("## %s (来源 %s/)\n\n%s", slug, dir, text)
+}
+
+func (s *Server) getRelated(a map[string]any) string {
+	slug, text, _, ok := s.pageArg(a)
+	if !ok {
+		return fmt.Sprintf("页面 [[%s]] 不存在。", slug)
+	}
+	links := wiki.ParseWikilinks(text)
+	var resolved, broken []string
+	for _, l := range links {
+		if wiki.ResolveLink(s.root, l) {
+			resolved = append(resolved, l)
+		} else {
+			broken = append(broken, l)
+		}
+	}
+	return fmt.Sprintf("[[%s]] 出站链接 %d 条:\n- 可解析: %s\n- 断链: %s",
+		slug, len(links), resolved, orNone(broken))
+}
+
+func (s *Server) listRecent(a map[string]any) string {
+	slugs := s.recentPages(intArg(a, "n", 5))
+	if len(slugs) == 0 {
+		return "暂无页面。"
+	}
+	var b strings.Builder
+	for _, slug := range slugs {
+		fmt.Fprintf(&b, "- [[%s]]\n", slug)
+	}
+	return strings.TrimSuffix(b.String(), "\n")
+}
+
+// recentPages 返回按修改时间倒序的前 n 个页面 slug。
+func (s *Server) recentPages(n int) []string {
+	type mod struct {
+		path string
+		t    time.Time
+	}
+	var ms []mod
+	for _, p := range wiki.Pages(s.root) {
+		fi, err := os.Stat(p)
+		if err != nil {
+			continue
+		}
+		ms = append(ms, mod{p, fi.ModTime()})
+	}
+	sort.Slice(ms, func(i, j int) bool { return ms[i].t.After(ms[j].t) })
+	var slugs []string
+	for i := 0; i < len(ms) && i < n; i++ {
+		slugs = append(slugs, strings.TrimSuffix(filepath.Base(ms[i].path), ".md"))
+	}
+	return slugs
+}
+
+func (s *Server) synthesizeFor(a map[string]any) string {
+	return s.synthesize(strArg(a, "question"))
+}
+
+func (s *Server) captureNote(a map[string]any) string {
+	title := strings.TrimSpace(strArg(a, "title"))
+	if title == "" {
+		return "参数 title 必填。"
+	}
+	dir := filepath.Join(s.root, "raw", "observations")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "写入失败: " + err.Error()
+	}
+	ts := time.Now().Format("2006-01-02-150405")
+	name := fmt.Sprintf("%s-%s.md", ts, title)
+	md := fmt.Sprintf("---\n类型: observation\n标题: %s\n时间: %s\n标签: %s\n---\n\n%s\n",
+		title, time.Now().Format(time.RFC3339), strArg(a, "tags"), strArg(a, "content"))
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(md), 0o644); err != nil {
+		return "写入失败: " + err.Error()
+	}
+	return "已回灌观察 → raw/observations/" + name + "(origin: self,编译时回灌「我的实践」)"
 }
 
 // ---- synthesize_for:检索 + LLM 综合 ----
@@ -296,7 +328,8 @@ func (s *Server) synthesize(question string) string {
 	if s.idx != nil {
 		res = s.idx.Rank(question, s.opts)
 	} else {
-		res = retrieval.Search(s.wikiDocs(), question, s.opts)
+		// 降级路径与 search_wiki 统一走 wiki.Retrieve(标签去 .md)
+		res = wiki.Retrieve(s.root, question, s.opts)
 	}
 	if len(res) == 0 {
 		return "知识库中未检索到相关内容。"
@@ -321,18 +354,6 @@ func (s *Server) synthesize(question string) string {
 		return "综合失败: " + err.Error()
 	}
 	return strings.TrimSpace(msg.Content)
-}
-
-func (s *Server) wikiDocs() []retrieval.Doc {
-	var docs []retrieval.Doc
-	for _, p := range wiki.Pages(s.root) {
-		text := wiki.Read(p)
-		if text == "" {
-			continue
-		}
-		docs = append(docs, retrieval.Doc{Path: p, Label: filepath.Base(p), Text: text})
-	}
-	return docs
 }
 
 // ---- MCP 协议(JSON-RPC 2.0,stdio 换行分隔) ----
@@ -382,25 +403,19 @@ func (s *Server) Serve(in io.Reader, out io.Writer) error {
 }
 
 func (s *Server) handle(req request) *response {
-	rpc := func(id json.RawMessage, result any) *response {
-		return &response{JSONRPC: "2.0", ID: id, Result: result}
-	}
-	fail := func(id json.RawMessage, code int, msg string) *response {
-		return &response{JSONRPC: "2.0", ID: id, Error: &rpcError{Code: code, Message: msg}}
-	}
 	// notification:无 id 或 null id,不回包
 	if len(req.ID) == 0 || string(req.ID) == "null" {
 		return nil
 	}
 	switch req.Method {
 	case "initialize":
-		return rpc(req.ID, map[string]any{
+		return rpcResult(req.ID, map[string]any{
 			"protocolVersion": protocolVer,
 			"capabilities":    map[string]any{"tools": map[string]any{"listChanged": false}},
 			"serverInfo":      map[string]any{"name": serverName, "version": serverVersion},
 		})
 	case "ping":
-		return rpc(req.ID, map[string]any{})
+		return rpcResult(req.ID, map[string]any{})
 	case "tools/list":
 		var list []map[string]any
 		for _, t := range s.tools {
@@ -408,7 +423,7 @@ func (s *Server) handle(req request) *response {
 				"name": t.name, "description": t.desc, "inputSchema": t.params,
 			})
 		}
-		return rpc(req.ID, map[string]any{"tools": list})
+		return rpcResult(req.ID, map[string]any{"tools": list})
 	case "tools/call":
 		var p struct {
 			Name      string         `json:"name"`
@@ -417,15 +432,29 @@ func (s *Server) handle(req request) *response {
 		_ = json.Unmarshal(req.Params, &p)
 		t, ok := s.tools[p.Name]
 		if !ok {
-			return fail(req.ID, -32602, "未知工具: "+p.Name)
+			return rpcErrorResponse(req.ID, -32602, "未知工具: "+p.Name)
 		}
-		text := t.call(p.Arguments)
-		return rpc(req.ID, map[string]any{
-			"content": []map[string]any{{"type": "text", "text": text}},
-		})
+		return textResult(req.ID, t.call(p.Arguments))
 	default:
-		return fail(req.ID, -32601, "Method not found: "+req.Method)
+		return rpcErrorResponse(req.ID, -32601, "Method not found: "+req.Method)
 	}
+}
+
+// rpcResult 构造成功响应。
+func rpcResult(id json.RawMessage, result any) *response {
+	return &response{JSONRPC: "2.0", ID: id, Result: result}
+}
+
+// rpcErrorResponse 构造 JSON-RPC 错误响应。
+func rpcErrorResponse(id json.RawMessage, code int, msg string) *response {
+	return &response{JSONRPC: "2.0", ID: id, Error: &rpcError{Code: code, Message: msg}}
+}
+
+// textResult 构造 tools/call 的标准文本结果。
+func textResult(id json.RawMessage, text string) *response {
+	return rpcResult(id, map[string]any{
+		"content": []map[string]any{{"type": "text", "text": text}},
+	})
 }
 
 // ---- 参数辅助 ----

@@ -64,7 +64,7 @@ func compactMessages(msgs []provider.Message, keepRounds int) []provider.Message
 	// 任务输入 = system 之后第一个 user
 	head := sys
 	if i < len(msgs) && msgs[i].Role == "user" {
-		head = append(append([]provider.Message{}, sys...), msgs[i])
+		head = append(head, msgs[i])
 		i++
 	}
 	rest := msgs[i:]
@@ -107,10 +107,8 @@ func keepRoundsAndWrites(msgs []provider.Message, n int) []provider.Message {
 	keep := make([]bool, len(rounds))
 	cnt := 0
 	for i := len(rounds) - 1; i >= 0 && cnt < n; i-- {
-		if !keep[i] {
-			keep[i] = true
-			cnt++
-		}
+		keep[i] = true
+		cnt++
 	}
 	for i, rd := range rounds {
 		if !keep[i] && hasWrite(rd) {
@@ -136,17 +134,4 @@ func hasWrite(round []provider.Message) bool {
 		}
 	}
 	return false
-}
-
-// lastNRounds 返回从尾部算起的最近 n 轮;不足 n 轮返回全部。
-func lastNRounds(msgs []provider.Message, n int) []provider.Message {
-	for i := len(msgs) - 1; i >= 0; i-- {
-		if msgs[i].Role == "assistant" {
-			n--
-			if n == 0 {
-				return msgs[i:]
-			}
-		}
-	}
-	return msgs
 }

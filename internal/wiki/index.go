@@ -45,13 +45,10 @@ func RebuildIndex(root string) string {
 			synths = append(synths, fmt.Sprintf("| [[%s]] | %s | %s |", slug, q, created))
 		}
 	}
-	// title 兜底已在 extractTitle 中实现(slug 兜底),表内直接用 slug 作为 [[wikilink]]
-
-	bySlug := func(list []string) { sort.Strings(list) }
-	bySlug(sources)
-	bySlug(concepts)
-	bySlug(entities)
-	bySlug(synths)
+	sort.Strings(sources)
+	sort.Strings(concepts)
+	sort.Strings(entities)
+	sort.Strings(synths)
 
 	st := Scan(root)
 	var b strings.Builder
@@ -85,8 +82,6 @@ func WriteIndex(root string) (string, error) {
 	}
 	return fp, nil
 }
-
-// extractTitle 取正文第一个 # 标题;无则用 slug。
 
 // firstLineOfSection 取节标题后的第一行非空内容(去 > 前缀,截断 120 字)。
 func firstLineOfSection(body, heading string) string {

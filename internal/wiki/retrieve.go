@@ -45,18 +45,12 @@ func Evidence(root, pagePath string) string {
 	}
 }
 
+var badgeDesc = map[string]string{"A": "公开", "B": "精选综合", "C": "私有"}
+
 // EvidenceBadge 返回带说明的徽标文字。
 func EvidenceBadge(root, pagePath string) string {
 	label := Evidence(root, pagePath)
-	desc := map[string]string{
-		"A": "公开",
-		"B": "精选综合",
-		"C": "私有",
-	}[label]
-	if label == "" {
-		return ""
-	}
-	return "[" + label + "]" + desc
+	return "[" + label + "]" + badgeDesc[label]
 }
 
 func frontmatterOrigin(path string) string {
@@ -65,8 +59,5 @@ func frontmatterOrigin(path string) string {
 		return ""
 	}
 	vals, _ := ParseFrontmatter(string(b))
-	if o, ok := vals["origin"].(string); ok {
-		return o
-	}
-	return ""
+	return FrontmatterString(vals, "origin")
 }

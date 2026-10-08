@@ -31,18 +31,6 @@ func msgs() []provider.Message {
 	return m
 }
 
-func TestLastNRounds(t *testing.T) {
-	m := msgs()
-	tail := lastNRounds(m, 2)
-	// 最近 2 轮 = assistant(搜索) + tool + assistant(最终答案),共 3 条;前面的全裁剪
-	if len(tail) != 3 {
-		t.Fatalf("最近 2 轮应含 3 条(assistant+tool+assistant),得 %d 条: %#v", len(tail), tail)
-	}
-	if tail[0].Role != "assistant" || tail[1].Role != "tool" || tail[2].Role != "assistant" {
-		t.Fatalf("轮切分破坏了 assistant/tool 配对: %#v", tail)
-	}
-}
-
 func TestCompactMessages(t *testing.T) {
 	m := msgs()
 	compacted := compactMessages(m, 2)

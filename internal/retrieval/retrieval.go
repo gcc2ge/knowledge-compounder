@@ -51,6 +51,11 @@ func Search(docs []Doc, query string, opts Options) []Result {
 	if len(terms) == 0 {
 		return nil
 	}
+	// 词槽预计算:hashSlot(t)%4096 在 df 统计与打分中重复出现,一次算好。
+	slots := make([]int, len(terms))
+	for i, t := range terms {
+		slots[i] = hashSlot(t) % 4096
+	}
 
 	// 词法分:TF×IDF(BM25-lite)。df 统计 + 逐文档打分一次过。
 	df := map[string]int{}
@@ -58,8 +63,8 @@ func Search(docs []Doc, query string, opts Options) []Result {
 	for i, d := range docs {
 		wordCounts[i] = termCounts(d.Text)
 		seen := map[string]bool{}
-		for _, t := range terms {
-			if wordCounts[i][hashSlot(t)%4096] > 0 && !seen[t] {
+		for j, t := range terms {
+			if wordCounts[i][slots[j]] > 0 && !seen[t] {
 				seen[t] = true
 				df[t]++
 			}
@@ -73,14 +78,13 @@ func Search(docs []Doc, query string, opts Options) []Result {
 		if len(head) > 300 {
 			head = head[:300]
 		}
-		for _, t := range terms {
-			cnt := wordCounts[i][hashSlot(t)%4096]
+		for j, t := range terms {
+			cnt := wordCounts[i][slots[j]]
 			if cnt == 0 {
 				continue
 			}
 			// 标题/开头命中翻倍:前 300 字符的计数视为命中权重
-			headCnt := strings.Count(strings.ToLower(head), t)
-			cnt += headCnt
+			cnt += strings.Count(strings.ToLower(head), t)
 			dfv := df[t]
 			idf := math.Log(1 + (n-float64(dfv)+0.5)/(float64(dfv)+0.5))
 			s += idf * float64(cnt) / (float64(cnt) + 1.2)
@@ -159,10 +163,7 @@ func corpusVectors(docs []Doc, emb embed.Embedder, cache *embed.Cache) [][]float
 	}
 	const batch = 16
 	for start := 0; start < len(pending); start += batch {
-		end := start + batch
-		if end > len(pending) {
-			end = len(pending)
-		}
+		end := min(start+batch, len(pending))
 		idx := pending[start:end]
 		texts := make([]string, len(idx))
 		for j, i := range idx {

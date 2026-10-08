@@ -55,23 +55,23 @@ type Trace struct {
 
 // LoadSeeds 加载评估种子:path 指定单个文件;空则扫 root/eval/seeds/*.json。
 func LoadSeeds(root, path string) ([]Seed, error) {
-	if path == "" {
-		matches, err := filepath.Glob(filepath.Join(root, "eval", "seeds", "*.json"))
-		if err != nil || len(matches) == 0 {
-			return nil, fmt.Errorf("未找到评估种子(%s/eval/seeds/*.json),请先准备种子", root)
-		}
-		sort.Strings(matches)
-		var all []Seed
-		for _, m := range matches {
-			seeds, err := loadSeedFile(m)
-			if err != nil {
-				return nil, err
-			}
-			all = append(all, seeds...)
-		}
-		return all, nil
+	if path != "" {
+		return loadSeedFile(path)
 	}
-	return loadSeedFile(path)
+	matches, err := filepath.Glob(filepath.Join(root, "eval", "seeds", "*.json"))
+	if err != nil || len(matches) == 0 {
+		return nil, fmt.Errorf("未找到评估种子(%s/eval/seeds/*.json),请先准备种子", root)
+	}
+	sort.Strings(matches)
+	var all []Seed
+	for _, m := range matches {
+		seeds, err := loadSeedFile(m)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, seeds...)
+	}
+	return all, nil
 }
 
 func loadSeedFile(path string) ([]Seed, error) {
@@ -88,37 +88,35 @@ func loadSeedFile(path string) ([]Seed, error) {
 
 // ---- 语料 ----
 
-// RawDocs 未编译原文语料(raw/、raw/books/)——RAG 外挂的检索对象。
-// 刻意排除 raw/observations/:失败回灌是编译复利独有的私有 edge,掺进 RAG 语料
-// 会掩盖对照实验的真实差异(见 M10 评估设计)。
-func RawDocs(root string) []retrieval.Doc {
-	var docs []retrieval.Doc
-	for _, dir := range []string{"raw", filepath.Join("raw", "books")} {
-		matches, _ := filepath.Glob(filepath.Join(root, dir, "*.md"))
-		for _, m := range matches {
-			text := wiki.Read(m)
-			if text == "" {
-				continue
-			}
-			rel, _ := filepath.Rel(root, m)
-			docs = append(docs, retrieval.Doc{Path: m, Label: rel, Text: text})
-		}
-	}
-	return docs
-}
-
-// WikiDocs 编译后知识资产(wiki/ 全部页面)——编译复利的检索对象。
-func WikiDocs(root string) []retrieval.Doc {
-	var docs []retrieval.Doc
-	for _, p := range wiki.Pages(root) {
+// collectDocs 从给定路径集读取 wiki 文本并转成检索文档(空文本跳过,label 相对 root)。
+func collectDocs(root string, paths []string, trimSuffix string) []retrieval.Doc {
+	docs := make([]retrieval.Doc, 0, len(paths))
+	for _, p := range paths {
 		text := wiki.Read(p)
 		if text == "" {
 			continue
 		}
 		rel, _ := filepath.Rel(root, p)
-		docs = append(docs, retrieval.Doc{Path: p, Label: strings.TrimSuffix(rel, ".md"), Text: text})
+		docs = append(docs, retrieval.Doc{Path: p, Label: strings.TrimSuffix(rel, trimSuffix), Text: text})
 	}
 	return docs
+}
+
+// RawDocs 未编译原文语料(raw/、raw/books/)——RAG 外挂的检索对象。
+// 刻意排除 raw/observations/:失败回灌是编译复利独有的私有 edge,掺进 RAG 语料
+// 会掩盖对照实验的真实差异(见 M10 评估设计)。
+func RawDocs(root string) []retrieval.Doc {
+	var paths []string
+	for _, dir := range []string{"raw", filepath.Join("raw", "books")} {
+		matches, _ := filepath.Glob(filepath.Join(root, dir, "*.md"))
+		paths = append(paths, matches...)
+	}
+	return collectDocs(root, paths, "")
+}
+
+// WikiDocs 编译后知识资产(wiki/ 全部页面)——编译复利的检索对象。
+func WikiDocs(root string) []retrieval.Doc {
+	return collectDocs(root, wiki.Pages(root), ".md")
 }
 
 // ---- 答题 ----
@@ -188,36 +186,38 @@ type judgeScores struct {
 // 复利 Δ 按精确 key 匹配——键漂移会让 beforeTotal 少算、Δ 被系统性高估。
 // 统一映射回规范维度后,基线快照和 Δ 才跨轮可比。
 var dimAliases = map[string]string{
-	"connection_value":      "连接价值",
-	"connection":            "连接价值",
-	"connections":           "连接价值",
-	"synthesis_density":     "综合密度",
-	"comprehensive_density": "综合密度",
-	"comprehensiveness":     "综合密度",
-	"synthesis":             "综合密度",
-	"argument_completeness": "论证完整性",
-	"argumentation":         "论证完整性",
-	"argument":              "论证完整性",
-	"argumentation_quality": "论证完整性",
-	"completeness":          "论证完整性",
-	"contradiction_marking": "矛盾标注",
-	"contradiction":         "矛盾标注",
-	"contradictions":        "矛盾标注",
+	"connection_value":        "连接价值",
+	"connection":              "连接价值",
+	"connections":             "连接价值",
+	"synthesis_density":       "综合密度",
+	"comprehensive_density":   "综合密度",
+	"comprehensiveness":       "综合密度",
+	"synthesis":               "综合密度",
+	"argument_completeness":   "论证完整性",
+	"argumentation":           "论证完整性",
+	"argument":                "论证完整性",
+	"argumentation_quality":   "论证完整性",
+	"completeness":            "论证完整性",
+	"contradiction_marking":   "矛盾标注",
+	"contradiction":           "矛盾标注",
+	"contradictions":          "矛盾标注",
 	"contradiction_detection": "矛盾标注",
-	"transferability":       "可迁移性",
-	"migratability":         "可迁移性",
-	"generalizability":      "可迁移性",
-	"portability":           "可迁移性",
-	"retrieval_relevance":   "检索相关度",
-	"evidence_coverage":     "证据覆盖",
-	"evidence_fidelity":     "证据忠实",
+	"transferability":         "可迁移性",
+	"migratability":           "可迁移性",
+	"generalizability":        "可迁移性",
+	"portability":             "可迁移性",
+	"retrieval_relevance":     "检索相关度",
+	"evidence_coverage":       "证据覆盖",
+	"evidence_fidelity":       "证据忠实",
 }
 
 // normalizeDimKeys 把所有维度键归一到规范名(小写查别名;未收录的键原样保留,不吞数据)。
+// 纯函数:不修改入参,返回新 map(调用方可与归一化前的输入直接对比)。
 func normalizeDimKeys(scores map[string]map[string]int) map[string]map[string]int {
 	if scores == nil {
-		return scores
+		return nil
 	}
+	out := make(map[string]map[string]int, len(scores))
 	for mode, dims := range scores {
 		norm := make(map[string]int, len(dims))
 		for k, v := range dims {
@@ -227,9 +227,9 @@ func normalizeDimKeys(scores map[string]map[string]int) map[string]map[string]in
 			}
 			norm[canon] = v
 		}
-		scores[mode] = norm
+		out[mode] = norm
 	}
-	return scores
+	return out
 }
 
 // rubricDesc 维度 → 打分说明(seed 自定义维度无说明时用通用描述)。
@@ -270,7 +270,6 @@ func buildJudgePrompt(rubric []string) string {
 }
 
 // Judge 让 LLM 评审两套答案,返回各维度分数。维度取 seed.Rubric(空则 5 维默认)。
-// Judge 让 LLM 评审两套答案,返回各维度分数。维度取 seed.Rubric(空则 5 维默认)。
 // 解析/调用失败自动重试(最多 3 次):多判去噪把评审次数放大 N 倍,模型输出偏差
 // (如把 scores 压成扁平数字 {"rag":3,"wiki":4})的命中率同比例上升,必须重试吸收。
 func Judge(ctx context.Context, p provider.Provider, seed Seed, ragAns, wikiAns string) (judgeScores, error) {
@@ -283,6 +282,12 @@ func Judge(ctx context.Context, p provider.Provider, seed Seed, ragAns, wikiAns 
 		{Role: "system", Content: "你是严格的评估评审,只输出 JSON。"},
 		{Role: "user", Content: prompt},
 	}
+	return chatParseRetry(ctx, p, msgs, parseJudgeJSON)
+}
+
+// chatParseRetry 调 LLM 并解析 JSON 结果,网络/解析失败自动重试(最多 3 次)。
+func chatParseRetry[T any](ctx context.Context, p provider.Provider, msgs []provider.Message, parse func(string) (T, error)) (T, error) {
+	var out T
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		msg, err := p.Chat(ctx, msgs, nil, nil)
@@ -290,27 +295,32 @@ func Judge(ctx context.Context, p provider.Provider, seed Seed, ragAns, wikiAns 
 			lastErr = err
 			continue // 网络/超时瞬断,换一轮重试
 		}
-		out, perr := parseJudgeJSON(msg.Content)
-		if perr == nil {
+		out, err = parse(msg.Content)
+		if err == nil {
 			return out, nil
 		}
-		lastErr = perr
+		lastErr = err
 	}
-	return judgeScores{}, lastErr
+	return out, lastErr
 }
 
-// parseJudgeJSON 清洗并解析评审 JSON(容忍 markdown 围栏/前后缀),维度键归一化。
-func parseJudgeJSON(text string) (judgeScores, error) {
-	var out judgeScores
+// stripJSONFence 剥离模型输出的 markdown 围栏与首尾非 JSON 噪声。
+func stripJSONFence(text string) string {
 	text = strings.TrimSpace(text)
 	text = strings.TrimPrefix(text, "```json")
 	text = strings.TrimPrefix(text, "```")
 	text = strings.TrimSuffix(text, "```")
 	text = strings.TrimSpace(text)
 	text = stripJSONPrefix.ReplaceAllString(text, "")
-	text = stripJSONSuffix.ReplaceAllString(text, "}")
-	if err := json.Unmarshal([]byte(text), &out); err != nil {
-		return judgeScores{}, fmt.Errorf("评审 JSON 解析失败: %v\n原文: %.200s", err, text)
+	return stripJSONSuffix.ReplaceAllString(text, "}")
+}
+
+// parseJudgeJSON 清洗并解析评审 JSON(容忍 markdown 围栏/前后缀),维度键归一化。
+func parseJudgeJSON(text string) (judgeScores, error) {
+	cleaned := stripJSONFence(text)
+	var out judgeScores
+	if err := json.Unmarshal([]byte(cleaned), &out); err != nil {
+		return judgeScores{}, fmt.Errorf("评审 JSON 解析失败: %v\n原文: %.200s", err, cleaned)
 	}
 	out.Scores = normalizeDimKeys(out.Scores)
 	return out, nil
@@ -359,20 +369,7 @@ func JudgeTrajectory(ctx context.Context, p provider.Provider, seed Seed, ragTra
 		{Role: "system", Content: "你是严格的评估评审,只输出 JSON。"},
 		{Role: "user", Content: prompt},
 	}
-	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
-		msg, err := p.Chat(ctx, msgs, nil, nil)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		out, perr := parseTrajJSON(msg.Content)
-		if perr == nil {
-			return out, nil
-		}
-		lastErr = perr
-	}
-	return trajScores{}, lastErr
+	return chatParseRetry(ctx, p, msgs, parseTrajJSON)
 }
 
 // traceText 把检索轨迹渲染成给 judge 的文本:命中列表(label + score)。
@@ -389,16 +386,10 @@ func traceText(prefix string, t Trace) string {
 
 // parseTrajJSON 清洗并解析轨迹评审 JSON(容忍 markdown 围栏/前后缀)。
 func parseTrajJSON(text string) (trajScores, error) {
+	cleaned := stripJSONFence(text)
 	var out trajScores
-	text = strings.TrimSpace(text)
-	text = strings.TrimPrefix(text, "```json")
-	text = strings.TrimPrefix(text, "```")
-	text = strings.TrimSuffix(text, "```")
-	text = strings.TrimSpace(text)
-	text = stripJSONPrefix.ReplaceAllString(text, "")
-	text = stripJSONSuffix.ReplaceAllString(text, "}")
-	if err := json.Unmarshal([]byte(text), &out); err != nil {
-		return trajScores{}, fmt.Errorf("轨迹评审 JSON 解析失败: %v\n原文: %.200s", err, text)
+	if err := json.Unmarshal([]byte(cleaned), &out); err != nil {
+		return trajScores{}, fmt.Errorf("轨迹评审 JSON 解析失败: %v\n原文: %.200s", err, cleaned)
 	}
 	out.Scores = normalizeDimKeys(out.Scores)
 	return out, nil
@@ -416,33 +407,22 @@ func medianInt(vals []int) int {
 	return (vals[n/2-1] + vals[n/2]) / 2
 }
 
-// aggregateJudge 把 N 轮独立评审聚合去噪:判官单次方差实测 ±3-5 分/种子,
-// 大于单轮编译带来的 wiki 增强——单次 Δ 会被噪声主导。
-// - 分数:每模式每维度取中位数
-// - verdict:多数票(平票 → 持平)
-// - rationale:取多数票那一轮的
-// - NoiseSpan:单次 wiki 总分的极差 = 本种子判官噪声底,供 render 判断 Δ 是否落在噪声内
-func aggregateJudge(runs []judgeScores) judgeScores {
-	out := judgeScores{Scores: map[string]map[string]int{}}
-	if len(runs) == 1 {
-		out = runs[0]
-		out.NoiseSpan = 0
-		return out
+// wikiTotal 单轮评审中 wiki 模式的维度总分(判官噪声底 / 轨迹居中的依据)。
+func wikiTotal(scores map[string]map[string]int) int {
+	total := 0
+	for _, v := range scores["wiki"] {
+		total += v
 	}
-	votes := map[string]int{}
-	wikiTotals := make([]int, 0, len(runs))
-	for _, r := range runs {
-		votes[r.Verdict]++
-		total := 0
-		for _, v := range r.Scores["wiki"] {
-			total += v
-		}
-		wikiTotals = append(wikiTotals, total)
-	}
-	for mode := range runs[0].Scores {
+	return total
+}
+
+// medianScores 对多轮评审分数按模式逐维度取中位数(判官去噪核心)。
+func medianScores(scoreMaps []map[string]map[string]int) map[string]map[string]int {
+	out := map[string]map[string]int{}
+	for mode := range scoreMaps[0] {
 		dims := map[string][]int{}
-		for _, r := range runs {
-			for d, v := range r.Scores[mode] {
+		for _, s := range scoreMaps {
+			for d, v := range s[mode] {
 				dims[d] = append(dims[d], v)
 			}
 		}
@@ -450,7 +430,30 @@ func aggregateJudge(runs []judgeScores) judgeScores {
 		for d, vals := range dims {
 			m[d] = medianInt(vals)
 		}
-		out.Scores[mode] = m
+		out[mode] = m
+	}
+	return out
+}
+
+// aggregateJudge 把 N 轮独立评审聚合去噪:判官单次方差实测 ±3-5 分/种子,
+// 大于单轮编译带来的 wiki 增强——单次 Δ 会被噪声主导。
+// - 分数:每模式每维度取中位数
+// - verdict:多数票(平票 → 持平)
+// - rationale:取多数票那一轮的
+// - NoiseSpan:单次 wiki 总分的极差 = 本种子判官噪声底,供 render 判断 Δ 是否落在噪声内
+func aggregateJudge(runs []judgeScores) judgeScores {
+	if len(runs) == 1 {
+		out := runs[0]
+		out.NoiseSpan = 0
+		return out
+	}
+	votes := map[string]int{}
+	scoreMaps := make([]map[string]map[string]int, len(runs))
+	wikiTotals := make([]int, 0, len(runs))
+	for i, r := range runs {
+		votes[r.Verdict]++
+		wikiTotals = append(wikiTotals, wikiTotal(r.Scores))
+		scoreMaps[i] = r.Scores
 	}
 	best, top := "持平", -1
 	for v, c := range votes {
@@ -458,22 +461,25 @@ func aggregateJudge(runs []judgeScores) judgeScores {
 			best, top = v, c
 		}
 	}
-	out.Verdict = best
+	sort.Ints(wikiTotals)
+	out := judgeScores{
+		Scores:    medianScores(scoreMaps),
+		Verdict:   best,
+		NoiseSpan: wikiTotals[len(wikiTotals)-1] - wikiTotals[0],
+	}
 	for _, r := range runs {
 		if r.Verdict == best {
 			out.Rationale = r.Rationale
 			break
 		}
 	}
-	out.NoiseSpan = maxInt(wikiTotals) - minInt(wikiTotals)
 	return out
 }
 
 // aggregateTraj 聚合 N 轮轨迹评审:分数取中位数,rationale 取 wiki 总分居中那一轮。
 func aggregateTraj(runs []trajScores) trajScores {
-	out := trajScores{Scores: map[string]map[string]int{}}
 	if len(runs) == 1 {
-		out = runs[0]
+		out := runs[0]
 		out.NoiseSpan = 0
 		return out
 	}
@@ -482,51 +488,18 @@ func aggregateTraj(runs []trajScores) trajScores {
 		r         trajScores
 	}
 	order := make([]runT, 0, len(runs))
-	for _, r := range runs {
-		total := 0
-		for _, v := range r.Scores["wiki"] {
-			total += v
-		}
-		order = append(order, runT{total, r})
+	scoreMaps := make([]map[string]map[string]int, len(runs))
+	for i, r := range runs {
+		order = append(order, runT{wikiTotal(r.Scores), r})
+		scoreMaps[i] = r.Scores
 	}
 	sort.Slice(order, func(i, j int) bool { return order[i].wikiTotal < order[j].wikiTotal })
-	for mode := range runs[0].Scores {
-		dims := map[string][]int{}
-		for _, r := range runs {
-			for d, v := range r.Scores[mode] {
-				dims[d] = append(dims[d], v)
-			}
-		}
-		m := map[string]int{}
-		for d, vals := range dims {
-			m[d] = medianInt(vals)
-		}
-		out.Scores[mode] = m
-	}
 	mid := order[len(order)/2]
-	out.Rationale = mid.r.Rationale
-	out.NoiseSpan = order[len(order)-1].wikiTotal - order[0].wikiTotal
-	return out
-}
-
-func maxInt(vals []int) int {
-	m := vals[0]
-	for _, v := range vals[1:] {
-		if v > m {
-			m = v
-		}
+	return trajScores{
+		Scores:    medianScores(scoreMaps),
+		Rationale: mid.r.Rationale,
+		NoiseSpan: order[len(order)-1].wikiTotal - order[0].wikiTotal,
 	}
-	return m
-}
-
-func minInt(vals []int) int {
-	m := vals[0]
-	for _, v := range vals[1:] {
-		if v < m {
-			m = v
-		}
-	}
-	return m
 }
 
 func absInt(v int) int {
@@ -596,6 +569,73 @@ func (bl *Baseline) Save(root string) {
 	_ = os.WriteFile(filepath.Join(dir, "latest.json"), b, 0o644)
 }
 
+// evalCtx 逐次 LLM 调用独立超时:慢 provider 下 4 次 LLM 调用(答题×2+判官×2)挤不进单种子硬窗口
+// (实测首轮 gc2 在第 4 次调用跑爆 90s deadline)。每次调用独立 ctx,超时用 cfg.EvalTimeout(默认 90s/次)。
+func evalCtx(cfg config.Config) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), time.Duration(cfg.EvalTimeout)*time.Second)
+}
+
+// judgePasses 判官去噪轮数:显式 0 = 退化为单判。
+func judgePasses(cfg config.Config) int {
+	if cfg.JudgePasses < 1 {
+		return 1
+	}
+	return cfg.JudgePasses
+}
+
+// runJudgePasses 跑 N 轮判官并跳过单轮失败;全部失败才判种子失败。
+func runJudgePasses[T any](cfg config.Config, p provider.Provider, seedID, kind string, passes int, call func(context.Context) (T, error)) ([]T, error) {
+	runs := make([]T, 0, passes)
+	for i := 0; i < passes; i++ {
+		ctx, cancel := evalCtx(cfg)
+		r, err := call(ctx)
+		cancel()
+		if err != nil {
+			// 单轮评审失败不杀整种子:多判场景一轮偏差(网络/模型输出畸形)跳过,
+			// 聚合用剩余有效轮次;全部失败才判种子失败。
+			fmt.Printf("  ⚠️ [%s] %s第 %d 轮失败,跳过: %v\n", seedID, kind, i+1, err)
+			continue
+		}
+		runs = append(runs, r)
+	}
+	if len(runs) == 0 {
+		return nil, fmt.Errorf("%s失败 [%s]: 全部 %d 轮均失败", kind, seedID, passes)
+	}
+	return runs, nil
+}
+
+// runCase 跑单个种子的完整流程:两方案各答题 → 判官多轮去噪 → 轨迹判官多轮去噪。
+func runCase(cfg config.Config, p provider.Provider, s Seed, rawDocs, wikiDocs []retrieval.Doc, opts retrieval.Options) (CaseResult, error) {
+	ctx, cancel := evalCtx(cfg)
+	ragAns, ragTrace, err := Answer(ctx, p, rawDocs, s.Question, opts, cfg.RetrieveK)
+	cancel()
+	if err != nil {
+		return CaseResult{}, fmt.Errorf("RAG 答题失败 [%s]: %w", s.ID, err)
+	}
+	ctx, cancel = evalCtx(cfg)
+	wikiAns, wikiTrace, err := Answer(ctx, p, wikiDocs, s.Question, opts, cfg.RetrieveK)
+	cancel()
+	if err != nil {
+		return CaseResult{}, fmt.Errorf("WIKI 答题失败 [%s]: %w", s.ID, err)
+	}
+	passes := judgePasses(cfg)
+	judgeRuns, err := runJudgePasses(cfg, p, s.ID, "评审", passes, func(ctx context.Context) (judgeScores, error) {
+		return Judge(ctx, p, s, ragAns, wikiAns)
+	})
+	if err != nil {
+		return CaseResult{}, err
+	}
+	trajRuns, err := runJudgePasses(cfg, p, s.ID, "轨迹评审", passes, func(ctx context.Context) (trajScores, error) {
+		return JudgeTrajectory(ctx, p, s, ragTrace, wikiTrace, ragAns, wikiAns)
+	})
+	if err != nil {
+		return CaseResult{}, err
+	}
+	ragTrace.Mode, wikiTrace.Mode = "rag", "wiki"
+	return CaseResult{Seed: s, RAGAns: ragAns, WikiAns: wikiAns, Judge: aggregateJudge(judgeRuns),
+		RAGTrace: ragTrace, WikiTrace: wikiTrace, Traj: aggregateTraj(trajRuns)}, nil
+}
+
 // RunCompare 跑完整对照实验:两方案各答题 → 评审 → 报告。
 // rebaseline=true 时读上次基线,报告里输出「wiki 复利 Δ」——同种子重跑才测得复利曲线。
 func RunCompare(root string, cfg config.Config, seeds []Seed, rebaseline bool) (string, error) {
@@ -606,84 +646,25 @@ func RunCompare(root string, cfg config.Config, seeds []Seed, rebaseline bool) (
 	opts := RetrievalOpts(root, cfg)
 	rawDocs, wikiDocs := RawDocs(root), WikiDocs(root)
 
-	var cases []CaseResult
+	cases := make([]CaseResult, 0, len(seeds))
 	for _, s := range seeds {
-		// 逐调用超时:慢 provider 下 4 次 LLM 调用(答题×2+判官×2)挤不进单种子硬窗口
-		// (实测首轮 gc2 在第 4 次调用跑爆 90s deadline)。每次调用独立 ctx,
-		// 超时用 cfg.EvalTimeout(默认 90s/次),单次慢调用不拖累整个种子。
-		newCtx := func() (context.Context, context.CancelFunc) {
-			return context.WithTimeout(context.Background(), time.Duration(cfg.EvalTimeout)*time.Second)
-		}
-		ctx, cancel := newCtx()
-		ragAns, ragTrace, err := Answer(ctx, p, rawDocs, s.Question, opts, cfg.RetrieveK)
-		cancel()
+		c, err := runCase(cfg, p, s, rawDocs, wikiDocs, opts)
 		if err != nil {
-			return "", fmt.Errorf("RAG 答题失败 [%s]: %w", s.ID, err)
+			return "", err
 		}
-		ctx, cancel = newCtx()
-		wikiAns, wikiTrace, err := Answer(ctx, p, wikiDocs, s.Question, opts, cfg.RetrieveK)
-		cancel()
-		if err != nil {
-			return "", fmt.Errorf("WIKI 答题失败 [%s]: %w", s.ID, err)
-		}
-		// 判官去噪:同一对答案独立评审 cfg.JudgePasses 轮(默认 3),取中位数 + 多数票。
-		// 单次评审实测方差 ±3-5 分/种子,直接拿单轮分数比 1-1 判涨跌会被噪声主导。
-		passes := cfg.JudgePasses
-		if passes < 1 {
-			passes = 1 // 显式 0 = 退化为单判
-		}
-		judgeRuns := make([]judgeScores, 0, passes)
-		for i := 0; i < passes; i++ {
-			ctx, cancel = newCtx()
-			j, err := Judge(ctx, p, s, ragAns, wikiAns)
-			cancel()
-			if err != nil {
-				// 单轮评审失败不杀整种子:多判场景一轮偏差(网络/模型输出畸形)跳过,
-				// 聚合用剩余有效轮次;全部失败才判种子失败。
-				fmt.Printf("  ⚠️ [%s] 评审第 %d 轮失败,跳过: %v\n", s.ID, i+1, err)
-				continue
-			}
-			judgeRuns = append(judgeRuns, j)
-		}
-		if len(judgeRuns) == 0 {
-			return "", fmt.Errorf("评审失败 [%s]: 全部 %d 轮均失败", s.ID, passes)
-		}
-		j := aggregateJudge(judgeRuns)
-		// M10 轨迹判官:评价检索过程质量,捕捉「对的答案、错的过程」。同样多判去噪。
-		trajRuns := make([]trajScores, 0, passes)
-		for i := 0; i < passes; i++ {
-			ctx, cancel = newCtx()
-			tj, err := JudgeTrajectory(ctx, p, s, ragTrace, wikiTrace, ragAns, wikiAns)
-			cancel()
-			if err != nil {
-				fmt.Printf("  ⚠️ [%s] 轨迹评审第 %d 轮失败,跳过: %v\n", s.ID, i+1, err)
-				continue
-			}
-			trajRuns = append(trajRuns, tj)
-		}
-		if len(trajRuns) == 0 {
-			return "", fmt.Errorf("轨迹评审失败 [%s]: 全部 %d 轮均失败", s.ID, passes)
-		}
-		tj := aggregateTraj(trajRuns)
-		ragTrace.Mode, wikiTrace.Mode = "rag", "wiki"
-		cases = append(cases, CaseResult{Seed: s, RAGAns: ragAns, WikiAns: wikiAns, Judge: j,
-			RAGTrace: ragTrace, WikiTrace: wikiTrace, Traj: tj})
-		fmt.Printf("✓ %s: verdict=%s · 轨迹优=%s\n", s.ID, j.Verdict, trajWinner(tj))
+		cases = append(cases, c)
+		fmt.Printf("✓ %s: verdict=%s · 轨迹优=%s\n", c.Seed.ID, c.Judge.Verdict, trajWinner(c.Traj))
 	}
-	report := render(cases, cfg.Model, prevBaseline(root, rebaseline))
+	var prev *Baseline
+	if rebaseline {
+		prev = LoadBaseline(root)
+	}
+	report := render(cases, cfg.Model, prev)
 	bl := CollectBaseline(cases, cfg.Model)
 	bl.Save(root) // 写最新基线:下次 --rebaseline 有对比对象
 	fp := writeReport(root, report)
 	fmt.Println("报告已写入: " + fp)
 	return report, nil
-}
-
-// prevBaseline rebaseline 模式才加载上次基线;普通评估跑无 Δ(基线仍会写,供下次)。
-func prevBaseline(root string, rebaseline bool) *Baseline {
-	if !rebaseline {
-		return nil
-	}
-	return LoadBaseline(root)
 }
 
 func render(cases []CaseResult, model string, prev *Baseline) string {
@@ -694,24 +675,10 @@ func render(cases []CaseResult, model string, prev *Baseline) string {
 		b.WriteString(fmt.Sprintf("> **复利对比(--rebaseline)**: vs 上次(%s, %s)\n\n", prev.Time.Format("2006-01-02 15:04"), prev.Model))
 	}
 
-	avg := func(mode string, dim string) float64 {
-		total, n := 0, 0
-		for _, c := range cases {
-			if v, ok := c.Judge.Scores[mode][dim]; ok {
-				total += v
-				n++
-			}
-		}
-		if n == 0 {
-			return 0
-		}
-		return float64(total) / float64(n)
-	}
-
 	b.WriteString("| 维度 | RAG | 编译 | Δ |\n|---|---|---|---|\n")
 	var ragTotal, wikiTotal float64
 	for _, dim := range DefaultRubric {
-		r, w := avg("rag", dim), avg("wiki", dim)
+		r, w := avgScore(cases, "rag", dim), avgScore(cases, "wiki", dim)
 		ragTotal += r
 		wikiTotal += w
 		b.WriteString(fmt.Sprintf("| %s | %.1f | %.1f | %+.1f |\n", dim, r, w, w-r))
@@ -728,115 +695,136 @@ func render(cases []CaseResult, model string, prev *Baseline) string {
 	b.WriteString(fmt.Sprintf("\n评审倾向: %s\n", verdictStr(verdictCount)))
 
 	// M10 轨迹质量汇总:检索过程维度(过程好 ≠ 答案好)。
-	tavg := func(dim string) (float64, float64) {
-		totalA, totalB, n := 0, 0, 0
-		for _, c := range cases {
-			if c.Traj.Scores == nil {
-				continue
-			}
-			totalA += c.Traj.Scores["rag"][dim]
-			totalB += c.Traj.Scores["wiki"][dim]
-			n++
-		}
-		if n == 0 {
-			return 0, 0
-		}
-		return float64(totalA) / float64(n), float64(totalB) / float64(n)
-	}
 	b.WriteString("\n| 轨迹维度 | RAG | 编译 | Δ |\n|---|---|---|---|\n")
 	for _, dim := range TrajRubric {
-		a, w := tavg(dim)
+		a, w := avgTraj(cases, dim)
 		b.WriteString(fmt.Sprintf("| %s | %.1f | %.1f | %+.1f |\n", dim, a, w, w-a))
 	}
 
 	for _, c := range cases {
-		note := c.Seed.Note
-		note = strings.TrimPrefix(note, "期望:")
-		note = strings.TrimSpace(note)
-		b.WriteString(fmt.Sprintf("\n---\n\n## %s %s\n\n> 期望: %s\n\n**RAG 答案**:\n\n%s\n\n**编译复利答案**:\n\n%s\n\n**评审**: verdict=%s · %s\n",
-			c.Seed.ID, c.Seed.Question, note, c.RAGAns, c.WikiAns, c.Judge.Verdict, c.Judge.Rationale))
-		// 复利 Δ:wiki 侧总分 vs 上次(同种子)——wiki 是否越变越强是复利曲线的直接读数。
-		if prev != nil {
-			if p, ok := prev.Seeds[c.Seed.ID]; ok {
-				nowTotal, beforeTotal := 0, 0
-				for dim, v := range c.Judge.Scores["wiki"] {
-					nowTotal += v
-					if pv, ok2 := p["wiki"][dim]; ok2 {
-						beforeTotal += pv
-					}
-				}
-				delta := nowTotal - beforeTotal
-				// 判官噪声底:本种子多判 wiki 总分极差。|Δ| 在噪声内时不断言涨跌——
-				// 单判噪声 ±3-5 分,一次 rejudge 抖动不该被读成 wiki 变强/变弱。
-				floor := c.Judge.NoiseSpan
-				if floor < 0 {
-					floor = 0
-				}
-				marker := ""
-				if absInt(delta) <= floor {
-					marker = fmt.Sprintf(" (±%d 判官噪声内,不判涨跌)", floor)
-				} else if floor > 0 {
-					marker = fmt.Sprintf(" (超出噪声底 ±%d)", floor)
-				}
-				b.WriteString(fmt.Sprintf("\n**复利 Δ(wiki vs 上次)**: %+d%s\n", delta, marker))
-			}
-		}
-		scores := map[string]map[string]int{"RAG": c.Judge.Scores["rag"], "WIKI": c.Judge.Scores["wiki"]}
-		dimList := DefaultRubric
-		if len(c.Seed.Rubric) > 0 {
-			dimList = c.Seed.Rubric
-		}
-		for _, m := range []string{"RAG", "WIKI"} {
-			b.WriteString(fmt.Sprintf("%s: ", m))
-			for _, dim := range dimList {
-				if v, ok := scores[m][dim]; ok {
-					b.WriteString(fmt.Sprintf("%s=%d ", dim, v))
-				}
-			}
-			b.WriteString("\n")
-		}
-		// M10 检索轨迹 + 过程质量评审
-		b.WriteString("\n**检索轨迹**:\n\n")
-		for _, t := range []struct {
-			name string
-			tr   Trace
-		}{{"RAG", c.RAGTrace}, {"编译复利", c.WikiTrace}} {
-			b.WriteString(fmt.Sprintf("- %s 命中 %d 条:", t.name, len(t.tr.Hits)))
-			for i, h := range t.tr.Hits {
-				if i >= 8 {
-					b.WriteString(" …")
-					break
-				}
-				b.WriteString(fmt.Sprintf(" [%s %.2f]", h.Label, h.Score))
-			}
-			b.WriteString("\n")
-		}
-		if c.Traj.Scores != nil {
-			b.WriteString("轨迹评审: ")
-			for _, m := range []string{"RAG", "WIKI"} {
-				b.WriteString(fmt.Sprintf("%s: ", m))
-				for _, dim := range TrajRubric {
-					if v, ok := c.Traj.Scores[strings.ToLower(m)][dim]; ok {
-						b.WriteString(fmt.Sprintf("%s=%d ", dim, v))
-					}
-				}
-				b.WriteString(" ")
-			}
-			b.WriteString("\n")
-			if c.Traj.Rationale != "" {
-				b.WriteString(fmt.Sprintf("轨迹评语: %s\n", c.Traj.Rationale))
-			}
-		}
+		renderCase(&b, c, prev)
 	}
 	return b.String()
 }
 
+// avgScore 某模式某维度的平均分(缺维度不计入分母)。
+func avgScore(cases []CaseResult, mode, dim string) float64 {
+	total, n := 0, 0
+	for _, c := range cases {
+		if v, ok := c.Judge.Scores[mode][dim]; ok {
+			total += v
+			n++
+		}
+	}
+	if n == 0 {
+		return 0
+	}
+	return float64(total) / float64(n)
+}
+
+// avgTraj 轨迹某维度的两方案平均分。
+func avgTraj(cases []CaseResult, dim string) (float64, float64) {
+	totalA, totalB, n := 0, 0, 0
+	for _, c := range cases {
+		if c.Traj.Scores == nil {
+			continue
+		}
+		totalA += c.Traj.Scores["rag"][dim]
+		totalB += c.Traj.Scores["wiki"][dim]
+		n++
+	}
+	if n == 0 {
+		return 0, 0
+	}
+	return float64(totalA) / float64(n), float64(totalB) / float64(n)
+}
+
+// renderCase 渲染单个种子的报告段(答案、评审、复利 Δ、检索轨迹)。
+func renderCase(b *strings.Builder, c CaseResult, prev *Baseline) {
+	note := strings.TrimPrefix(c.Seed.Note, "期望:")
+	note = strings.TrimSpace(note)
+	b.WriteString(fmt.Sprintf("\n---\n\n## %s %s\n\n> 期望: %s\n\n**RAG 答案**:\n\n%s\n\n**编译复利答案**:\n\n%s\n\n**评审**: verdict=%s · %s\n",
+		c.Seed.ID, c.Seed.Question, note, c.RAGAns, c.WikiAns, c.Judge.Verdict, c.Judge.Rationale))
+	// 复利 Δ:wiki 侧总分 vs 上次(同种子)——wiki 是否越变越强是复利曲线的直接读数。
+	if prev != nil {
+		if p, ok := prev.Seeds[c.Seed.ID]; ok {
+			nowTotal, beforeTotal := 0, 0
+			for dim, v := range c.Judge.Scores["wiki"] {
+				nowTotal += v
+				if pv, ok2 := p["wiki"][dim]; ok2 {
+					beforeTotal += pv
+				}
+			}
+			delta := nowTotal - beforeTotal
+			// 判官噪声底:本种子多判 wiki 总分极差。|Δ| 在噪声内时不断言涨跌——
+			// 单判噪声 ±3-5 分,一次 rejudge 抖动不该被读成 wiki 变强/变弱。
+			floor := c.Judge.NoiseSpan
+			if floor < 0 {
+				floor = 0
+			}
+			marker := ""
+			if absInt(delta) <= floor {
+				marker = fmt.Sprintf(" (±%d 判官噪声内,不判涨跌)", floor)
+			} else if floor > 0 {
+				marker = fmt.Sprintf(" (超出噪声底 ±%d)", floor)
+			}
+			b.WriteString(fmt.Sprintf("\n**复利 Δ(wiki vs 上次)**: %+d%s\n", delta, marker))
+		}
+	}
+	scores := map[string]map[string]int{"RAG": c.Judge.Scores["rag"], "WIKI": c.Judge.Scores["wiki"]}
+	dimList := DefaultRubric
+	if len(c.Seed.Rubric) > 0 {
+		dimList = c.Seed.Rubric
+	}
+	for _, m := range []string{"RAG", "WIKI"} {
+		b.WriteString(fmt.Sprintf("%s: ", m))
+		for _, dim := range dimList {
+			if v, ok := scores[m][dim]; ok {
+				b.WriteString(fmt.Sprintf("%s=%d ", dim, v))
+			}
+		}
+		b.WriteString("\n")
+	}
+	// M10 检索轨迹 + 过程质量评审
+	b.WriteString("\n**检索轨迹**:\n\n")
+	for _, t := range []struct {
+		name string
+		tr   Trace
+	}{{"RAG", c.RAGTrace}, {"编译复利", c.WikiTrace}} {
+		b.WriteString(fmt.Sprintf("- %s 命中 %d 条:", t.name, len(t.tr.Hits)))
+		for i, h := range t.tr.Hits {
+			if i >= 8 {
+				b.WriteString(" …")
+				break
+			}
+			b.WriteString(fmt.Sprintf(" [%s %.2f]", h.Label, h.Score))
+		}
+		b.WriteString("\n")
+	}
+	if c.Traj.Scores != nil {
+		b.WriteString("轨迹评审: ")
+		for _, m := range []string{"RAG", "WIKI"} {
+			b.WriteString(fmt.Sprintf("%s: ", m))
+			for _, dim := range TrajRubric {
+				if v, ok := c.Traj.Scores[strings.ToLower(m)][dim]; ok {
+					b.WriteString(fmt.Sprintf("%s=%d ", dim, v))
+				}
+			}
+			b.WriteString(" ")
+		}
+		b.WriteString("\n")
+		if c.Traj.Rationale != "" {
+			b.WriteString(fmt.Sprintf("轨迹评语: %s\n", c.Traj.Rationale))
+		}
+	}
+}
+
 // trajWinner 按轨迹维度总分判过程优胜方(用于命令行 ✓ 输出)。
 func trajWinner(t trajScores) string {
-	sumA, sumB := 0, 0
 	if t.Scores == nil {
 		return "无轨迹分"
 	}
+	sumA, sumB := 0, 0
 	for _, d := range TrajRubric {
 		sumA += t.Scores["rag"][d]
 		sumB += t.Scores["wiki"][d]

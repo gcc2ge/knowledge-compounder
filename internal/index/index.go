@@ -41,13 +41,13 @@ type PageMeta struct {
 
 // Index 内存索引。
 type Index struct {
-	Version  int
-	Pages    map[string]*PageMeta          // rel path → meta
-	Invert   map[string]map[string]struct{} // term → rel path 集合(df = len)
-	Back     map[string][]string           // slug → 链向它的页面 slug(反向链接)
-	SavedAt  time.Time
+	Version int
+	Pages   map[string]*PageMeta           // rel path → meta
+	Invert  map[string]map[string]struct{} // term → rel path 集合(df = len)
+	Back    map[string][]string            // slug → 链向它的页面 slug(反向链接)
+	SavedAt time.Time
 
-	root      string   // 项目根(gob 不序列化)
+	root      string            // 项目根(gob 不序列化)
 	slugIndex map[string]string // slug → rel path
 }
 
@@ -274,7 +274,7 @@ func (idx *Index) UpdateFile(absPath string) {
 // syncBack 把单页出链变化增量反映到 Back/slugIndex,替代全量 rebuildGraph。
 // 与 rebuildGraph 同语义:跳过 raw/ 前缀链接,target 去 .md 后缀。
 func (idx *Index) syncBack(rel string, old *PageMeta) {
-	slug := strings.TrimSuffix(filepath.Base(rel), ".md")
+	slug := slugOf(rel)
 	idx.slugIndex[slug] = rel
 	cur := idx.Pages[rel]
 	if cur == nil {
@@ -391,18 +391,15 @@ func parsePage(absPath, rel string) *PageMeta {
 }
 
 // rebuildGraph 重建反向链接与 slug 索引(全量重建,千页级开销可忽略)。
-// 与 lint 的入站统计同语义:跳过 raw/ 前缀链接。
+// 与 lint 的入站统计同语义:跳过 raw/ 前缀链接;与 syncBack 同语义:按去重后的
+// 目标 slug 记账(同一页重复列出同一 wikilink 时,Back[target] 不出现重复 slug)。
 func (idx *Index) rebuildGraph() {
 	idx.Back = map[string][]string{}
 	idx.slugIndex = map[string]string{}
 	for rel, m := range idx.Pages {
-		slug := strings.TrimSuffix(filepath.Base(rel), ".md")
+		slug := slugOf(rel)
 		idx.slugIndex[slug] = rel
-		for _, l := range m.OutLinks {
-			if strings.HasPrefix(l, "raw/") {
-				continue
-			}
-			target := strings.TrimSuffix(l, ".md")
+		for target := range linkTargetSet(m.OutLinks) {
 			idx.Back[target] = append(idx.Back[target], slug)
 		}
 	}
@@ -469,53 +466,10 @@ func (idx *Index) Rank(query string, opts retrieval.Options) []retrieval.Result 
 	}
 
 	// 可选向量层:仅候选页(缓存键免 stat,直用索引里的 mtime|size)
-	sem := map[string]float64{}
+	var sem map[string]float64
 	useVec := opts.Embedder != nil
 	if useVec {
-		vecs := map[string][]float32{}
-		var pending []string
-		for rel, m := range cand {
-			if opts.Cache != nil {
-				if v, ok := opts.Cache.Get(embed.KeyParts(m.Path, m.MTime, m.Size), opts.Embedder.Dim()); ok {
-					vecs[rel] = v
-					continue
-				}
-			}
-			pending = append(pending, rel)
-		}
-		for start := 0; start < len(pending); start += 16 {
-			end := start + 16
-			if end > len(pending) {
-				end = len(pending)
-			}
-			texts := make([]string, 0, end-start)
-			for _, rel := range pending[start:end] {
-				texts = append(texts, idx.Pages[rel].Text)
-			}
-			b, err := opts.Embedder.Embed(texts)
-			if err != nil {
-				break // 嵌入失败:向量层降级,词法分照常
-			}
-			for j, rel := range pending[start:end] {
-				vecs[rel] = b[j]
-				if opts.Cache != nil {
-					m := idx.Pages[rel]
-					opts.Cache.Set(embed.KeyParts(m.Path, m.MTime, m.Size), b[j])
-				}
-			}
-		}
-		if opts.Cache != nil {
-			opts.Cache.Save()
-		}
-		if qv, err := opts.Embedder.Embed([]string{query}); err == nil && len(qv) == 1 {
-			for rel := range cand {
-				if v, ok := vecs[rel]; ok {
-					sem[rel] = embed.Cosine(qv[0], v)
-				}
-			}
-		} else {
-			useVec = false
-		}
+		sem, useVec = idx.embedCandidates(query, cand, opts)
 	}
 
 	out := make([]retrieval.Result, 0, len(cands))
@@ -548,6 +502,57 @@ func (idx *Index) Rank(query string, opts retrieval.Options) []retrieval.Result 
 	return out
 }
 
+// embedCandidates 只对候选页跑向量嵌入并回填缓存,返回 sem 得分与是否成功。
+// 失败时降级纯词法((nil,false));缓存命中免重复嵌入(键用 mtime|size)。
+func (idx *Index) embedCandidates(query string, cand map[string]*PageMeta, opts retrieval.Options) (map[string]float64, bool) {
+	vecs := map[string][]float32{}
+	var pending []string
+	for rel, m := range cand {
+		if opts.Cache != nil {
+			if v, ok := opts.Cache.Get(embed.KeyParts(m.Path, m.MTime, m.Size), opts.Embedder.Dim()); ok {
+				vecs[rel] = v
+				continue
+			}
+		}
+		pending = append(pending, rel)
+	}
+	for start := 0; start < len(pending); start += 16 {
+		end := start + 16
+		if end > len(pending) {
+			end = len(pending)
+		}
+		texts := make([]string, 0, end-start)
+		for _, rel := range pending[start:end] {
+			texts = append(texts, idx.Pages[rel].Text)
+		}
+		b, err := opts.Embedder.Embed(texts)
+		if err != nil {
+			break // 嵌入失败:向量层降级,词法分照常
+		}
+		for j, rel := range pending[start:end] {
+			vecs[rel] = b[j]
+			if opts.Cache != nil {
+				m := idx.Pages[rel]
+				opts.Cache.Set(embed.KeyParts(m.Path, m.MTime, m.Size), b[j])
+			}
+		}
+	}
+	if opts.Cache != nil {
+		opts.Cache.Save()
+	}
+	qv, err := opts.Embedder.Embed([]string{query})
+	if err != nil || len(qv) != 1 {
+		return nil, false
+	}
+	sem := map[string]float64{}
+	for rel := range cand {
+		if v, ok := vecs[rel]; ok {
+			sem[rel] = embed.Cosine(qv[0], v)
+		}
+	}
+	return sem, true
+}
+
 // Mentions 批量统计源页提及(大小写不敏感 Contains,与全扫实现语义一致)。
 func (idx *Index) Mentions(terms []string) []MentionResult {
 	out := make([]MentionResult, 0, len(terms))
@@ -563,7 +568,7 @@ func (idx *Index) Mentions(terms []string) []MentionResult {
 			}
 			idx.hydrate(m) // Contains 需要全文,按需读盘
 			if strings.Contains(strings.ToLower(m.Text), low) {
-				hits = append(hits, strings.TrimSuffix(filepath.Base(rel), ".md"))
+				hits = append(hits, slugOf(rel))
 			}
 		}
 		sort.Strings(hits)
@@ -643,7 +648,7 @@ func (idx *Index) Backlinks(slug string) (inbound, outbound []string) {
 func (idx *Index) BrokenLinks() map[string][]string {
 	out := map[string][]string{}
 	for rel, m := range idx.Pages {
-		slug := strings.TrimSuffix(filepath.Base(rel), ".md")
+		slug := slugOf(rel)
 		for _, l := range m.OutLinks {
 			if strings.HasPrefix(l, "raw/") {
 				continue
@@ -687,6 +692,11 @@ func (idx *Index) rel(absPath string) string {
 		return absPath
 	}
 	return r
+}
+
+// slugOf 页面 rel 路径 → slug(去 .md 后缀)。
+func slugOf(rel string) string {
+	return strings.TrimSuffix(filepath.Base(rel), ".md")
 }
 
 func snapshotPath(root string) string {

@@ -24,7 +24,7 @@ import (
 // 工具参数恢复/打转检测用的正则——热路径(每次工具调用/写历史),编译一次复用。
 var (
 	writePathRe    = regexp.MustCompile(`"path"\s*:\s*"([^"]*)"`) // write_file 的 path 字段
-	writeContentRe = regexp.MustCompile(`"content"\s*:`)           // write_file 的 content 键
+	writeContentRe = regexp.MustCompile(`"content"\s*:`)          // write_file 的 content 键
 )
 
 type Runtime struct {
@@ -100,33 +100,28 @@ func (r *Runtime) Run(ctx context.Context, input, state string) (string, error) 
 			// 指令并延长预算(最多 MaxFinishPushes 次),而不是带半成品死掉。
 			// 边界裁决:预算耗尽 ≠ 失败——FinishGuard 通过(页面按闸门定义已完成)时
 			// 正常收尾;否则 push 未满则续跑、push 已满则如实失败。
-			if r.FinishGuard != nil {
-				cont := r.FinishGuard(provider.Message{})
-				if cont == "" {
-					// 闸门判定任务已完成:预算边界完成与正常收尾同判成功,
-					// 交由 cli 的 postCompileQA 独立复核,不在此误杀。
-					_ = r.saveCheckpoint(msgs)
-					r.emit(Event{Kind: EvDone, Step: step})
-					return "", nil
-				}
-				if r.finishPushes < r.MaxFinishPushes {
-					r.finishPushes++
-					r.emit(Event{Kind: EvFinishGuard, Step: step, Text: trunc(cont, 100)})
-					msgs = append(msgs, provider.Message{Role: "user", Content: cont})
-					budget += r.MaxSteps // 每次续跑再给一整份预算
-					continue
-				}
-				err := fmt.Errorf("达到最大步数 %d,停止: 任务未通过闸门(续跑 %d 次仍不合格)", r.MaxSteps, r.finishPushes)
-				r.emit(Event{Kind: EvStop, Step: step, Err: err})
-				return "", err
+			if r.FinishGuard == nil {
+				return r.fail(Event{Kind: EvStop, Step: step, Err: fmt.Errorf("达到最大步数 %d,停止", r.MaxSteps)})
 			}
-			err := fmt.Errorf("达到最大步数 %d,停止", r.MaxSteps)
-			r.emit(Event{Kind: EvStop, Step: step, Err: err})
-			return "", err
+			cont := r.FinishGuard(provider.Message{})
+			if cont == "" {
+				// 闸门判定任务已完成:预算边界完成与正常收尾同判成功,
+				// 交由 cli 的 postCompileQA 独立复核,不在此误杀。
+				_ = r.saveCheckpoint(msgs)
+				r.emit(Event{Kind: EvDone, Step: step})
+				return "", nil
+			}
+			if r.finishPushes < r.MaxFinishPushes {
+				r.finishPushes++
+				r.emit(Event{Kind: EvFinishGuard, Step: step, Text: trunc(cont, 100)})
+				msgs = append(msgs, provider.Message{Role: "user", Content: cont})
+				budget += r.MaxSteps // 每次续跑再给一整份预算
+				continue
+			}
+			return r.fail(Event{Kind: EvStop, Step: step, Err: fmt.Errorf("达到最大步数 %d,停止: 任务未通过闸门(续跑 %d 次仍不合格)", r.MaxSteps, r.finishPushes)})
 		}
 		if err := ctx.Err(); err != nil {
-			r.emit(Event{Kind: EvStop, Step: step, Err: err})
-			return "", err
+			return r.fail(Event{Kind: EvStop, Step: step, Err: err})
 		}
 		// M09 上下文治理:callProvider 前先压缩,避免超预算请求真的发出(压缩后必写 checkpoint)
 		if next, ok := r.maybeCompact(msgs); ok {
@@ -137,15 +132,12 @@ func (r *Runtime) Run(ctx context.Context, input, state string) (string, error) 
 		// token 预算闸门:每轮只估算一次,复用于停止判据与事件(avoid 重复全量扫描)。
 		tok := r.consumedTokens(msgs)
 		if r.MaxTokens > 0 && tok >= r.MaxTokens {
-			err := fmt.Errorf("达到 token 预算 %d(累计已用 %d),停止", r.MaxTokens, tok)
-			r.emit(Event{Kind: EvStop, Step: step, Tokens: tok, Err: err})
-			return "", err
+			return r.fail(Event{Kind: EvStop, Step: step, Tokens: tok, Err: fmt.Errorf("达到 token 预算 %d(累计已用 %d),停止", r.MaxTokens, tok)})
 		}
 		r.emit(Event{Kind: EvStep, Step: step, Tokens: tok})
 		reply, err := r.callProvider(ctx, msgs)
 		if err != nil {
-			r.emit(Event{Kind: EvError, Step: step, Err: err})
-			return "", err
+			return r.fail(Event{Kind: EvError, Step: step, Err: err})
 		}
 		r.accumulateUsage(reply)
 		if len(reply.ToolCalls) == 0 {
@@ -163,33 +155,9 @@ func (r *Runtime) Run(ctx context.Context, input, state string) (string, error) 
 			r.emit(Event{Kind: EvDone, Step: step, Text: reply.Content, Tokens: r.consumedTokens(msgs)})
 			return reply.Content, nil
 		}
-		for _, tc := range reply.ToolCalls {
-			r.emit(Event{Kind: EvToolCall, Step: step, Tool: tc.Name, Args: tc.Arguments})
-			r.ToolCalls++ // 真实执行计数器:编译收尾区分幂等跳写与零工作假成功
-			obs := r.execTool(tc)
-			if r.MidRunGuard != nil {
-				if note := r.MidRunGuard(step, tc.Name, tc.Arguments); note != "" {
-					obs = obs + "\n\n" + note // 指引并入工具观察,模型当场可见
-				}
-			}
-			r.emit(Event{Kind: EvToolResult, Step: step, Tool: tc.Name, Result: trunc(obs, 300)})
-			// 历史里 write_file 的 arguments 压缩成占位:整页 content 是上下文最大消费源,
-			// 而分块写页的每轮全文若不压缩会永久留在上下文(compaction 保留所有 write 轮)——
-			// 上下文钉在阈值上、折叠读轮、模型忘 raw、重读、再填满的履带(实测 51 次压缩/文件)。
-			histTC := tc
-			if tc.Name == "write_file" {
-				histTC.Arguments = compactWriteArgs(tc.Arguments)
-			}
-			msgs = append(msgs, provider.Message{Role: "assistant", Content: reply.Content, ToolCalls: []provider.ToolCall{histTC}})
-			msgs = append(msgs, provider.Message{Role: "tool", Content: obs, ToolCallID: tc.ID})
-
-			sig := actionKey(tc.Name, tc.Arguments)
-			same[sig]++
-			if same[sig] > r.MaxSameAction {
-				err := fmt.Errorf("同一动作重复 %d 次(%s),判定原地打转,停止", r.MaxSameAction, sig)
-				r.emit(Event{Kind: EvStop, Step: step, Err: err})
-				return "", err
-			}
+		msgs, err = r.runToolCalls(step, reply, msgs, same)
+		if err != nil {
+			return r.fail(Event{Kind: EvStop, Step: step, Err: err})
 		}
 		// checkpoint 降频写,避免每步全量序列化(O(n²) 写放大);压缩已在循环顶部闭环时写
 		if step%every == every-1 {
@@ -197,6 +165,44 @@ func (r *Runtime) Run(ctx context.Context, input, state string) (string, error) 
 		}
 		step++
 	}
+}
+
+// runToolCalls 依次执行本轮全部工具调用,回填 Observation 并写回历史;
+// 每次调用后做原地打转检测,违规即返回错误。
+func (r *Runtime) runToolCalls(step int, reply provider.Message, msgs []provider.Message, same map[string]int) ([]provider.Message, error) {
+	for _, tc := range reply.ToolCalls {
+		r.emit(Event{Kind: EvToolCall, Step: step, Tool: tc.Name, Args: tc.Arguments})
+		r.ToolCalls++ // 真实执行计数器:编译收尾区分幂等跳写与零工作假成功
+		obs := r.execTool(tc)
+		if r.MidRunGuard != nil {
+			if note := r.MidRunGuard(step, tc.Name, tc.Arguments); note != "" {
+				obs = obs + "\n\n" + note // 指引并入工具观察,模型当场可见
+			}
+		}
+		r.emit(Event{Kind: EvToolResult, Step: step, Tool: tc.Name, Result: trunc(obs, 300)})
+		// 历史里 write_file 的 arguments 压缩成占位:整页 content 是上下文最大消费源,
+		// 而分块写页的每轮全文若不压缩会永久留在上下文(compaction 保留所有 write 轮)——
+		// 上下文钉在阈值上、折叠读轮、模型忘 raw、重读、再填满的履带(实测 51 次压缩/文件)。
+		histTC := tc
+		if tc.Name == "write_file" {
+			histTC.Arguments = compactWriteArgs(tc.Arguments)
+		}
+		msgs = append(msgs, provider.Message{Role: "assistant", Content: reply.Content, ToolCalls: []provider.ToolCall{histTC}})
+		msgs = append(msgs, provider.Message{Role: "tool", Content: obs, ToolCallID: tc.ID})
+
+		sig := actionKey(tc.Name, tc.Arguments)
+		same[sig]++
+		if same[sig] > r.MaxSameAction {
+			return msgs, fmt.Errorf("同一动作重复 %d 次(%s),判定原地打转,停止", r.MaxSameAction, sig)
+		}
+	}
+	return msgs, nil
+}
+
+// fail 所有中止路径统一收口:发停止/错误事件并返回空输出与该错误。
+func (r *Runtime) fail(ev Event) (string, error) {
+	r.emit(ev)
+	return "", ev.Err
 }
 
 // callProvider 调用 LLM:Provider 实现 Streamer 且订阅了流式时走 SSE;
@@ -374,7 +380,8 @@ func (r *Runtime) execTool(tc provider.ToolCall) (out string) {
 		// 与解析成败解耦:裸参数不以 } 收尾一律标 truncated,由工具按截断语义拒绝(write_file
 		// 走 recoverWriteFileArgs 的 content_truncated 既有路径;edit_file 必须拒绝——new_string
 		// 只替换一半会静默破坏已有页,比整页覆盖更危险)。
-		if strings.TrimSpace(tc.Arguments) != "" && !strings.HasSuffix(strings.TrimSpace(tc.Arguments), "}") {
+		trimmed := strings.TrimSpace(tc.Arguments)
+		if trimmed != "" && !strings.HasSuffix(trimmed, "}") {
 			if args == nil {
 				args = map[string]any{}
 			}

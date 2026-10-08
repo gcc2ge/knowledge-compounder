@@ -120,9 +120,9 @@ func (o *OpenAIEmbedder) Embed(texts []string) ([][]float32, error) {
 	for _, d := range out.Data {
 		norm(d.Embedding)
 		vecs = append(vecs, d.Embedding)
-		if o.dim == 0 {
-			o.dim = len(d.Embedding)
-		}
+	}
+	if o.dim == 0 && len(vecs) > 0 {
+		o.dim = len(vecs[0])
 	}
 	if len(vecs) != len(texts) {
 		return nil, fmt.Errorf("embeddings 返回 %d 条,期望 %d", len(vecs), len(texts))
@@ -178,17 +178,18 @@ func NewCache(path string) *Cache {
 	if path == "" {
 		return c
 	}
-	if b, err := os.ReadFile(path); err == nil {
-		var disk struct {
-			Dim  int                  `json:"dim"`
-			Vecs map[string][]float32 `json:"vecs"`
-		}
-		if json.Unmarshal(b, &disk) == nil && disk.Vecs != nil {
-			c.m, c.dim = disk.Vecs, disk.Dim
-			return c
-		}
-		_ = json.Unmarshal(b, &c.m) // 旧版结构
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return c
 	}
+	var disk struct {
+		Dim  int                  `json:"dim"`
+		Vecs map[string][]float32 `json:"vecs"`
+	}
+	if json.Unmarshal(b, &disk) == nil && disk.Vecs != nil {
+		return &Cache{path: path, m: disk.Vecs, dim: disk.Dim}
+	}
+	_ = json.Unmarshal(b, &c.m) // 旧版结构
 	return c
 }
 

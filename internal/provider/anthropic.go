@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"sort"
 	"strings"
@@ -20,9 +19,7 @@ type Anthropic struct {
 	MaxTokens int // 0 = 默认 8192;>0 覆盖单次输出上限
 	Client    *http.Client
 
-	// 工具定义序列化缓存:一次运行的工具集固定,避免每步 Chat/Stream 重建 map。
-	toolCacheKey  string
-	toolCacheDefs []map[string]any
+	tools toolDefsCache // 工具定义序列化缓存
 }
 
 func NewAnthropic(model, apiKey, baseURL string) *Anthropic {
@@ -50,16 +47,7 @@ func buildAnthropicTools(tools []ToolDef) []map[string]any {
 
 // anthropicTools 缓存版 buildAnthropicTools:签名复用 toolsSignature,避免每步重建 map。
 func (p *Anthropic) anthropicTools(tools []ToolDef) []map[string]any {
-	if len(tools) == 0 {
-		return nil
-	}
-	key := toolsSignature(tools)
-	if key == p.toolCacheKey {
-		return p.toolCacheDefs
-	}
-	defs := buildAnthropicTools(tools)
-	p.toolCacheKey, p.toolCacheDefs = key, defs
-	return defs
+	return p.tools.get(tools, buildAnthropicTools)
 }
 
 // messagesToAnthropic 把统一 Message 转成 Anthropic 消息格式:
@@ -109,9 +97,13 @@ func (p *Anthropic) maxTokens() int {
 	return 8192
 }
 
-func (p *Anthropic) Chat(ctx context.Context, msgs []Message, tools []ToolDef, stop []string) (Message, error) {
+// chatPayload 构建 /v1/messages 请求体;stream 时置 stream。
+func (p *Anthropic) chatPayload(msgs []Message, tools []ToolDef, stop []string, stream bool) map[string]any {
 	system, blocks := messagesToAnthropic(msgs)
 	payload := map[string]any{"model": p.Model, "messages": blocks, "max_tokens": p.maxTokens()}
+	if stream {
+		payload["stream"] = true
+	}
 	if system != "" {
 		payload["system"] = system
 	}
@@ -121,29 +113,38 @@ func (p *Anthropic) Chat(ctx context.Context, msgs []Message, tools []ToolDef, s
 	if len(stop) > 0 {
 		payload["stop_sequences"] = stop
 	}
+	return payload
+}
 
+// post 发送 /v1/messages 请求;非 200 时归一为带错误体的错误。
+func (p *Anthropic) post(ctx context.Context, payload any) (*http.Response, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return Message{}, err
+		return nil, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.BaseURL+"/v1/messages", bytes.NewReader(body))
 	if err != nil {
-		return Message{}, err
+		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-api-key", p.APIKey)
 	req.Header.Set("anthropic-version", "2023-06-01")
-
 	resp, err := p.Client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, decodeAPIError(resp, "Anthropic API")
+	}
+	return resp, nil
+}
+
+func (p *Anthropic) Chat(ctx context.Context, msgs []Message, tools []ToolDef, stop []string) (Message, error) {
+	resp, err := p.post(ctx, p.chatPayload(msgs, tools, stop, false))
 	if err != nil {
 		return Message{}, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		var e struct{ Error map[string]any }
-		_ = json.NewDecoder(resp.Body).Decode(&e)
-		return Message{}, fmt.Errorf("Anthropic API %d: %v", resp.StatusCode, e.Error)
-	}
 	var data struct {
 		Content []struct {
 			Type  string         `json:"type"`
@@ -179,38 +180,11 @@ func (p *Anthropic) Chat(ctx context.Context, msgs []Message, tools []ToolDef, s
 
 // Stream SSE 流式版 Chat:content_block_delta(text_delta/input_json_delta)按 index 归并。
 func (p *Anthropic) Stream(ctx context.Context, msgs []Message, tools []ToolDef, stop []string, onDelta func(string)) (Message, error) {
-	system, blocks := messagesToAnthropic(msgs)
-	payload := map[string]any{"model": p.Model, "messages": blocks, "max_tokens": p.maxTokens(), "stream": true}
-	if system != "" {
-		payload["system"] = system
-	}
-	if defs := p.anthropicTools(tools); len(defs) > 0 {
-		payload["tools"] = defs
-	}
-	if len(stop) > 0 {
-		payload["stop_sequences"] = stop
-	}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return Message{}, err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.BaseURL+"/v1/messages", bytes.NewReader(body))
-	if err != nil {
-		return Message{}, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", p.APIKey)
-	req.Header.Set("anthropic-version", "2023-06-01")
-	resp, err := p.Client.Do(req)
+	resp, err := p.post(ctx, p.chatPayload(msgs, tools, stop, true))
 	if err != nil {
 		return Message{}, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		var e struct{ Error map[string]any }
-		_ = json.NewDecoder(resp.Body).Decode(&e)
-		return Message{}, fmt.Errorf("Anthropic API %d: %v", resp.StatusCode, e.Error)
-	}
 
 	out := Message{Role: "assistant"}
 	textByIndex := map[int]string{}

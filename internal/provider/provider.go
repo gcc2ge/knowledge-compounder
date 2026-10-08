@@ -2,7 +2,14 @@
 // 能力位 Tools:支持则 function calling,否则降级 ReAct。
 package provider
 
-import "context"
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
+)
 
 // ToolCall 一次工具调用请求(assistant 消息里的 tool_calls)。
 type ToolCall struct {
@@ -57,4 +64,45 @@ type VisionProvider interface {
 // Streamer 流式决策(SSE 增量输出)。Provider 实现它且 runtime.OnStream 非 nil 时走流式。
 type Streamer interface {
 	Stream(ctx context.Context, msgs []Message, tools []ToolDef, stop []string, onDelta func(string)) (Message, error)
+}
+
+// toolsSignature 工具集指纹:name+参数个数。一次运行内工具名唯一且参数绑定 name,
+// 此签名足以区分不同工具集;O(len(tools)) 免哈希。
+func toolsSignature(tools []ToolDef) string {
+	var b strings.Builder
+	for _, t := range tools {
+		b.WriteString(t.Name)
+		b.WriteByte(':')
+		b.WriteString(strconv.Itoa(len(t.Parameters)))
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+// toolDefsCache 工具集序列化缓存:一次运行的工具集固定,按 toolsSignature 命中复用,
+// 避免每步 Chat/Stream 重建 map。openai/anthropic 两个提供商共用。
+type toolDefsCache struct {
+	key  string
+	defs []map[string]any
+}
+
+func (c *toolDefsCache) get(tools []ToolDef, build func([]ToolDef) []map[string]any) []map[string]any {
+	if len(tools) == 0 {
+		return nil
+	}
+	key := toolsSignature(tools)
+	if key == c.key {
+		return c.defs
+	}
+	defs := build(tools)
+	c.key, c.defs = key, defs
+	return defs
+}
+
+// decodeAPIError 从非 200 响应解析 provider error 字段并归一错误消息。
+func decodeAPIError(resp *http.Response, label string) error {
+	defer resp.Body.Close()
+	var e struct{ Error map[string]any }
+	_ = json.NewDecoder(resp.Body).Decode(&e)
+	return fmt.Errorf("%s %d: %v", label, resp.StatusCode, e.Error)
 }
